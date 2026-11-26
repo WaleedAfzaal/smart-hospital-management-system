@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hospital Management System</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+
+  <!-- ======================= HEADER ======================= -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 64 64" class="logo-cross"><path d="M26 10h12v16h16v12H38v16H26V38H10V26h16z" fill="currentColor"/></svg>
+      </div>
+      <h1 class="brand-title">Hospital Management System</h1>
+    </div>
+    <div class="top-actions">
+      <button id="top-undo" class="pill-btn" type="button" title="Undo last action">
+        <svg viewBox="0 0 24 24" class="ic"><path d="M12 5V1L5 8l7 7V9c3.3 0 6 2.7 6 6s-2.7 6-6 6-6-2.7-6-6H4c0 4.4 3.6 8 8 8s8-3.6 8-8-3.6-8-8-8z" fill="currentColor"/></svg>
+        <span>Undo</span>
+      </button>
+      <button id="theme-toggle" class="pill-btn" type="button" title="Switch dark / light mode">
+        <svg id="theme-icon-moon" viewBox="0 0 24 24" class="ic"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" fill="currentColor"/></svg>
+        <svg id="theme-icon-sun" viewBox="0 0 24 24" class="ic hidden"><path d="M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zm0-15v3m0 12v3M2 12h3m14 0h3M4.9 4.9l2.1 2.1m10 10 2.1 2.1m0-14.2-2.1 2.1m-10 10-2.1 2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+        <span id="theme-label">Dark Mode</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ======================= STATS STRIP ======================= -->
+  <section class="stats" id="stats-strip" aria-label="Live stats">
+    <div class="stat-card stat-teal" data-stat="patients" role="button" tabindex="0" title="Patients list kholo">
+      <div class="stat-icon" aria-hidden="true">
+        <span class="gender male">&#9794;</span><span class="gender female">&#9792;</span>
+      </div>
+      <div class="stat-text"><span class="stat-label">Patients</span><span class="stat-num" id="stat-patients">0</span></div>
+    </div>
+    <div class="stat-card stat-blue" data-stat="doctors" role="button" tabindex="0" title="Doctors list kholo">
+      <div class="stat-icon" aria-hidden="true">
+        <svg viewBox="0 0 64 64" class="cap-icon"><path d="M32 8c-12 0-20 6-20 14v6h40v-6C52 14 44 8 32 8z" fill="currentColor"/><rect x="14" y="30" width="36" height="5" rx="2" fill="currentColor"/><path d="M28 38h8v4h-8z" fill="currentColor"/><circle cx="32" cy="48" r="8" fill="none" stroke="currentColor" stroke-width="3"/><path d="M32 43v10M27 48h10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>
+      </div>
+      <div class="stat-text"><span class="stat-label">Doctors</span><span class="stat-num" id="stat-doctors">0</span></div>
+    </div>
+    <div class="stat-card stat-blue" data-stat="waiting" role="button" tabindex="0" title="Doctor queues kholo">
+      <div class="stat-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" class="clock-icon"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg>
+      </div>
+      <div class="stat-text"><span class="stat-label">Waiting</span><span class="stat-num" id="stat-waiting">0</span></div>
+    </div>
+    <div class="stat-card stat-teal" data-stat="beds" role="button" tabindex="0" title="Beds kholo">
+      <div class="stat-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" class="bed-icon"><path d="M3 18v-6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6M3 18h18M3 18v2m18-2v2M6 10V6h12v4" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><circle cx="7.5" cy="8" r="1" fill="currentColor"/></svg>
+      </div>
+      <div class="stat-text"><span class="stat-label">Free Beds</span><span class="stat-num" id="stat-beds">0</span></div>
+    </div>
+  </section>
+
+  <!-- ======================= MAIN ======================= -->
+  <main class="main">
+    <!-- Operation tiles: all 11 ops on the front page -->
+    <section class="ops" aria-label="Operations">
+      <div class="ops-group-label">Patients</div>
+      <div class="tiles">
+        <button class="tile tile-teal" data-op="add-patient" type="button">
+          <span class="tile-icon"><span class="gender male">&#9794;</span><span class="gender female">&#9792;</span></span>
+          <span class="tile-label">Add Patient</span><span class="tile-plus">+</span>
+        </button>
+        <button class="tile tile-teal" data-op="view-sorted" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M4 6h10M4 11h7M4 16h4M18 5v14m0 0-3-3m3 3 3-3" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></span>
+          <span class="tile-label">View Sorted</span>
+        </button>
+        <button class="tile tile-teal" data-op="find-patient" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 16 5 5M11 8.5v5M8.5 11h5" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></span>
+          <span class="tile-label">Find Patient</span>
+        </button>
+        <button class="tile tile-teal" data-op="add-note" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8 9h8M8 12h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+          <span class="tile-label">Add Note</span>
+        </button>
+      </div>
+
+      <div class="ops-group-label">Doctors &amp; Appointments</div>
+      <div class="tiles">
+        <button class="tile tile-blue" data-op="doctors" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 64 64" class="cap-icon"><path d="M32 8c-12 0-20 6-20 14v6h40v-6C52 14 44 8 32 8z" fill="currentColor"/><rect x="14" y="30" width="36" height="5" rx="2" fill="currentColor"/><path d="M28 38h8v4h-8z" fill="currentColor"/><circle cx="32" cy="48" r="8" fill="none" stroke="currentColor" stroke-width="3"/><path d="M32 43v10M27 48h10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg></span>
+          <span class="tile-label">Doctors</span>
+        </button>
+        <button class="tile tile-blue" data-op="book-appointment" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 10h18M8 3v4M16 3v4M12 13v6M9 16h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+          <span class="tile-label">Book Appointment</span>
+        </button>
+        <button class="tile tile-blue" data-op="beds" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M3 18v-6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6M3 18h18M3 18v2m18-2v2M6 10V6h12v4" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><circle cx="7.5" cy="8" r="1" fill="currentColor"/></svg></span>
+          <span class="tile-label">Beds</span>
+        </button>
+        <button class="tile tile-blue" data-op="pharmacy" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M10.5 20.5 3 13a4.5 4.5 0 0 1 6.4-6.4l7.5 7.5a4.5 4.5 0 0 1-6.4 6.4zM14 7l3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><path d="m8 12 2 2M11 9l2 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+          <span class="tile-label">Pharmacy Queue</span>
+        </button>
+      </div>
+
+      <div class="ops-group-label">Hospital</div>
+      <div class="tiles">
+        <button class="tile tile-blue" data-op="shifts" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></span>
+          <span class="tile-label">Shifts</span>
+        </button>
+        <button class="tile tile-blue" data-op="dashboard" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-8M22 20H2" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></svg></span>
+          <span class="tile-label">Dashboard</span>
+        </button>
+        <button class="tile tile-blue" data-op="undo" type="button">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M12 5V1L5 8l7 7V9c3.3 0 6 2.7 6 6s-2.7 6-6 6-6-2.7-6-6H4c0 4.4 3.6 8 8 8s8-3.6 8-8-3.6-8-8-8z" fill="currentColor"/></svg></span>
+          <span class="tile-label">Undo</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- Central workspace: the clicked operation opens here -->
+    <section class="workspace" aria-label="Operation workspace">
+      <div class="workspace-head">
+        <h2 id="workspace-title">Dashboard</h2>
+        <span class="workspace-sub" id="workspace-sub">Open Operation Form</span>
+      </div>
+      <div class="workspace-body" id="workspace-body">
+        <p class="hint">Loading…</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span class="dot-ok" id="status-dot"></span>
+    <span id="status-text">Connecting…</span>
+    <span class="sep">•</span>
+    <span>Last update: <span id="last-update">—</span></span>
+  </footer>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
