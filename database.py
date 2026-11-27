@@ -44,6 +44,13 @@ Design notes
   added and old rows load as Pending. Status history lives in its own
   table (``appointment_status_history``) managed by status_history.py
   — this module never touches it.
+* Step 8 (Book Appointment form): patients carry ``father_name`` /
+  ``phone`` / ``gender``, and appointments carry ``apt_id`` /
+  ``appt_type`` / ``reason`` / ``notes``. Older files get the columns
+  added; old rows load with the new fields empty (APT ID None, type
+  General). The Appointment ID counter lives in ``meta`` as
+  ``apt_counter`` — the next number to hand out — so an ID is never
+  reused after a restart.
 """
 
 import os
@@ -63,7 +70,10 @@ CREATE TABLE IF NOT EXISTS patients(
     problem TEXT NOT NULL,
     visits INTEGER NOT NULL DEFAULT 0,
     position INTEGER NOT NULL,
-    registered TEXT
+    registered TEXT,
+    father_name TEXT,
+    phone TEXT,
+    gender TEXT
 );
 CREATE TABLE IF NOT EXISTS patient_notes(
     patient_id INTEGER NOT NULL,
@@ -91,7 +101,11 @@ CREATE TABLE IF NOT EXISTS appointments(
     date TEXT,
     appt_date TEXT,
     appt_time TEXT,
-    status TEXT
+    status TEXT,
+    apt_id TEXT,
+    appt_type TEXT,
+    reason TEXT,
+    notes TEXT
 );
 CREATE TABLE IF NOT EXISTS beds(
     bed_no INTEGER PRIMARY KEY,
@@ -149,21 +163,32 @@ class Database:
 
     @staticmethod
     def _migrate(conn):
-        """Add Step 3 / Step 4 / Step 6 columns to databases created earlier.
+        """Add Step 3 / Step 4 / Step 6 / Step 8 columns to databases
+        created earlier.
 
         ``CREATE TABLE IF NOT EXISTS`` never touches an existing table,
         so an older hospital.db would otherwise miss ``registered`` /
-        ``date`` / ``appt_date`` / ``appt_time`` / ``status`` and the
-        INSERTs below would fail. Old rows keep NULL (date unknown /
-        no date/time set / status Pending) — the daily report simply
-        never counts them, the schedule view skips appointments with
-        no scheduled date, and old appointments load as Pending.
+        ``date`` / ``appt_date`` / ``appt_time`` / ``status`` /
+        ``father_name`` / ``phone`` / ``gender`` / ``apt_id`` /
+        ``appt_type`` / ``reason`` / ``notes`` and the INSERTs below
+        would fail. Old rows keep NULL (date unknown / no date/time
+        set / status Pending / no father name, phone, gender or
+        appointment details) — the daily report simply never counts
+        them, the schedule view skips appointments with no scheduled
+        date, and old appointments load as Pending with no APT ID.
         """
         for table, column in (("patients", "registered"),
+                             ("patients", "father_name"),
+                             ("patients", "phone"),
+                             ("patients", "gender"),
                              ("appointments", "date"),
                              ("appointments", "appt_date"),
                              ("appointments", "appt_time"),
-                             ("appointments", "status")):
+                             ("appointments", "status"),
+                             ("appointments", "apt_id"),
+                             ("appointments", "appt_type"),
+                             ("appointments", "reason"),
+                             ("appointments", "notes")):
             cols = [row[1] for row in conn.execute(
                 f"PRAGMA table_info({table})")]
             if column not in cols:
@@ -186,9 +211,13 @@ class Database:
             for pos, pat in enumerate(hospital.patients_list):
                 conn.execute(
                     "INSERT INTO patients(id, name, age, problem, visits,"
-                    " position, registered) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " position, registered, father_name, phone, gender)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (pat["id"], pat["name"], pat["age"], pat["problem"],
-                     pat["visits"], pos, pat.get("registered")),
+                     pat["visits"], pos, pat.get("registered"),
+                     pat.get("father_name") or None,
+                     pat.get("phone") or None,
+                     pat.get("gender") or None),
                 )
                 for npos, note in enumerate(_notes_of(pat)):
                     conn.execute(
@@ -207,20 +236,28 @@ class Database:
                 for hpos, row in enumerate(doc["queue"].heap):
                     # heap row: (priority, count, token, pid, name, fee,
                     #            booked date, appt_date, appt_time,
-                    #            status). Rows built before Step 3 have
+                    #            status, apt_id, appt_type, reason,
+                    #            notes). Rows built before Step 3 have
                     # no 7th field, rows built before Step 4 have no
                     # 8th/9th field, rows built before Step 6 have no
-                    # 10th field (they save as Pending).
+                    # 10th field (they save as Pending), rows built
+                    # before Step 8 have no 11th–14th field (they save
+                    # as NULL/empty — no APT ID, type General).
                     conn.execute(
                         "INSERT INTO appointments(doctor_id, heap_pos, priority,"
                         " seq, token, patient_id, patient_name, fee, date,"
-                        " appt_date, appt_time, status)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        " appt_date, appt_time, status, apt_id, appt_type,"
+                        " reason, notes)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (doc["id"], hpos, row[0], row[1], row[2], row[3],
                          row[4], row[5], row[6] if len(row) > 6 else None,
                          row[7] if len(row) > 7 else None,
                          row[8] if len(row) > 8 else None,
-                         row[9] if len(row) > 9 else "Pending"),
+                         row[9] if len(row) > 9 else "Pending",
+                         row[10] if len(row) > 10 else None,
+                         row[11] if len(row) > 11 else None,
+                         row[12] if len(row) > 12 else None,
+                         row[13] if len(row) > 13 else None),
                     )
 
             for i, pid in enumerate(hospital.beds):
@@ -249,6 +286,14 @@ class Database:
                 " VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+            # Step 8: the Appointment ID counter — the next number to
+            # hand out (APT-0001, ...). Saved on every save, so an ID
+            # is never reused after a restart.
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value)"
+                " VALUES ('apt_counter', ?)",
+                (str(hospital.apt_counter),),
+            )
             conn.commit()
 
     # ------------------------------------------------------------ load
@@ -271,8 +316,9 @@ class Database:
 
             # ---- patients (+ notes), in original insertion order
             hospital.patients_map, hospital.patients_list = {}, []
-            for pid, name, age, problem, visits, registered in conn.execute(
-                "SELECT id, name, age, problem, visits, registered FROM patients"
+            for pid, name, age, problem, visits, registered, father_name, phone, gender in conn.execute(
+                "SELECT id, name, age, problem, visits, registered,"
+                " father_name, phone, gender FROM patients"
                 " ORDER BY position"
             ):
                 notes = LinkedList()
@@ -284,9 +330,25 @@ class Database:
                     notes.add_last(note)
                 pat = {"id": pid, "name": name, "age": age,
                        "problem": problem, "visits": visits, "notes": notes,
-                       "registered": registered}
+                       "registered": registered,
+                       "father_name": father_name or "",
+                       "phone": phone or "", "gender": gender or ""}
                 hospital.patients_map[pid] = pat
                 hospital.patients_list.append(pat)
+
+            # Step 8: the Appointment ID counter — the next number to
+            # hand out. A database from before Step 8 has no such row
+            # and starts at 1 (its old appointments never had IDs).
+            counter_row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'apt_counter'"
+            ).fetchone()
+            try:
+                hospital.apt_counter = int(counter_row[0]) \
+                    if counter_row else 1
+            except (TypeError, ValueError):
+                hospital.apt_counter = 1
+            if hospital.apt_counter < 1:
+                hospital.apt_counter = 1
 
             # ---- doctors + their appointment heaps
             hospital.doctors_map = {}
@@ -298,10 +360,11 @@ class Database:
                 queue.heap = [
                     (priority, seq, token, pat_id, pat_name, fee_, date_,
                      appt_date, appt_time,
-                     status_ if status_ else "Pending")
-                    for priority, seq, token, pat_id, pat_name, fee_, date_, appt_date, appt_time, status_ in conn.execute(
+                     status_ if status_ else "Pending",
+                     apt_id, appt_type, reason, notes)
+                    for priority, seq, token, pat_id, pat_name, fee_, date_, appt_date, appt_time, status_, apt_id, appt_type, reason, notes in conn.execute(
                         "SELECT priority, seq, token, patient_id, patient_name, fee, date,"
-                        " appt_date, appt_time, status"
+                        " appt_date, appt_time, status, apt_id, appt_type, reason, notes"
                         " FROM appointments WHERE doctor_id = ? ORDER BY heap_pos",
                         (doc_id,),
                     )
@@ -333,5 +396,21 @@ class Database:
                 "SELECT value FROM shifts ORDER BY position"
             ):
                 hospital.shift_q.enqueue(value)
+
+            # Step 8: never hand out an Appointment ID twice — if the
+            # saved counter somehow fell behind the appointments that
+            # are already stored, push it above the highest APT number
+            # in use.
+            highest = 0
+            for doc in hospital.doctors_map.values():
+                for row in doc["queue"].heap:
+                    apt_id = row[10] if len(row) > 10 else None
+                    if apt_id and apt_id.startswith("APT-"):
+                        try:
+                            highest = max(highest, int(apt_id[4:]))
+                        except ValueError:
+                            pass
+            if hospital.apt_counter <= highest:
+                hospital.apt_counter = highest + 1
 
             return True

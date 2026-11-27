@@ -9,7 +9,7 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Patient Registration & Lookup**: Patients stored in a dict + list with input validation and duplicate-ID prevention; sorted view by ID or age (bubble sort); lookup by ID (binary search) or by name — type part of a name ("ahm" finds "Ahmed Khan") and matching is case-insensitive. A patient's name, age or problem can be edited (the ID never changes); deleting a patient (Admin only, with confirmation) removes their record, notes and queued appointments and frees their bed, while their bills are kept as financial records.
 - **Patient Notes**: Visit notes kept in a linked list per patient; each note counts as a visit.
 - **Doctor Directory**: Starts empty — add your own doctors with specialty and token fee. View doctors or add a new one.
-- **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…).
+- **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…). Every booking gets a unique Appointment ID (`APT-0001`, …) and a Type (General / Follow-up / Emergency), a Reason for Visit and Notes.
 - **Appointment Date & Time**: Every appointment is scheduled for a date (`YYYY-MM-DD`, empty = today) and a time (`HH:MM`, 24-hour, empty = no fixed time). The **Schedule** view lists a day's appointments — for one doctor or all — sorted by time, then Emergency-first. The queue order itself never changes: date/time is for scheduling and display only.
 - **Appointment Statuses**: Every appointment has a status — Pending, Confirmed, Checked In, In Progress, Completed, Cancelled or No Show. New appointments start Pending; every change is recorded with who made it and when, and the history survives a restart. Booking refuses a double booking: the same doctor cannot have two active appointments at the same date and time. Admin and Receptionist can set any status; a Doctor can only move their own queue's appointments to Checked In, In Progress or Completed.
 - **Beds**: 10 beds — assign a patient to a free bed or free an occupied one.
@@ -112,15 +112,57 @@ Appointments booked before this feature have no scheduled date — they
 still work everywhere (queue, billing, reports) but never appear in a
 dated schedule view.
 
+## Book Appointment Form
+
+The booking form walks through three steps: **Patient, Doctor,
+Appointment**.
+
+1. **Patient** — search an existing patient by **ID, name or phone**
+   ("0300" finds a patient whose phone is 0300-1234567) and pick them
+   from the results; or register a **new patient without leaving the
+   form** (name, age, problem, plus optional Father Name, Phone and
+   Gender — the patient ID is assigned automatically).
+2. **Doctor** — pick a **Department** (a doctor's specialization),
+   then a **Doctor** in that department; the form shows the
+   specialization and consultation fee, and the doctor's **already
+   booked times for the chosen day**, so a taken slot is visible
+   before you pick a time. (There are no fixed working hours yet —
+   that comes in a later step — so any free time can be picked.)
+3. **Appointment** — date, time, **Type** (General / Follow-up /
+   Emergency — Emergency books an E- token, the others an N- token),
+   **Reason for Visit**, **Additional Notes** and **Status** (Pending
+   or Confirmed). A **Confirm & Book** button saves it and shows a
+   confirmation summary — Appointment ID, token, patient, doctor,
+   department, date/time, type, fee and status — with a **Generate
+   Bill** button (the bill itself is only made when you ask for it).
+
+Every booking gets a unique **Appointment ID** (`APT-0001`,
+`APT-0002`, …) that keeps counting up and never repeats, even after a
+restart. Patients also carry **Father Name, Phone and Gender** now
+(added to the Add Patient and Edit Patient forms too; patients
+registered before this feature simply show those fields as empty).
+
+- **CLI:** menu option **6. Book Appt** runs the same flow — search
+  or register a patient, pick department then doctor, see the booked
+  times for the day, then date/time/type/reason/notes/status; it shows
+  a confirmation summary and offers to generate the bill.
+- **Dashboard:** the **Book Appointment** form (Appointments in the
+  sidebar, or the Quick Action on the dashboard) is the same three
+  steps, with live patient search and live booked-times.
+
 ## Patient Search, Edit & Delete
 
-**Search by name:** type all or part of a name — "ahm" finds "Ahmed
-Khan" and "Ali Ahmed", and "AHMED" finds them too (matching ignores
-case). Nothing matching gives a plain "no patient found" message, not
+**Search by ID, name or phone:** type all or part of a name — "ahm"
+finds "Ahmed Khan" and "Ali Ahmed", and "AHMED" finds them too
+(matching ignores case). A patient ID ("101") finds that patient, and
+a phone fragment ("0300") finds patients whose phone contains those
+digits. Nothing matching gives a plain "no patient found" message, not
 an error. Every role can search.
 
 **Edit:** change a patient's name, age and/or problem — the ID never
-changes, and fields you leave alone stay as they are. A renamed
+changes, and fields you leave alone stay as they are. Father Name,
+Phone and Gender can be changed the same way (leave one blank in the
+edit form to clear it). A renamed
 patient's queued appointments show the new name too; bills keep the
 name they were made with. Admin and Receptionist can edit; Doctors are
 read-only here.

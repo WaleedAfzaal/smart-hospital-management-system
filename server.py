@@ -56,6 +56,17 @@ appointments with real statuses, the recent-activity feed (status
 changes, registrations, bills, bookings) and the notification count
 (pending appointments + unpaid bills). Every number is live data from
 hospital.db — nothing is hardcoded.
+
+Step 8 (Book Appointment form): patients carry Father Name, Phone and
+Gender (``POST /api/patients`` and the edit endpoint accept them;
+``GET /api/patients?name=...`` now matches by ID, name or phone).
+Booking takes a Type (General / Follow-up / Emergency — Emergency
+books an E- token), a Reason, Notes and a Status (Pending or
+Confirmed), and accepts either ``patient_id`` or a ``new_patient``
+object to register inline. Every booking gets a unique Appointment
+ID (APT-0001, ...) returned with the appointment, and
+``GET /api/appointments/slots?doctor_id=...&date=...`` lists that
+doctor's booked times for the day.
 """
 
 import argparse
@@ -71,8 +82,10 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 from auth import AuthStore, can
-from hospital import (DEFAULT_DB_PATH, Hospital, PriorityQueue,
-                      binary_search, bubble_sort, validate_appt_datetime)
+from hospital import (APPOINTMENT_TYPES, BOOKING_STATUSES, DEFAULT_DB_PATH,
+                      Hospital, PriorityQueue, binary_search, bubble_sort,
+                      validate_appt_datetime, validate_gender,
+                      validate_patient_details, validate_phone)
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOST = "127.0.0.1"
@@ -189,6 +202,10 @@ def _serialize_patient(patient: Dict[str, Any]) -> Dict[str, Any]:
         "problem": patient["problem"],
         "visits": patient["visits"],
         "notes": _notes_of(patient),
+        # Step 8: Father Name, Phone and Gender ("" when not given).
+        "father_name": patient.get("father_name") or "",
+        "phone": patient.get("phone") or "",
+        "gender": patient.get("gender") or "",
     }
 
 
@@ -216,6 +233,12 @@ def _serialize_doctor(doc: Dict[str, Any]) -> Dict[str, Any]:
                 # Step 6: every appointment carries its status
                 # ("Pending" for rows built before Step 6).
                 "status": row[9] if len(row) > 9 and row[9] else "Pending",
+                # Step 8: Appointment ID, type, reason, notes
+                # (None/"" for rows booked before Step 8).
+                "apt_id": row[10] if len(row) > 10 else None,
+                "appt_type": row[11] if len(row) > 11 and row[11] else "General",
+                "reason": row[12] if len(row) > 12 and row[12] else "",
+                "notes": row[13] if len(row) > 13 and row[13] else "",
             }
             for row in rows
         ],
@@ -429,7 +452,9 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 field = "age" if field == "age" else "id"
                 # Step 5: ?name= finds patients by part of their name
                 # (case-insensitive) — an empty result is a plain empty
-                # list, not an error.
+                # list, not an error. Step 8: the same search also
+                # matches an exact patient ID and a phone number
+                # ("0300" finds a patient whose phone is 0300-...).
                 name = query.get("name", [None])[0]
                 if name is not None:
                     matches = hospital.search_patients(name)
@@ -493,6 +518,36 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "ok": True, "date": date,
                     "appointments": hospital.appointments_for_date(
                         date, doctor_id),
+                })
+
+            # ---- Step 8: booked times for one doctor on one day —
+            # the availability the booking form shows, so taken slots
+            # are visible before a time is picked. A Doctor user
+            # linked to one doctor only ever sees their own day.
+            if path == "/api/appointments/slots":
+                doctor_id = query.get("doctor_id", [None])[0]
+                date = query.get("date", [None])[0] or \
+                    datetime.date.today().isoformat()
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    doctor_id = doctor_filter
+                if not doctor_id:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "doctor_id is required."}, 400)
+                doctor_id = doctor_id.strip().upper()
+                if doctor_id not in hospital.doctors_map:
+                    return self._send_json(
+                        {"ok": False, "error": "Doctor not found."}, 404)
+                try:
+                    booked = hospital.doctor_booked_times(doctor_id, date)
+                    date, _ = validate_appt_datetime(date, None)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "doctor_id": doctor_id, "date": date,
+                    "booked": booked,
                 })
 
             # ---- Step 6: status history for one appointment
@@ -745,10 +800,21 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 if not name or not problem:
                     return self._send_json(
                         {"ok": False, "error": "Name and Problem are required."}, 400)
+                # Step 8: Father Name, Phone and Gender are optional —
+                # a bad phone or gender is a 400 with a plain message.
+                father_name = str(data.get("father_name", "") or "").strip()
+                try:
+                    phone = validate_phone(data.get("phone", ""))
+                    gender = validate_gender(data.get("gender", ""))
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
                 if pid in hospital.patients_map:
                     return self._send_json(
                         {"ok": False, "error": "ID already exists."}, 400)
-                hospital.add_patient(pid, name, age, problem)
+                hospital.add_patient(pid, name, age, problem,
+                                     father_name=father_name, phone=phone,
+                                     gender=gender)
                 if pid not in hospital.patients_map:
                     return self._send_json(
                         {"ok": False, "error": "Could not add patient."}, 400)
@@ -788,6 +854,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
             # ---- Edit Patient (Step 5): POST /api/patients/<id> with
             # any of {name, age, problem} — only the given fields
             # change, the ID never changes. Admin + Receptionist only.
+            # Step 8: father_name, phone and gender can be changed the
+            # same way ("" clears one, missing leaves it alone).
             if path.startswith("/api/patients/"):
                 if not can(role, "edit_patient"):
                     return self._forbidden(role)
@@ -821,21 +889,30 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     if not problem:
                         return self._send_json(
                             {"ok": False, "error": "Problem cannot be empty."}, 400)
+                father_name = data.get("father_name")
+                phone = data.get("phone")
+                gender = data.get("gender")
+                if father_name is not None:
+                    father_name = str(father_name).strip()
+                try:
+                    if phone is not None:
+                        phone = validate_phone(phone)
+                    if gender is not None:
+                        gender = validate_gender(gender)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
                 try:
                     updated = hospital.edit_patient(
-                        pid, name=name, age=age, problem=problem)
+                        pid, name=name, age=age, problem=problem,
+                        father_name=father_name, phone=phone, gender=gender)
                 except ValueError as exc:
                     return self._send_json(
                         {"ok": False, "error": str(exc)}, 400)
                 return self._send_json({
                     "ok": True, "message": "Patient updated.",
-                    "patient": {
-                        "id": updated["id"], "name": updated["name"],
-                        "age": updated["age"],
-                        "problem": updated["problem"],
-                        "visits": updated["visits"],
-                        "notes": updated["notes"],
-                    },
+                    "patient": _serialize_patient(
+                        hospital.patients_map[pid]),
                 })
 
             # ---- Add Doctor
@@ -871,15 +948,79 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Book Appointment (Step 4: date/time — date empty =
             # today, time empty = no fixed time; bad values get a 400)
+            # Step 8: a Type (General / Follow-up / Emergency —
+            # Emergency books an E- token), a Reason, Notes and a
+            # Status (Pending or Confirmed), and either "patient_id"
+            # for an existing patient or a "new_patient" object to
+            # register one inline (its ID is auto-assigned when left
+            # out). The reply carries the full appointment, including
+            # its auto-generated Appointment ID (APT-0001, ...).
             if path == "/api/appointments":
                 if not can(role, "book_appointment"):
                     return self._forbidden(role)
                 doc_id = str(data.get("doctor_id", "")).strip().upper()
-                pid = _parse_int(data.get("patient_id"))
-                if pid is None:
+                # ---- Patient: existing, or register one inline.
+                new_patient = data.get("new_patient")
+                pid = None
+                if isinstance(new_patient, dict):
+                    try:
+                        np_age = _parse_int(new_patient.get("age"))
+                        if np_age is None:
+                            raise ValueError(
+                                "Age must be a number.")
+                        np_name, np_age, np_problem = validate_patient_details(
+                            new_patient.get("name"), np_age,
+                            new_patient.get("problem"))
+                        np_phone = validate_phone(
+                            new_patient.get("phone", ""))
+                        np_gender = validate_gender(
+                            new_patient.get("gender", ""))
+                    except ValueError as exc:
+                        return self._send_json(
+                            {"ok": False, "error": str(exc)}, 400)
+                    np_id = _parse_int(new_patient.get("id"))
+                    if np_id is not None:
+                        if np_id <= 0:
+                            return self._send_json(
+                                {"ok": False,
+                                 "error": "Patient ID must be a positive number."}, 400)
+                        if np_id in hospital.patients_map:
+                            return self._send_json(
+                                {"ok": False,
+                                 "error": "ID already exists."}, 400)
+                        pid = np_id
+                    else:
+                        pid = hospital.next_patient_id()
+                    np_father = str(
+                        new_patient.get("father_name", "") or "").strip()
+                else:
+                    pid = _parse_int(data.get("patient_id"))
+                    if pid is None:
+                        return self._send_json(
+                            {"ok": False,
+                             "error": "Patient ID must be a number, or send new_patient."}, 400)
+                # ---- Type (decides the token), status, reason, notes.
+                # When no type is given, the old "emergency" flag
+                # still decides it (Emergency -> E- token) so older
+                # callers keep working.
+                if data.get("type") not in (None, ""):
+                    appt_type = str(data.get("type")).strip()
+                    if appt_type not in APPOINTMENT_TYPES:
+                        return self._send_json(
+                            {"ok": False,
+                             "error": "Type must be General, Follow-up or Emergency."}, 400)
+                else:
+                    appt_type = "Emergency" if bool(
+                        data.get("emergency")) else "General"
+                is_emg = appt_type == "Emergency"
+                status = str(
+                    data.get("status", "Pending") or "Pending").strip()
+                if status not in BOOKING_STATUSES:
                     return self._send_json(
-                        {"ok": False, "error": "Patient ID must be a number."}, 400)
-                is_emg = bool(data.get("emergency"))
+                        {"ok": False,
+                         "error": "Status at booking must be Pending or Confirmed."}, 400)
+                reason = str(data.get("reason", "") or "").strip()
+                notes = str(data.get("notes", "") or "").strip()
                 try:
                     appt_date, appt_time = validate_appt_datetime(
                         data.get("date"), data.get("time"))
@@ -887,10 +1028,24 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     return self._send_json(
                         {"ok": False, "error": str(exc)}, 400)
                 doc = hospital.doctors_map.get(doc_id)
-                pat = hospital.patients_map.get(pid)
-                if not doc or not pat:
+                if not doc:
                     return self._send_json(
-                        {"ok": False, "error": "Invalid doctor or patient ID."}, 400)
+                        {"ok": False, "error": "Invalid doctor ID."}, 400)
+                # Everything is checked BEFORE the new patient is
+                # registered, so a failed booking never leaves a stray
+                # patient behind.
+                if isinstance(new_patient, dict):
+                    if pid not in hospital.patients_map:
+                        hospital.add_patient(
+                            pid, np_name, np_age, np_problem,
+                            father_name=np_father, phone=np_phone,
+                            gender=np_gender)
+                    pat = hospital.patients_map[pid]
+                else:
+                    pat = hospital.patients_map.get(pid)
+                    if not pat:
+                        return self._send_json(
+                            {"ok": False, "error": "Invalid patient ID."}, 400)
                 # ---- Step 6: no double booking — the same doctor,
                 # same date, same time, while the existing appointment
                 # is still active. The 400 says exactly what is taken.
@@ -903,19 +1058,25 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                                   f"{appt_date} {appt_time} (token {conflict['token']}, "
                                   f"{conflict['status']}). Pick another time."}, 400)
                 token = hospital.book_appointment(
-                    doc_id, pid, is_emg, appt_date, appt_time)
+                    doc_id, pid, is_emg, appt_date, appt_time,
+                    appt_type=appt_type, reason=reason, notes=notes,
+                    status=status)
                 if token is None:
                     return self._send_json(
                         {"ok": False, "error": "Could not book appointment."}, 400)
+                appt = hospital.get_appointment(doc_id, token)
                 when = appt_date + (f" {appt_time}" if appt_time else "")
                 return self._send_json({
                     "ok": True,
-                    "message": f"Booked {token} for {pat['name']} ({when}).",
-                    "token": token, "doctor": doc["name"],
+                    "message": f"Booked {appt['apt_id']} ({token}) for {pat['name']} ({when}).",
+                    "token": token, "apt_id": appt["apt_id"],
+                    "appointment": appt,
+                    "doctor": doc["name"],
+                    "department": doc["spec"],
                     "patient": pat["name"], "fee": doc["fee"],
                     "emergency": is_emg,
                     "date": appt_date, "time": appt_time,
-                    "status": "Pending",
+                    "status": appt["status"],
                 })
 
             # ---- Step 6: change an appointment's status.

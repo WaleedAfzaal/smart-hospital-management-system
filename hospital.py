@@ -40,6 +40,17 @@ appointments (anything except Cancelled / No Show) at the same date
 and time. Doctors may only move their OWN queue's appointments to
 Checked In, In Progress or Completed; Admin and Receptionist may set
 any status.
+
+Step 8 (Book Appointment form): patients also carry Father Name,
+Phone and Gender; a booking carries an auto-generated unique
+Appointment ID (APT-0001, sequential, counter kept in the database),
+a Type (General / Follow-up / Emergency — Emergency means an E-
+token, the others an N- token), a Reason for Visit, Additional Notes,
+and a Status chosen at booking (Pending or Confirmed). The heap row
+grew to 14 fields: (priority, seq, token, pid, name, fee,
+booked_date, appt_date, appt_time, status, apt_id, appt_type,
+reason, notes). Old rows load with the new fields empty — their
+APT ID is None and their type reads as General.
 """
 
 import datetime
@@ -59,6 +70,66 @@ APPOINTMENT_STATUSES = ("Pending", "Confirmed", "Checked In",
 # Statuses a Doctor may set — only on their OWN queue (Admin and
 # Receptionist may set any status on any doctor's queue).
 DOCTOR_STATUSES = ("Checked In", "In Progress", "Completed")
+# Statuses that may be chosen AT BOOKING time (Step 8) — anything
+# else (Checked In, In Progress, Completed, Cancelled, No Show) only
+# makes sense as a later update, never as a fresh booking.
+BOOKING_STATUSES = ("Pending", "Confirmed")
+# Step 8: appointment types. "Emergency" books an E- token (first in
+# the queue); General and Follow-up book an N- token.
+APPOINTMENT_TYPES = ("General", "Follow-up", "Emergency")
+# Step 8: patient genders.
+GENDERS = ("Male", "Female", "Other")
+_PHONE_RE = re.compile(r"^\+?[0-9][0-9\s\-()]*$")
+
+
+def validate_phone(phone):
+    """Clean a phone number, or raise ValueError.
+
+    Empty/None means "no phone" and comes back as "". Otherwise only
+    digits, spaces, dashes, brackets and a leading + are allowed —
+    "0300-1234567" and "+92 300 1234567" are fine, letters are not.
+    """
+    if phone in (None, ""):
+        return ""
+    phone = str(phone).strip()
+    if not _PHONE_RE.match(phone) or not any(c.isdigit() for c in phone):
+        raise ValueError(
+            "Phone number may only contain digits, spaces, dashes "
+            "and a leading + (e.g. 0300-1234567).")
+    return phone
+
+
+def validate_gender(gender):
+    """Clean a gender value, or raise ValueError.
+
+    Empty/None means "not given" and comes back as "". Otherwise it
+    must be Male, Female or Other (any case — "male" becomes "Male").
+    """
+    if gender in (None, ""):
+        return ""
+    gender = str(gender).strip().title()
+    if gender not in GENDERS:
+        raise ValueError("Gender must be Male, Female or Other.")
+    return gender
+
+
+def validate_patient_details(name, age, problem):
+    """Check a new patient's name/age/problem, or raise ValueError.
+
+    Used by the booking flow (CLI + API) when a patient is registered
+    inline — the same rules the Add Patient form already enforces.
+    Returns (name, age, problem) cleaned up.
+    """
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("Name cannot be empty.")
+    problem = str(problem or "").strip()
+    if not problem:
+        raise ValueError("Problem cannot be empty.")
+    if isinstance(age, bool) or not isinstance(age, int) \
+            or not 0 <= age <= 150:
+        raise ValueError("Age must be a whole number between 0 and 150.")
+    return name, age, problem
 # Appointments in these statuses no longer occupy their time slot —
 # a new booking at the same date/time is allowed after one of these.
 _INACTIVE_STATUSES = ("Cancelled", "No Show")
@@ -74,11 +145,18 @@ def _row_status(row):
 
 def _public_appointment(doc, row):
     """A plain dict for one heap row — the shape the API and the CLI
-    both use, so the status is the same everywhere."""
+    both use, so the status is the same everywhere.
+
+    Step 8 fields (11th–14th): the auto-generated Appointment ID
+    (None for rows booked before Step 8), the type, the reason for
+    visit and the notes. Rows built before Step 8 simply have none of
+    these — the type reads as General and the rest as empty.
+    """
     return {
         "token": row[2],
         "doctor_id": doc["id"],
         "doctor_name": doc["name"],
+        "department": doc["spec"],
         "patient_id": row[3],
         "patient_name": row[4],
         "fee": row[5],
@@ -87,6 +165,10 @@ def _public_appointment(doc, row):
         "appt_date": row[7] if len(row) > 7 else None,
         "appt_time": row[8] if len(row) > 8 else None,
         "status": _row_status(row),
+        "apt_id": row[10] if len(row) > 10 else None,
+        "appt_type": row[11] if len(row) > 11 and row[11] else "General",
+        "reason": row[12] if len(row) > 12 and row[12] else "",
+        "notes": row[13] if len(row) > 13 and row[13] else "",
     }
 
 # SQLite file used by the CLI and the web server (same file, so both
@@ -149,7 +231,12 @@ def _public_patient(pat):
         node = node.next
     return {"id": pat["id"], "name": pat["name"], "age": pat["age"],
             "problem": pat["problem"], "visits": pat["visits"],
-            "notes": notes, "registered": pat.get("registered")}
+            "notes": notes, "registered": pat.get("registered"),
+            # Step 8: Father Name, Phone and Gender (""/missing for
+            # patients registered before Step 8).
+            "father_name": pat.get("father_name") or "",
+            "phone": pat.get("phone") or "",
+            "gender": pat.get("gender") or ""}
 
 
 class Node:
@@ -292,7 +379,9 @@ class PriorityQueue:
             self.heap[i], self.heap[best] = self.heap[best], self.heap[i]
             i = best
 
-    def enqueue(self, is_emg, pid, name, fee, appt_date=None, appt_time=None):
+    def enqueue(self, is_emg, pid, name, fee, appt_date=None, appt_time=None,
+                apt_id=None, appt_type=None, reason=None, notes=None,
+                status="Pending"):
         self.count += 1
         token = f"{'E' if is_emg else 'N'}-{self.count}"
         # Step 3: the booking date rides along as the 7th field, so the
@@ -303,10 +392,15 @@ class PriorityQueue:
         # Bad values raise ValueError (see validate_appt_datetime).
         appt_date, appt_time = validate_appt_datetime(appt_date, appt_time)
         # Step 6: the status rides as the 10th field — every new
-        # appointment starts Pending.
+        # appointment starts Pending (or Confirmed when chosen at
+        # booking, Step 8).
+        # Step 8: the Appointment ID, type, reason and notes ride as
+        # the 11th–14th fields. Rows built before Step 8 simply have
+        # none of these (they save/load as NULL/empty).
         self.heap.append((1 if is_emg else 2, self.count, token, pid, name,
                           fee, datetime.date.today().isoformat(),
-                          appt_date, appt_time, "Pending"))
+                          appt_date, appt_time, status, apt_id,
+                          appt_type or "General", reason or "", notes or ""))
         self._move_up(len(self.heap) - 1)
         return token
 
@@ -355,6 +449,10 @@ class Hospital:
         self.patients_map, self.patients_list, self.doctors_map = {}, [], {}
         self.beds = [0] * self.NUM_BEDS
         self.undo_stack, self.pharmacy_q, self.shift_q = Stack(), Queue(), CircularQueue(20)
+        # Step 8: the Appointment ID counter — the next number to use
+        # (APT-0001, APT-0002, ...). The database load overwrites it
+        # with the saved value, so IDs never repeat after a restart.
+        self.apt_counter = 1
         # Persistence (Step 1): with a db file, load saved state (or
         # save this fresh empty state to the file on first run). Without
         # one, everything stays in memory as before.
@@ -380,19 +478,38 @@ class Hospital:
         """Save after every change, so a restart never loses data."""
         self.save()
 
-    def add_patient(self, pid, name, age, problem, save_undo=True):
+    def add_patient(self, pid, name, age, problem, father_name=None,
+                    phone=None, gender=None, save_undo=True):
+        """Register a patient.
+
+        Step 8: Father Name, Phone and Gender are optional (empty when
+        not given). A bad phone or gender raises ValueError; a
+        duplicate ID just prints and adds nothing (as before — the
+        test for duplicate IDs relies on it).
+        """
         if pid in self.patients_map:
             return print("  ID already exists.")
+        phone = validate_phone(phone)
+        gender = validate_gender(gender)
         # Step 3: remember the registration date for the daily report.
         pat = {"id": pid, "name": name, "age": age, "problem": problem,
                "visits": 0, "notes": LinkedList(),
-               "registered": datetime.date.today().isoformat()}
+               "registered": datetime.date.today().isoformat(),
+               "father_name": (father_name or "").strip(),
+               "phone": phone, "gender": gender}
         self.patients_map[pid] = pat
         self.patients_list.append(pat)
         if save_undo:
             self.undo_stack.push(("ADD_PATIENT", pid))
         self._persist()
         print("  Patient added.")
+
+    def next_patient_id(self):
+        """The next free patient ID — one above the highest ID in use
+        (101 when the register is empty). Used when a new patient is
+        registered inside the booking flow, so nobody has to invent
+        an ID number."""
+        return max(self.patients_map, default=100) + 1
 
     def show_sorted(self, field):
         for p in bubble_sort(self.patients_list, field):
@@ -407,22 +524,40 @@ class Hospital:
         p["notes"].show()
 
     # ------------------------------------------------ Step 5: search / edit / delete
-    def search_patients(self, name):
-        """Patients whose name contains ``name`` (partial, case-insensitive).
+    def search_patients(self, query):
+        """Find patients by ID, name or phone — one search box for all
+        three (Step 8).
 
+        * a query that is all digits matches a patient with that exact
+          ID, and any patient whose phone contains those digits;
+        * any other query matches patients whose NAME contains it
+          (partial, case-insensitive, as before) or whose phone
+          contains its digits ("0300" finds "0300-1234567").
         Returns public copies sorted by ID. An empty query matches
         nothing — it is not "show everyone" — so the caller gets an
         empty list and can say so plainly instead of dumping the whole
         register.
         """
-        query = (name or "").strip().lower()
-        if not query:
+        raw = (query or "")
+        text = str(raw).strip()
+        if not text:
             return []
-        return [_public_patient(p) for p in
-                sorted(self.patients_list, key=lambda p: p["id"])
-                if query in p["name"].lower()]
+        digits = re.sub(r"\D", "", text)
+        is_id = text.isdigit()
+        query_lower = text.lower()
+        out = []
+        for pat in sorted(self.patients_list, key=lambda p: p["id"]):
+            pat_digits = re.sub(r"\D", "", pat.get("phone") or "")
+            if is_id and pat["id"] == int(text):
+                out.append(_public_patient(pat))
+            elif query_lower in pat["name"].lower():
+                out.append(_public_patient(pat))
+            elif digits and pat_digits and digits in pat_digits:
+                out.append(_public_patient(pat))
+        return out
 
-    def edit_patient(self, pid, name=None, age=None, problem=None):
+    def edit_patient(self, pid, name=None, age=None, problem=None,
+                     father_name=None, phone=None, gender=None):
         """Change a patient's name, age and/or problem. The ID never changes.
 
         Only the fields you pass are changed. Raises ValueError if the
@@ -431,6 +566,10 @@ class Hospital:
         appointments show the new name too; bills keep the name they
         were made with (they are financial records). Returns the
         updated patient.
+
+        Step 8: Father Name, Phone and Gender can be changed the same
+        way (pass "" to clear one, None to leave it alone). A bad
+        phone or gender raises ValueError and nothing changes.
         """
         pat = self.patients_map.get(pid)
         if pat is None:
@@ -448,6 +587,12 @@ class Hospital:
                     or not 0 <= age <= 150:
                 raise ValueError(
                     "Age must be a whole number between 0 and 150.")
+        if father_name is not None:
+            father_name = str(father_name).strip()
+        if phone is not None:
+            phone = validate_phone(phone)
+        if gender is not None:
+            gender = validate_gender(gender)
         if name is not None and name != pat["name"]:
             # The name rides on the queued appointment rows too — keep
             # them in sync (heap order is untouched: priority/seq never
@@ -461,6 +606,12 @@ class Hospital:
             pat["age"] = age
         if problem is not None:
             pat["problem"] = problem
+        if father_name is not None:
+            pat["father_name"] = father_name
+        if phone is not None:
+            pat["phone"] = phone
+        if gender is not None:
+            pat["gender"] = gender
         self._persist()
         return _public_patient(pat)
 
@@ -562,7 +713,64 @@ class Hospital:
                 return print(f"  {exc}")
             print("  Doctor added.")
 
-    def book_appointment(self, doc_id, pid, is_emg, appt_date=None, appt_time=None):
+    # ------------------------------------------------ Step 8: booking form helpers
+    def departments(self):
+        """Every department — the distinct doctor specializations,
+        alphabetically. There is no separate Departments module yet;
+        a doctor's specialization IS their department."""
+        return sorted({doc["spec"] for doc in self.doctors_map.values()})
+
+    def doctors_in_department(self, department):
+        """Doctors in one department (specialization), by ID."""
+        dept = str(department or "").strip()
+        return [doc for doc in sorted(self.doctors_map.values(),
+                                      key=lambda d: d["id"])
+                if doc["spec"] == dept]
+
+    def next_apt_id(self):
+        """The next Appointment ID (APT-0001, APT-0002, ...) and move
+        the counter on. The counter is saved in the database, so an ID
+        is never handed out twice — not even after a restart. Only
+        call this when a booking is really about to happen."""
+        apt_id = f"APT-{self.apt_counter:04d}"
+        self.apt_counter += 1
+        return apt_id
+
+    def doctor_booked_times(self, doctor_id, date):
+        """The times one doctor already has booked on ``date`` — the
+        availability the booking form shows, so taken slots are
+        visible before a time is picked.
+
+        Every timed appointment that day is listed (time, token,
+        status, patient name), sorted by time. Cancelled and No Show
+        appointments are listed too but do NOT block their slot — the
+        Step 6 guard only counts ACTIVE ones. Untimed appointments
+        never appear here (they have no slot to show).
+        """
+        if date is None:
+            date = datetime.date.today().isoformat()
+        else:
+            date, _ = validate_appt_datetime(date, None)
+        doc = self.doctors_map.get(str(doctor_id or "").upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        out = []
+        for row in doc["queue"].heap:
+            appt_date = row[7] if len(row) > 7 else None
+            appt_time = row[8] if len(row) > 8 else None
+            if appt_date == date and appt_time:
+                out.append({
+                    "time": appt_time,
+                    "token": row[2],
+                    "status": _row_status(row),
+                    "patient_name": row[4],
+                })
+        out.sort(key=lambda b: b["time"])
+        return out
+
+    def book_appointment(self, doc_id, pid, is_emg=False, appt_date=None,
+                         appt_time=None, appt_type=None, reason=None,
+                         notes=None, status="Pending"):
         """Book an appointment and return its token (None on failure).
 
         Step 4: ``appt_date`` (YYYY-MM-DD, empty = today) and
@@ -572,11 +780,34 @@ class Hospital:
         Step 6: a double booking is refused — the same doctor cannot
         have two ACTIVE appointments at the same date and time. The
         new appointment starts with status Pending.
+        Step 8: ``appt_type`` is General, Follow-up or Emergency. The
+        type decides the queue priority — Emergency books an E- token,
+        the others an N- token (when no type is given, the old
+        ``is_emg`` flag decides, so old callers keep working).
+        ``reason`` and ``notes`` are stored on the appointment, and
+        ``status`` may be Pending (the default) or Confirmed. The
+        booking gets a unique Appointment ID (APT-0001, ...) — read it
+        back with get_appointment(token). A bad type, status, reason
+        or note just prints the reason and books nothing.
         """
         doc, pat = self.doctors_map.get(doc_id.upper()), self.patients_map.get(pid)
         if not doc or not pat:
             print("  Invalid doctor or patient ID.")
             return None
+        if appt_type is None:
+            appt_type = "Emergency" if is_emg else "General"
+        else:
+            appt_type = str(appt_type).strip()
+            if appt_type not in APPOINTMENT_TYPES:
+                print("  Type must be General, Follow-up or Emergency.")
+                return None
+            is_emg = appt_type == "Emergency"
+        status = str(status or "Pending").strip()
+        if status not in BOOKING_STATUSES:
+            print("  Status at booking must be Pending or Confirmed.")
+            return None
+        reason = (reason or "").strip()
+        notes = (notes or "").strip()
         try:
             appt_date, appt_time = validate_appt_datetime(appt_date, appt_time)
         except ValueError as exc:
@@ -589,9 +820,12 @@ class Hospital:
                   f"{appt_date} {appt_time} (token {conflict['token']}, "
                   f"{conflict['status']}). Pick another time.")
             return None
+        apt_id = self.next_apt_id()
         try:
             token = doc["queue"].enqueue(
-                is_emg, pid, pat["name"], doc["fee"], appt_date, appt_time)
+                is_emg, pid, pat["name"], doc["fee"], appt_date, appt_time,
+                apt_id=apt_id, appt_type=appt_type, reason=reason,
+                notes=notes, status=status)
         except ValueError as exc:
             print(f"  {exc}")
             return None
@@ -600,8 +834,8 @@ class Hospital:
         self._persist()
         row = next((r for r in doc["queue"].heap if r[2] == token), None)
         when = _appt_when(row) if row is not None else ""
-        print(f"  Booked {token} for {pat['name']} with {doc['name']} | Fee: {doc['fee']}"
-              f"{' | ' + when if when else ''} | Pending")
+        print(f"  Booked {apt_id} ({token}) for {pat['name']} with {doc['name']} | Fee: {doc['fee']}"
+              f"{' | ' + when if when else ''} | {appt_type} | {status}")
         return token
 
     # ------------------------------------------------ Step 6: statuses
@@ -686,9 +920,10 @@ class Hospital:
         if old_status == new_status:
             return _public_appointment(doc, row)
         # Heap order is untouched (priority/seq never change), so the
-        # heap stays valid — only the 10th field changes.
-        base = row[:9] if len(row) > 9 else row
-        doc["queue"].heap[idx] = base + (new_status,)
+        # heap stays valid — only the 10th field changes. Everything
+        # after it (Step 8: Appointment ID, type, reason, notes) is
+        # kept exactly as it was.
+        doc["queue"].heap[idx] = row[:9] + (new_status,) + row[10:]
         self.status_history.record(
             doc["id"], token, old_status, new_status, changed_by)
         self._persist()
@@ -1302,10 +1537,169 @@ def appointment_status_menu(hosp, role, user):
     print(f"  Status updated: {token} is now {updated['status']}.")
 
 
+def book_appointment_menu(hosp):
+    """Book Appointment (Step 8, menu 6): the full booking form on the
+    command line — search an existing patient (ID / name / phone) or
+    register a new one inline, pick department then doctor, see that
+    doctor's booked times for the day, then date/time/type/reason/
+    notes/status. A confirmation summary is shown before booking, and
+    after booking the user is offered a bill for the appointment
+    (Step 3 flow — only when they ask, never automatic).
+    """
+    print("\n  --- Book Appointment ---")
+    # ---- 1. Patient: search, or register a new one inline
+    print("  1. Patient")
+    query = input("  Search patient by ID / name / phone (empty = new patient): ").strip()
+    pat = None
+    if query:
+        matches = hosp.search_patients(query)
+        if not matches:
+            print("  No patient found — register a new patient below.")
+        else:
+            for i, p in enumerate(matches, 1):
+                print(f"    {i}. ID {p['id']} | {p['name']} | Age {p['age']} | {p['problem']}"
+                      + (f" | {p['phone']}" if p.get("phone") else ""))
+            try:
+                pick = int(input("  Pick a patient (number, 0 = new patient): ").strip())
+            except ValueError:
+                return print("  Pick a number.")
+            if pick == 0:
+                pass
+            elif 1 <= pick <= len(matches):
+                pat = hosp.patients_map[matches[pick - 1]["id"]]
+            else:
+                return print("  Pick a number from the list.")
+    if pat is None:
+        pid = hosp.next_patient_id()
+        print(f"  New patient — ID will be {pid}.")
+        name = input("  Full Name: ").strip()
+        try:
+            age = int(input("  Age: ").strip())
+        except ValueError:
+            return print("  Age must be a number.")
+        problem = input("  Problem / Symptoms: ").strip()
+        father_name = input("  Father Name (optional): ").strip()
+        phone = input("  Phone (optional): ").strip()
+        gender = input("  Gender (Male/Female/Other, optional): ").strip()
+        try:
+            name, age, problem = validate_patient_details(name, age, problem)
+            phone = validate_phone(phone)
+            gender = validate_gender(gender)
+        except ValueError as exc:
+            return print(f"  {exc}")
+        hosp.add_patient(pid, name, age, problem, father_name=father_name,
+                         phone=phone, gender=gender)
+        pat = hosp.patients_map[pid]
+        print(f"  Patient {name} (#{pid}) registered.")
+    # ---- 2. Department, then doctor
+    print("  2. Doctor")
+    depts = hosp.departments()
+    if not depts:
+        return print("  No doctors yet — ask Admin to add one first.")
+    for i, dept in enumerate(depts, 1):
+        print(f"    {i}. {dept}")
+    try:
+        pick = int(input("  Pick a department (number): ").strip())
+        dept = depts[pick - 1]
+    except (ValueError, IndexError):
+        return print("  Pick a number from the list.")
+    docs = hosp.doctors_in_department(dept)
+    for i, doc in enumerate(docs, 1):
+        print(f"    {i}. {doc['id']} | {doc['name']} | Fee Rs {doc['fee']}")
+    try:
+        pick = int(input("  Pick a doctor (number): ").strip())
+        doc = docs[pick - 1]
+    except (ValueError, IndexError):
+        return print("  Pick a number from the list.")
+    # ---- 3. Date, then that doctor's booked times, then time
+    print(f"  3. Date & Time — {doc['name']} ({doc['spec']}), Fee Rs {doc['fee']}")
+    date_raw = input("  Date (YYYY-MM-DD, empty = today): ").strip() or None
+    try:
+        appt_date, _ = validate_appt_datetime(date_raw, None)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    try:
+        booked = hosp.doctor_booked_times(doc["id"], appt_date)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    if booked:
+        print(f"  Already booked on {appt_date}:")
+        for b in booked:
+            tag = "TAKEN" if b["status"] not in _INACTIVE_STATUSES else "free again"
+            print(f"    {b['time']} | {b['token']} ({b['patient_name']}) | {b['status']} — {tag}")
+    else:
+        print(f"  Nothing booked on {appt_date} yet — all times free.")
+    appt_time = input("  Time (HH:MM, empty = no fixed time): ").strip() or None
+    # ---- 4. Type, reason, notes, status
+    print("  4. Appointment details")
+    print("  Type: 1. General  2. Follow-up  3. Emergency (E- token, first in queue)")
+    type_raw = input("  Pick a type (1-3, empty = General): ").strip()
+    appt_type = {"1": "General", "2": "Follow-up",
+                 "3": "Emergency"}.get(type_raw or "1")
+    if appt_type is None:
+        return print("  Pick 1, 2 or 3.")
+    reason = input("  Reason for Visit: ").strip()
+    notes = input("  Additional Notes (optional): ").strip()
+    status_raw = input("  Status (Pending / Confirmed, empty = Pending): ").strip().title()
+    status = status_raw if status_raw in BOOKING_STATUSES else "Pending"
+    # ---- 5. Confirm, then book
+    print("\n  --- Confirm ---")
+    print(f"  Patient: {pat['name']} (#{pat['id']})")
+    print(f"  Doctor: {doc['name']} ({doc['spec']}) — Fee Rs {doc['fee']}")
+    print(f"  When: {appt_date}"
+          + (f" {appt_time}" if appt_time else " (no fixed time)"))
+    print(f"  Type: {appt_type} | Status: {status}")
+    if reason:
+        print(f"  Reason: {reason}")
+    if input("  Book this appointment? (Y/N): ").strip().upper() != "Y":
+        return print("  Cancelled — nothing booked.")
+    token = hosp.book_appointment(doc["id"], pat["id"], False, appt_date,
+                                  appt_time, appt_type=appt_type,
+                                  reason=reason, notes=notes, status=status)
+    if token is None:
+        return print("  Booking failed — see the message above.")
+    appt = hosp.get_appointment(doc["id"], token)
+    print(f"  Booked! Appointment ID {appt['apt_id']} — Token {token} "
+          f"— Fee Rs {doc['fee']} — {status}")
+    # ---- 6. Offer the bill (Step 3 flow — only when the user asks)
+    if input("  Generate a bill for this appointment now? (Y/N): ").strip().upper() == "Y":
+        try:
+            bill = hosp.create_bill(pat["id"], doc["id"], token)
+        except ValueError as exc:
+            return print(f"  {exc}")
+        print(f"  Bill #{bill['id']} created — Total Rs {bill['total']} (Unpaid).")
+
+
+def add_patient_menu(hosp):
+    """Add Patient (menu 1, Step 8): ID + name + age + problem, plus
+    the optional Father Name, Phone and Gender."""
+    try:
+        pid = int(input("ID: "))
+    except ValueError:
+        return print("  ID must be a number.")
+    name = input("Name: ").strip()
+    try:
+        age = int(input("Age: "))
+    except ValueError:
+        return print("  Age must be a number.")
+    problem = input("Problem: ").strip()
+    father_name = input("Father Name (optional): ").strip()
+    phone = input("Phone (optional): ").strip()
+    gender = input("Gender (Male/Female/Other, optional): ").strip()
+    try:
+        name, age, problem = validate_patient_details(name, age, problem)
+        phone = validate_phone(phone)
+        gender = validate_gender(gender)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    hosp.add_patient(pid, name, age, problem, father_name=father_name,
+                     phone=phone, gender=gender)
+
+
 def find_patient_menu(hosp):
-    """Find a patient — by ID (binary search) or by name (Step 5:
-    partial, case-insensitive)."""
-    opt = input("  1. By ID  2. By Name: ").strip()
+    """Find a patient — by ID (binary search) or by name / phone / ID
+    (Step 8: one search matches all three)."""
+    opt = input("  1. By ID  2. Search (name / phone / ID): ").strip()
     if opt == "1":
         try:
             pid = int(input("  ID: "))
@@ -1313,20 +1707,23 @@ def find_patient_menu(hosp):
             return print("  ID must be a number.")
         hosp.find_patient(pid)
     elif opt == "2":
-        name = input("  Name (or part of it): ").strip()
-        matches = hosp.search_patients(name)
+        query = input("  Search (name, phone or ID): ").strip()
+        matches = hosp.search_patients(query)
         if not matches:
-            return print("  No patient found with that name.")
+            return print("  No patient found.")
         for p in matches:
             print(f"  ID {p['id']} | {p['name']} | Age {p['age']} | "
-                  f"{p['problem']} | Visits: {p['visits']}")
+                  f"{p['problem']} | Visits: {p['visits']}"
+                  + (f" | {p['phone']}" if p.get("phone") else ""))
     else:
         print("  Invalid choice.")
 
 
 def edit_patient_menu(hosp):
     """Edit a patient (Step 5): change name, age and/or problem.
-    The ID never changes; Enter keeps the current value."""
+    The ID never changes; Enter keeps the current value.
+    Step 8: Father Name, Phone and Gender can be changed the same way.
+    """
     try:
         pid = int(input("  Patient ID to edit: "))
     except ValueError:
@@ -1338,6 +1735,9 @@ def edit_patient_menu(hosp):
     name = input(f"  New name [{pat['name']}]: ").strip() or None
     age_raw = input(f"  New age [{pat['age']}]: ").strip()
     problem = input(f"  New problem [{pat['problem']}]: ").strip() or None
+    father_name = input(f"  New father name [{pat.get('father_name') or ''}]: ").strip() or None
+    phone = input(f"  New phone [{pat.get('phone') or ''}]: ").strip() or None
+    gender = input(f"  New gender [{pat.get('gender') or ''}]: ").strip() or None
     age = None
     if age_raw:
         try:
@@ -1345,11 +1745,14 @@ def edit_patient_menu(hosp):
         except ValueError:
             return print("  Age must be a number.")
     try:
-        updated = hosp.edit_patient(pid, name=name, age=age, problem=problem)
+        updated = hosp.edit_patient(pid, name=name, age=age, problem=problem,
+                                    father_name=father_name, phone=phone,
+                                    gender=gender)
     except ValueError as exc:
         return print(f"  {exc}")
     print(f"  Updated: ID {updated['id']} | {updated['name']} | "
-          f"Age {updated['age']} | {updated['problem']}")
+          f"Age {updated['age']} | {updated['problem']}"
+          + (f" | Phone {updated['phone']}" if updated.get("phone") else ""))
 
 
 def delete_patient_menu(hosp):
@@ -1451,7 +1854,7 @@ def main():
             print(f"  Not allowed for your role ({role}).")
             continue
         if choice == "1":
-            hosp.add_patient(int(input("ID: ")), input("Name: "), int(input("Age: ")), input("Problem: "))
+            add_patient_menu(hosp)
         elif choice == "2":
             hosp.show_sorted("age" if input("Sort by (id/age): ").strip() == "age" else "id")
         elif choice == "3":
@@ -1461,14 +1864,9 @@ def main():
         elif choice == "5":
             hosp.doctors_menu(role)
         elif choice == "6":
-            # Step 4: ask WHEN the appointment is for — date empty means
-            # today, time empty means no fixed time. A bad date/time
-            # just prints the reason (book_appointment handles it).
-            hosp.book_appointment(
-                input("Doctor ID: "), int(input("Patient ID: ")),
-                input("Emergency (E) or Normal (N): ").strip().upper() == "E",
-                input("Date (YYYY-MM-DD, empty = today): ").strip() or None,
-                input("Time (HH:MM, empty = no fixed time): ").strip() or None)
+            # Step 8: the full booking form — search or register a
+            # patient inline, pick department/doctor, date/time/type.
+            book_appointment_menu(hosp)
         elif choice == "7":
             hosp.beds_menu()
         elif choice == "8":

@@ -50,11 +50,11 @@ their own with the Add Doctor form (CLI menu or web dashboard).
 
 | Method | Path | Body | Description |
 | ------ | ---- | ---- | ----------- |
-| POST | `/api/patients` | `{id, name, age, problem}` | Add patient. Fails if the ID already exists or fields are invalid |
+| POST | `/api/patients` | `{id, name, age, problem, father_name?, phone?, gender?}` | Add patient. Fails if the ID already exists or fields are invalid. Step 8: Father Name, Phone and Gender are optional — a bad phone (letters in it) or gender (not Male / Female / Other) gets a 400 |
 | GET | `/api/patients?sort=id\|age` | — | Patients sorted with `bubble_sort` by id or age |
-| GET | `/api/patients?name=ahm` | — | Step 5: patients whose name contains the query (partial, case-insensitive), sorted by id. No match returns an empty list, not an error |
+| GET | `/api/patients?name=ahm` | — | Step 5: patients whose name contains the query (partial, case-insensitive), sorted by id. No match returns an empty list, not an error. Step 8: the same search also matches an exact patient ID ("101") and a phone fragment ("0300" finds a phone 0300-...) |
 | GET | `/api/patients/<id>` | — | Find one patient via `binary_search` on the id-sorted list; includes notes |
-| POST | `/api/patients/<id>` | `{name?, age?, problem?}` | Step 5: edit a patient — only the given fields change, the ID never changes. Admin + Receptionist only. Bad values get a 400; missing patient gets a 404 |
+| POST | `/api/patients/<id>` | `{name?, age?, problem?, father_name?, phone?, gender?}` | Step 5: edit a patient — only the given fields change, the ID never changes. Admin + Receptionist only. Bad values get a 400; missing patient gets a 404. Step 8: father_name, phone and gender can be changed the same way ("" clears one) |
 | DELETE | `/api/patients/<id>` | — | Step 5: delete a patient — Admin only. Removes the record, notes and queued appointments and frees their bed; their bills are KEPT. Returns a summary of what was removed. Missing patient gets a 404 |
 | POST | `/api/patients/<id>/notes` | `{note}` | Add a note (LinkedList) — also bumps the visit count |
 
@@ -69,12 +69,13 @@ their own with the Add Doctor form (CLI menu or web dashboard).
 
 | Method | Path | Body | Description |
 | ------ | ---- | ---- | ----------- |
-| POST | `/api/appointments` | `{doctor_id, patient_id, emergency, date?, time?}` | Book a token. Emergency → `E-n`, Normal → `N-n` (n = that doctor's queue count). PriorityQueue (binary heap) serves Emergency first. `date` is `YYYY-MM-DD` (empty = today), `time` is `HH:MM` 24-hour (empty = no fixed time); bad values get a 400 with a plain message. Returns the token + fee + scheduled date/time. **Step 6:** a double booking — same doctor, same date, same time, while the existing appointment is still active — gets a 400 that says which token is in the way. New appointments start Pending |
+| POST | `/api/appointments` | `{doctor_id, patient_id \| new_patient, type?, status?, reason?, notes?, date?, time?}` | Book a token. Step 8: `type` is General / Follow-up / Emergency — Emergency → `E-n`, the others → `N-n` (n = that doctor's queue count); when no `type` is given the old `emergency` flag still decides. PriorityQueue (binary heap) serves Emergency first. `date` is `YYYY-MM-DD` (empty = today), `time` is `HH:MM` 24-hour (empty = no fixed time); bad values get a 400 with a plain message. `status` is Pending (default) or Confirmed. `new_patient` (`{name, age, problem, father_name?, phone?, gender?, id?}`) registers a patient inline — the ID is auto-assigned when left out. Returns the full appointment including its unique Appointment ID (`APT-0001`, …) + token + fee + scheduled date/time. **Step 6:** a double booking — same doctor, same date, same time, while the existing appointment is still active — gets a 400 that says which token is in the way. New appointments start Pending |
 | GET | `/api/appointments?date=YYYY-MM-DD&doctor_id=D1` | — | Appointments scheduled for that date (today by default), sorted by time then Emergency-first. `doctor_id` is optional; a Doctor user linked to one doctor only ever sees that doctor's appointments |
+| GET | `/api/appointments/slots?doctor_id=D1&date=YYYY-MM-DD` | — | Step 8: that doctor's booked times for the day (time, token, status, patient name), sorted by time — the availability the booking form shows. Cancelled / No Show times are listed but do not block their slot. Bad date or unknown doctor gets a 400/404; a Doctor user linked to one doctor only ever sees their own day |
 | POST | `/api/appointments/<doctor>/<token>/status` | `{status}` | Step 6: change an appointment's status (one of the seven). Admin/Receptionist: any status, any queue. Doctor: only their own queue, only Checked In / In Progress / Completed — otherwise 403. Bad status or missing token gets a 400. Returns the updated appointment + its full history |
 | GET | `/api/appointments/<doctor>/<token>/history` | — | Step 6: the recorded status changes for one appointment, oldest first — old status, new status, who changed it, when. A Doctor linked to one doctor may only read their own queue's. Missing doctor/token gets a 404 |
 
-Each queue item in `GET /api/doctors` and `/api/state` now also carries `booked_date` (when the token was issued), `appt_date` and `appt_time` (when the patient should come — `null` for appointments booked before Step 4) and `status` (Step 6 — `Pending` for appointments booked before Step 6).
+Each queue item in `GET /api/doctors` and `/api/state` now also carries `booked_date` (when the token was issued), `appt_date` and `appt_time` (when the patient should come — `null` for appointments booked before Step 4), `status` (Step 6 — `Pending` for appointments booked before Step 6) and `apt_id`, `appt_type`, `reason`, `notes` (Step 8 — `null`/empty for appointments booked before Step 8).
 
 ## Beds (op 7)
 

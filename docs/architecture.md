@@ -338,6 +338,100 @@ doctor also joins the shift rotation.
   on a seeded hospital, empty-hospital zeros, `StatusHistory.recent`,
   `/api/dashboard` payload + 401 without login).
 
+## Book Appointment Form — Step 8 (`hospital.py` + `database.py` + `server.py` + `web/`)
+
+- **Appointment ID** (`Hospital.next_apt_id`): `APT-0001`, `APT-0002`,
+  … — one hospital-wide counter, handed out only when a booking is
+  really about to happen (after the double-booking check passes).
+  The counter lives in the `meta` table (`apt_counter`) and is saved
+  on every save, so an ID is never reused after a restart; on load it
+  is also pushed above the highest APT number already stored, so a
+  missing meta row can never cause a duplicate. The ID rides as the
+  **11th field** of the heap row, with the type (12th), reason (13th)
+  and notes (14th).
+- **Type** (`APPOINTMENT_TYPES` = General, Follow-up, Emergency):
+  the type decides the queue priority — Emergency books an `E-` token,
+  the others an `N-` token. When no type is given, the old `is_emg`
+  flag decides (so older callers and the old API shape keep working).
+  `Hospital.book_appointment` takes the new fields as keyword
+  arguments (`appt_type`, `reason`, `notes`, `status`) and still
+  returns the token (or `None` on failure, printing the reason);
+  the full appointment — including the APT ID — is read back with
+  `Hospital.get_appointment(doc_id, token)`. The status at booking
+  may only be Pending or Confirmed (`BOOKING_STATUSES`).
+- **Patient fields** (`father_name`, `phone`, `gender`): stored on
+  the patient record, validated by `validate_phone` (digits, spaces,
+  dashes, brackets, leading `+` only) and `validate_gender` (Male /
+  Female / Other, any case). `Hospital.search_patients(query)` now
+  matches all three ways — an exact patient ID, a name substring
+  (partial, case-insensitive, as before) or a phone fragment
+  (digits only, so "0300" finds "0300-1234567"). `next_patient_id`
+  is one above the highest ID in use (101 when empty) — used when a
+  patient is registered inside the booking flow.
+- **Departments / availability** (`Hospital.departments`,
+  `doctors_in_department`, `doctor_booked_times`): departments are
+  the distinct doctor specializations (no separate Departments module
+  yet). `doctor_booked_times(doctor_id, date)` lists that doctor's
+  timed appointments for the day (time, token, status, patient name),
+  sorted by time — Cancelled / No Show entries are listed but do not
+  block their slot. There is no working-hours system yet (that is
+  Step 11), so the form shows booked times and refuses a taken slot
+  via the Step 6 guard instead of inventing fixed slots.
+- **History key unchanged:** the status history is still keyed by
+  doctor + token (see Step 6) — the APT ID rides on the appointment
+  record and the API reply, but nothing in the history was re-keyed.
+  One Step 6 bug was fixed along the way: `update_status` used to
+  rebuild the heap row from its first 9 fields, which would have
+  dropped the Step 8 fields — it now keeps everything after the
+  status field.
+- **Database** (`database.py`): `patients` gains `father_name` /
+  `phone` / `gender`, `appointments` gains `apt_id` / `appt_type` /
+  `reason` / `notes` (schema + `_migrate` ALTER TABLE for older
+  files); old rows load with the new fields empty (APT ID `None`,
+  type General). A database built before Step 8 is verified to load
+  this way in the tests.
+- **API:** `POST /api/appointments` takes `{doctor_id, patient_id |
+  new_patient, type?, status?, reason?, notes?, date?, time?}` —
+  `new_patient` (`{name, age, problem, father_name?, phone?,
+  gender?, id?}`) registers a patient inline (ID auto-assigned when
+  left out); everything is validated BEFORE the patient is
+  registered, so a failed booking never leaves a stray patient
+  behind. The reply carries the full `appointment` (with `apt_id`)
+  plus the confirmation fields. `GET /api/appointments/slots?
+  doctor_id=...&date=...` returns the booked times. `POST
+  /api/patients` and the edit endpoint accept the three new patient
+  fields; `GET /api/patients?name=...` matches ID/name/phone. The
+  old `emergency` flag still works when no `type` is given.
+- **CLI:** menu **6. Book Appt** (`book_appointment_menu`) runs the
+  same three steps — search or register a patient, pick department
+  then doctor, see the booked times for the day, then
+  date/time/type/reason/notes/status — shows a confirmation summary
+  and offers to generate the bill (Step 3 flow, only when asked).
+  Menu **1. Add Patient** asks the three optional fields too, and
+  menu **18. Edit Patient** can change them (blank keeps the value).
+- **Web:** the **Book Appointment** form (Appointments in the
+  sidebar, or the dashboard Quick Action) is the same three steps —
+  live patient search (ID / name / phone) with a selectable result
+  list, an inline new-patient form, department → doctor dropdowns
+  with fee + specialization shown, live booked-times for the chosen
+  doctor/day, type/status dropdowns, reason/notes, and a
+  confirmation summary with the Appointment ID and a **Generate
+  Bill** button. The Add Patient form and the patient-card edit form
+  have the three new fields too, and patient cards show them.
+- **Permissions:** booking is still Admin/Receptionist only
+  (Doctor cannot book — existing rule, enforced by the server with a
+  403); the slots endpoint is `view` for every role, with a linked
+  Doctor only ever seeing their own day.
+- Tests: `tests/test_book_appointment.py` (APT ID sequential +
+  unique + persistent across restart, old rows load without APT
+  fields, patient search by ID/name/phone, new patient fields +
+  validation, department → doctor filtering, type → token mapping,
+  reason/notes/status at booking, double booking still refused,
+  booked-times incl. Cancelled freeing the slot, update_status keeps
+  the Step 8 fields, plus the API: inline new-patient booking, type
+  / reason / notes / status, slots endpoint, validation 400s,
+  Doctor booking 403, search by phone/ID, new fields on add/edit).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -382,7 +476,10 @@ and `tests/test_server.py::TestServerPatients` (the same over HTTP).
 Step 6 adds `tests/test_appointment_status.py` (default Pending,
 transitions + history, old-row migration, double-booking guard,
 role enforcement, history persistence, plus
-`TestStatusServer` over HTTP).
+`TestStatusServer` over HTTP). Step 7 adds `tests/test_dashboard.py`.
+Step 8 adds `tests/test_book_appointment.py` (Appointment IDs,
+patient search by ID/name/phone, new patient fields, type → token,
+booked-times/slots endpoint, inline new-patient booking over HTTP).
 Run with:
 
 ```bash

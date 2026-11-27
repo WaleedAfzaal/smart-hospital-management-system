@@ -8,7 +8,6 @@ let currentView = "dashboard"; /* "dashboard" = Step 7 view, "module" = workspac
 let dashData = null; /* latest GET /api/dashboard payload */
 let chartMode = "year"; /* "year" (Jan–Dec) or "last12" (rolling 12 months) */
 let sortField = "id";
-let bookEmergency = false;
 let currentUser = null;
 
 /* Step 2 (Login): which tile each role may use. The server enforces
@@ -219,7 +218,7 @@ const OPS = {
   "find-patient": ["Find Patient", "Find by ID, or search by name — edit or delete from the card"],
   "add-note": ["Add Note", "Record visit note (increments visits)"],
   "doctors": ["Doctors", "View doctor queues or add a doctor"],
-  "book-appointment": ["Book Appointment", "Issue Normal or Emergency token"],
+  "book-appointment": ["Book Appointment", "Search patient, pick department/doctor, date/time, type"],
   "beds": ["Beds", "Assign or free hospital beds (1–10)"],
   "pharmacy": ["Pharmacy Queue", "FIFO medicine counter queue"],
   "shifts": ["Shifts", "Circular doctor duty rotation"],
@@ -420,6 +419,16 @@ function renderAddPatient(msg = "", ok = true) {
         <div class="field"><label>Problem / Symptoms</label>
           <input type="text" name="problem" placeholder="e.g. Cough, fever" required></div>
       </div>
+      <div class="field-row">
+        <div class="field"><label>Father Name (optional)</label>
+          <input type="text" name="father_name" placeholder="e.g. Muhammad Ali"></div>
+        <div class="field"><label>Phone (optional)</label>
+          <input type="text" name="phone" placeholder="e.g. 0300-1234567"></div>
+      </div>
+      <div class="field"><label>Gender (optional)</label>
+        <select name="gender">
+          <option value="">—</option><option>Male</option><option>Female</option><option>Other</option>
+        </select></div>
       <div class="btn-row">
         <button type="submit" class="btn btn-primary">Create Patient +</button>
         <button type="button" class="btn btn-ghost" onclick="openOp('dashboard')">Cancel</button>
@@ -431,6 +440,8 @@ function renderAddPatient(msg = "", ok = true) {
     const res = await api("/api/patients", "POST", {
       id: Number(f.get("id")), name: f.get("name"),
       age: Number(f.get("age")), problem: f.get("problem"),
+      father_name: f.get("father_name"), phone: f.get("phone"),
+      gender: f.get("gender"),
     });
     await loadState();
     if (res.ok) {
@@ -479,6 +490,7 @@ function patientCard(p) {
   return `<div class="card">
     <h3>${esc(p.name)} <span class="muted">#${p.id}</span></h3>
     <p>Age: <b>${p.age}</b> &nbsp;•&nbsp; Problem: <b>${esc(p.problem)}</b> &nbsp;•&nbsp; Visits: <b>${p.visits}</b></p>
+    ${p.father_name || p.phone || p.gender ? `<p class="muted">${p.father_name ? `Father: <b>${esc(p.father_name)}</b> &nbsp;•&nbsp; ` : ""}${p.phone ? `Phone: <b>${esc(p.phone)}</b> &nbsp;•&nbsp; ` : ""}${p.gender ? `Gender: <b>${esc(p.gender)}</b>` : ""}</p>` : ""}
     <p class="muted">Notes (${p.notes.length}):</p>
     ${p.notes.length
       ? `<ul class="q-list">${p.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>`
@@ -509,6 +521,16 @@ function wirePatientCard(container, p) {
             <div class="field"><label>Problem</label>
               <input type="text" name="problem" value="${esc(p.problem)}" required></div>
           </div>
+          <div class="field-row">
+            <div class="field"><label>Father Name</label>
+              <input type="text" name="father_name" value="${esc(p.father_name || "")}"></div>
+            <div class="field"><label>Phone</label>
+              <input type="text" name="phone" value="${esc(p.phone || "")}"></div>
+          </div>
+          <div class="field"><label>Gender</label>
+            <select name="gender">
+              ${["", "Male", "Female", "Other"].map((g) => `<option value="${g}"${(p.gender || "") === g ? " selected" : ""}>${g || "—"}</option>`).join("")}
+            </select></div>
           <div class="btn-row">
             <button type="submit" class="btn btn-primary">Save Changes</button>
             <button type="button" class="btn btn-ghost" data-cancel-edit="${p.id}">Cancel</button>
@@ -519,6 +541,8 @@ function wirePatientCard(container, p) {
         const f = new FormData(e.target);
         const res = await api(`/api/patients/${p.id}`, "POST", {
           name: f.get("name"), age: Number(f.get("age")), problem: f.get("problem"),
+          father_name: f.get("father_name"), phone: f.get("phone"),
+          gender: f.get("gender"),
         });
         await loadState();
         toast(res.ok ? res.message : errOf(res), !res.ok);
@@ -717,6 +741,15 @@ function renderDoctors(msg = "", ok = true) {
   });
 }
 
+/* Step 8 (Book Appointment form) state — the patient picked (or the
+   new patient being registered), the department/doctor picked, and
+   the booked times for the chosen doctor/day. */
+let bookPatient = null;      /* {id, name, ...} or null */
+let bookNewPatient = false;  /* inline registration form open */
+let bookDept = "";
+let bookDoctor = "";
+let bookSlots = [];          /* booked times for bookDoctor + date */
+
 function renderBook(msg = "", ok = true) {
   const docs = state ? state.doctors : [];
   if (!state) {
@@ -733,66 +766,261 @@ function renderBook(msg = "", ok = true) {
      be yesterday after midnight in Pakistan). */
   const now = new Date();
   const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const depts = [...new Set(docs.map((d) => d.spec || "—"))].sort();
   body.innerHTML = `
     ${msgHtml(msg, ok)}
     <form id="f-book" class="form-grid">
-      <div class="field"><label>Doctor</label>
-        <select name="doctor_id" required>
-          ${docs.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — ${esc(d.spec || "—")} (Rs ${d.fee ?? "—"})</option>`).join("")}
-        </select></div>
-      <div class="field"><label>Patient ID</label>
-        <input type="number" name="patient_id" min="1" placeholder="e.g. 101" required></div>
+      <h3 style="margin:4px 0 8px">1. Patient</h3>
       <div class="field-row">
-        <div class="field"><label>Date</label>
-          <input type="date" name="date" value="${todayLocal}" required></div>
-        <div class="field"><label>Time (24-hour, optional)</label>
-          <input type="time" name="time" placeholder="e.g. 10:30"></div>
-      </div>
-      <div class="field"><label>Priority</label>
-        <div class="seg">
-          <button type="button" id="pri-n" class="${!bookEmergency ? "on" : ""}">Normal</button>
-          <button type="button" id="pri-e" class="emg ${bookEmergency ? "on" : ""}">Emergency</button>
+        <div class="field"><label>Search Patient (ID / name / phone)</label>
+          <input type="text" id="bk-search" placeholder="e.g. Ahmed, 101, or 0300"></div>
+        <div class="btn-row" style="align-items:flex-end">
+          <button type="button" id="bk-search-btn" class="btn btn-primary">Search</button>
+          <button type="button" id="bk-new-btn" class="btn btn-ghost">+ New Patient</button>
         </div>
       </div>
+      <div id="bk-search-results" style="margin-top:8px"></div>
+      <div id="bk-patient-card" style="margin-top:8px"></div>
+      <div id="bk-new-patient" class="hidden" style="margin-top:8px">
+        <div class="field-row">
+          <div class="field"><label>Full Name *</label>
+            <input type="text" id="bk-np-name" placeholder="e.g. Ahmed Khan"></div>
+          <div class="field"><label>Age *</label>
+            <input type="number" id="bk-np-age" min="0" max="150" placeholder="e.g. 32"></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Problem / Symptoms *</label>
+            <input type="text" id="bk-np-problem" placeholder="e.g. Cough, fever"></div>
+          <div class="field"><label>Father Name</label>
+            <input type="text" id="bk-np-father" placeholder="optional"></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Phone</label>
+            <input type="text" id="bk-np-phone" placeholder="e.g. 0300-1234567"></div>
+          <div class="field"><label>Gender</label>
+            <select id="bk-np-gender">
+              <option value="">—</option><option>Male</option><option>Female</option><option>Other</option>
+            </select></div>
+        </div>
+        <p class="muted">Patient ID auto-assign ho jayega (naya ID number khud ban jayega).</p>
+      </div>
+
+      <h3 style="margin:16px 0 8px">2. Doctor</h3>
+      <div class="field-row">
+        <div class="field"><label>Department</label>
+          <select id="bk-dept">
+            <option value="">— Select department —</option>
+            ${depts.map((d) => `<option>${esc(d)}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Doctor</label>
+          <select id="bk-doctor" disabled>
+            <option value="">— Pick a department first —</option>
+          </select></div>
+      </div>
+      <div id="bk-doctor-info" style="margin-top:8px"></div>
+      <div id="bk-slots" style="margin-top:8px">
+        <p class="muted">Doctor aur date choose karo to yahan us din ke booked times dikhenge.</p>
+      </div>
+
+      <h3 style="margin:16px 0 8px">3. Appointment</h3>
+      <div class="field-row">
+        <div class="field"><label>Date</label>
+          <input type="date" id="bk-date" value="${todayLocal}" required></div>
+        <div class="field"><label>Time (24-hour, optional)</label>
+          <input type="time" id="bk-time" placeholder="e.g. 10:30"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Type</label>
+          <select id="bk-type">
+            <option>General</option><option>Follow-up</option><option>Emergency</option>
+          </select></div>
+        <div class="field"><label>Status</label>
+          <select id="bk-status">
+            <option>Pending</option><option>Confirmed</option>
+          </select></div>
+      </div>
+      <div class="field"><label>Reason for Visit</label>
+        <input type="text" id="bk-reason" placeholder="e.g. Follow-up checkup"></div>
+      <div class="field"><label>Additional Notes</label>
+        <input type="text" id="bk-notes" placeholder="optional"></div>
+      <p class="muted">Emergency type = E- token (queue mein pehle). General / Follow-up = N- token.</p>
       <div class="btn-row">
-        <button type="submit" class="btn btn-primary">+ Book Now</button>
+        <button type="submit" class="btn btn-primary">✓ Confirm &amp; Book</button>
         <button type="button" class="btn btn-ghost" onclick="openOp('dashboard')">Cancel</button>
       </div>
     </form>
     <div id="book-result" style="margin-top:14px"></div>`;
-  document.getElementById("pri-n").onclick = () => {
-    bookEmergency = false;
-    document.getElementById("pri-n").classList.add("on");
-    document.getElementById("pri-e").classList.remove("on");
+
+  const deptSel = document.getElementById("bk-dept");
+  const docSel = document.getElementById("bk-doctor");
+  const dateInput = document.getElementById("bk-date");
+  const infoBox = document.getElementById("bk-doctor-info");
+  const slotsBox = document.getElementById("bk-slots");
+
+  function renderSelectedPatient() {
+    const card = document.getElementById("bk-patient-card");
+    if (!bookPatient) { card.innerHTML = ""; return; }
+    const p = bookPatient;
+    card.innerHTML = `<div class="card"><h3>${esc(p.name)} <span class="muted">#${p.id}</span></h3>
+      <p>Age: <b>${p.age}</b> &nbsp;•&nbsp; Problem: <b>${esc(p.problem)}</b>${p.phone ? ` &nbsp;•&nbsp; Phone: <b>${esc(p.phone)}</b>` : ""}${p.father_name ? ` &nbsp;•&nbsp; Father: <b>${esc(p.father_name)}</b>` : ""}${p.gender ? ` &nbsp;•&nbsp; Gender: <b>${esc(p.gender)}</b>` : ""}</p>
+      <button type="button" class="btn btn-ghost" id="bk-clear-patient">Change Patient</button></div>`;
+    document.getElementById("bk-clear-patient").onclick = () => {
+      bookPatient = null;
+      renderSelectedPatient();
+    };
+  }
+
+  async function refreshSlots() {
+    if (!bookDoctor) {
+      slotsBox.innerHTML = `<p class="muted">Doctor aur date choose karo to yahan us din ke booked times dikhenge.</p>`;
+      return;
+    }
+    const date = dateInput.value || todayLocal;
+    const res = await api(`/api/appointments/slots?doctor_id=${encodeURIComponent(bookDoctor)}&date=${encodeURIComponent(date)}`);
+    if (!res.ok) {
+      slotsBox.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+      return;
+    }
+    bookSlots = res.booked || [];
+    slotsBox.innerHTML = bookSlots.length
+      ? `<p><b>Booked on ${esc(res.date)}:</b></p>
+        <p>${bookSlots.map((b) => {
+          const taken = !["Cancelled", "No Show"].includes(b.status);
+          return `<span class="tag ${taken ? "tag-cancel" : "tag-done"}">${esc(b.time)} · ${esc(b.token)} · ${esc(b.patient_name)}</span> <span class="tag ${statusTagClass(b.status)}">${esc(b.status)}</span>${taken ? " — TAKEN" : " — free again"}`;
+        }).join("<br>")}</p>`
+      : `<p class="muted">Nothing booked on ${esc(res.date)} yet — all times free.</p>`;
+  }
+
+  function refreshDoctors() {
+    const docsInDept = docs.filter((d) => (d.spec || "—") === bookDept);
+    docSel.innerHTML = docsInDept.length
+      ? `<option value="">— Select doctor —</option>` + docsInDept.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — Rs ${d.fee ?? "—"}</option>`).join("")
+      : `<option value="">— No doctors in this department —</option>`;
+    docSel.disabled = !docsInDept.length;
+    bookDoctor = "";
+    infoBox.innerHTML = "";
+    refreshSlots();
+  }
+
+  document.getElementById("bk-search-btn").onclick = async () => {
+    const q = document.getElementById("bk-search").value.trim();
+    const box = document.getElementById("bk-search-results");
+    if (!q) { box.innerHTML = `<p class="muted">Kuch likho — ID, naam ya phone number.</p>`; return; }
+    const res = await api(`/api/patients?name=${encodeURIComponent(q)}`);
+    if (!res.ok) { box.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`; return; }
+    if (!res.patients.length) {
+      box.innerHTML = `<p class="muted">No patient found — "New Patient" se register kar lo.</p>`;
+      return;
+    }
+    box.innerHTML = `<p class="muted">${res.patients.length} patient(s) found — select karo:</p>` +
+      res.patients.map((p) => `<button type="button" class="btn btn-ghost" data-pick-patient="${p.id}" style="margin:2px">${esc(p.name)} (#${p.id})${p.phone ? " · " + esc(p.phone) : ""}</button>`).join(" ");
+    box.querySelectorAll("[data-pick-patient]").forEach((btn) => {
+      btn.onclick = () => {
+        bookPatient = res.patients.find((p) => String(p.id) === btn.dataset.pickPatient);
+        bookNewPatient = false;
+        document.getElementById("bk-new-patient").classList.add("hidden");
+        document.getElementById("bk-new-btn").textContent = "+ New Patient";
+        box.innerHTML = "";
+        renderSelectedPatient();
+      };
+    });
   };
-  document.getElementById("pri-e").onclick = () => {
-    bookEmergency = true;
-    document.getElementById("pri-e").classList.add("on");
-    document.getElementById("pri-n").classList.remove("on");
+
+  document.getElementById("bk-new-btn").onclick = () => {
+    bookNewPatient = !bookNewPatient;
+    bookPatient = bookNewPatient ? null : bookPatient;
+    document.getElementById("bk-new-patient").classList.toggle("hidden", !bookNewPatient);
+    document.getElementById("bk-new-btn").textContent = bookNewPatient ? "✕ Cancel New Patient" : "+ New Patient";
+    if (bookNewPatient) renderSelectedPatient();
   };
+
+  deptSel.onchange = () => {
+    bookDept = deptSel.value;
+    refreshDoctors();
+  };
+  docSel.onchange = () => {
+    bookDoctor = docSel.value;
+    const doc = docs.find((d) => d.id === bookDoctor);
+    infoBox.innerHTML = doc
+      ? `<p><b>${esc(doc.name)}</b> — ${esc(doc.spec || "—")} • Consultation Fee: <b>Rs ${doc.fee ?? "—"}</b></p>`
+      : "";
+    refreshSlots();
+  };
+  dateInput.onchange = refreshSlots;
+
   document.getElementById("f-book").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const f = new FormData(e.target);
-    const res = await api("/api/appointments", "POST", {
-      doctor_id: f.get("doctor_id"),
-      patient_id: Number(f.get("patient_id")),
-      emergency: bookEmergency,
-      date: f.get("date") || "",
-      time: f.get("time") || "",
-    });
-    await loadState();
-    if (res.ok) {
-      toast(res.message);
-      document.getElementById("book-result").innerHTML = `
-        <div class="card"><h3>Token ${esc(res.token)} ${res.emergency ? '<span class="tag tag-emg">EMERGENCY</span>' : '<span class="tag tag-nor">NORMAL</span>'}</h3>
-        <p>${esc(res.patient)} with ${esc(res.doctor)} — Fee Rs ${res.fee}</p>
-        <p>${esc(res.date)}${res.time ? " at " + esc(res.time) : ""} · Status: Pending</p></div>`;
+    const resultBox = document.getElementById("book-result");
+    const type = document.getElementById("bk-type").value;
+    const status = document.getElementById("bk-status").value;
+    const date = dateInput.value || "";
+    const time = document.getElementById("bk-time").value || "";
+    const reason = document.getElementById("bk-reason").value.trim();
+    const notes = document.getElementById("bk-notes").value.trim();
+    if (!bookDoctor) {
+      resultBox.innerHTML = `<div class="msg msg-err">Pehle department aur doctor choose karo.</div>`;
+      return;
+    }
+    let payload = { doctor_id: bookDoctor, type, status, date, time, reason, notes };
+    if (bookNewPatient) {
+      const npName = document.getElementById("bk-np-name").value.trim();
+      const npAge = Number(document.getElementById("bk-np-age").value);
+      const npProblem = document.getElementById("bk-np-problem").value.trim();
+      if (!npName || !npProblem || !npAge) {
+        resultBox.innerHTML = `<div class="msg msg-err">New patient ke liye Name, Age aur Problem zaroori hain.</div>`;
+        return;
+      }
+      payload.new_patient = {
+        name: npName, age: npAge, problem: npProblem,
+        father_name: document.getElementById("bk-np-father").value.trim(),
+        phone: document.getElementById("bk-np-phone").value.trim(),
+        gender: document.getElementById("bk-np-gender").value,
+      };
+    } else if (bookPatient) {
+      payload.patient_id = bookPatient.id;
     } else {
+      resultBox.innerHTML = `<div class="msg msg-err">Pehle patient search kar ke select karo, ya "New Patient" se register karo.</div>`;
+      return;
+    }
+    const res = await api("/api/appointments", "POST", payload);
+    await loadState();
+    if (!res.ok) {
       const msg = errOf(res);
       toast(msg, true);
-      document.getElementById("book-result").innerHTML =
-        `<div class="msg msg-err">${esc(msg)}</div>`;
+      resultBox.innerHTML = `<div class="msg msg-err">${esc(msg)}</div>`;
+      return;
     }
+    toast(res.message);
+    const a = res.appointment;
+    resultBox.innerHTML = `
+      <div class="card"><h3>✓ Booked — Appointment ID ${esc(a.apt_id)} <span class="tag ${a.emergency ? "tag-emg" : "tag-nor"}">${esc(a.token)} · ${esc(a.appt_type)}</span></h3>
+      <p>${esc(a.patient_name)} (#${a.patient_id}) with ${esc(a.doctor_name)} (${esc(a.department)})</p>
+      <p>${esc(a.appt_date)}${a.appt_time ? " at " + esc(a.appt_time) : ""} • Fee Rs ${a.fee} • Status: <span class="tag ${statusTagClass(a.status)}">${esc(a.status)}</span></p>
+      ${a.reason ? `<p>Reason: ${esc(a.reason)}</p>` : ""}
+      <div class="btn-row" style="margin-top:10px">
+        <button type="button" class="btn btn-primary" id="bk-bill-btn">Generate Bill (Rs ${a.fee})</button>
+        <button type="button" class="btn btn-ghost" onclick="openOp('schedule')">View Schedule</button>
+      </div>
+      <div id="bk-bill-result" style="margin-top:10px"></div></div>`;
+    document.getElementById("bk-bill-btn").onclick = async () => {
+      const billRes = await api("/api/bills", "POST", {
+        patient_id: a.patient_id, doctor_id: a.doctor_id, token: a.token,
+      });
+      await loadState();
+      const slot = document.getElementById("bk-bill-result");
+      if (!billRes.ok) {
+        toast(errOf(billRes), true);
+        slot.innerHTML = `<div class="msg msg-err">${esc(errOf(billRes))}</div>`;
+        return;
+      }
+      toast(billRes.message);
+      slot.innerHTML = `<div class="msg msg-ok">Bill #${billRes.bill.id} created — Total Rs ${billRes.bill.total} (Unpaid).</div>`;
+      document.getElementById("bk-bill-btn").disabled = true;
+    };
+    /* Reset the form for the next booking, keep the doctor picked. */
+    bookPatient = null;
+    bookNewPatient = false;
+    renderSelectedPatient();
   });
 }
 
