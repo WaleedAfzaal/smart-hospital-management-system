@@ -43,6 +43,44 @@ They also seed the shift rotation.
 - Tests: `tests/test_database.py` — save → restart → reload round-trips
   for patients/notes, appointments, beds, pharmacy, shifts, doctors.
 
+## Login & Roles — Step 2 (`auth.py` + `server.py` + `web/`)
+
+- `auth.py` — `AuthStore` (stdlib `sqlite3` only). One table, `users`,
+  in the same `hospital.db` file: `username` (PK), `password_hash`,
+  `role` (Admin / Doctor / Receptionist), `doctor_id` (nullable —
+  links a Doctor user to one doctor's queue). Passwords are hashed
+  with PBKDF2-HMAC-SHA256 (200,000 rounds, random 16-byte salt, stored
+  as `salt_hex:hash_hex`) — plain-text passwords are never stored.
+- On first run, when the `users` table is empty, the store seeds one
+  default Admin: `admin` / `admin123`. Change it after login.
+- `PERMISSIONS` in `auth.py` is the single source of truth: Admin can
+  do everything; Doctor can view, add notes, rotate shifts, and see
+  their own appointments; Receptionist can register patients, book
+  appointments, manage beds and pharmacy, and rotate shifts. Only
+  Admin can add doctors/users, undo, or reset passwords. Every role
+  can change its own password.
+- **Sessions:** the server keeps login sessions in memory — a random
+  32-byte token (`secrets.token_hex`) in an `hms_session` cookie
+  (HttpOnly, `SameSite=Lax`, 12-hour expiry). Restarting the server
+  ends all sessions (log in again); users themselves live in
+  `hospital.db` and survive restarts. Enforcement lives in the UI
+  layers (CLI menu + server endpoints), not in the `Hospital` class —
+  tests call the class directly without a login.
+- **CLI:** `hospital.py` asks for username/password at startup
+  (`getpass`, so the password is not echoed) and loops until the
+  credentials are right; the menu then shows only the options the
+  role may use, and every choice is permission-checked again.
+- **Web:** `web/login.html` is the login page (served instead of the
+  dashboard when there is no session); `app.js` calls `/api/me` on
+  boot, hides tiles the role cannot use, and redirects to the login
+  page on any 401. Admin gets a **Users** tile (list users, add user,
+  reset password) and every role gets **Change Password** in the
+  header. The "Add Doctor" form is hidden for non-Admins.
+- Tests: `tests/test_auth.py` (hashing, permissions table, default
+  admin, restart persistence, password change/reset) and
+  `tests/test_server.py::TestServerAuth` (401 without login, 403 per
+  role, doctor queue filtering, logout).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.

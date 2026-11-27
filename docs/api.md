@@ -3,6 +3,36 @@
 Base URL: `http://127.0.0.1:8000` (default). All responses are JSON with an
 `ok` flag. Errors return `{"ok": false, "error": "..."}` with a 4xx status.
 
+## Login first
+
+**Every `/api/*` call needs a login.** Log in with `POST /api/login`
+(sets an `hms_session` cookie, valid 12 hours), then send that cookie
+with every later call. Without a valid session the API answers
+**401 `{"ok": false, "error": "Please log in first."}`**; an action your
+role is not allowed returns **403 `{"ok": false, "error": "Not allowed
+for your role (X)."}`**. The dashboard serves `web/login.html` instead
+of the dashboard when you are not logged in.
+
+Default Admin account (first run): `admin` / `admin123` — change it
+after login. Roles and permissions: Admin (everything), Doctor (view
+patients + own appointments, add notes), Receptionist (register
+patients, book appointments, beds, pharmacy). See the README's
+[Login & Roles](../README.md#login--roles) table.
+
+| Method | Path | Body | Description |
+| ------ | ---- | ---- | ----------- |
+| POST | `/api/login` | `{username, password}` | Log in. Sets the `hms_session` cookie (HttpOnly, 12h). Returns `{ok, message, user: {username, role, doctor_id}}` |
+| POST | `/api/logout` | — | Log out (drops the session, clears the cookie) |
+| GET | `/api/me` | — | The logged-in user `{username, role, doctor_id}` |
+| GET | `/api/users` | — | Admin only. All users (username, role, linked doctor) — never passwords |
+| POST | `/api/users` | `{username, password, role, doctor_id?}` | Admin only. Create a user. `role` is Admin / Doctor / Receptionist; `doctor_id` links a Doctor to one doctor's queue (empty = all queues) |
+| POST | `/api/users/<username>/reset` | `{new_password}` | Admin only. Reset a user's password without knowing the old one |
+| POST | `/api/change-password` | `{current_password, new_password, new_password_again}` | Any logged-in user. Change your own password |
+
+A Doctor user linked to a doctor (e.g. `D1`) sees only that doctor in
+`GET /api/doctors` and in the `doctors` list inside `GET /api/state`;
+other roles see all doctors.
+
 The server saves all data to `hospital.db` (SQLite, created automatically
 next to `server.py`) on every change, so restarting the server keeps
 everything — patients, notes, doctors, appointments, beds, pharmacy

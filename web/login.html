@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login — Hospital Management System</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  /* Login page only: center one card on the page. */
+  .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .login-card { width: 100%; max-width: 420px; background: var(--surface); border-radius: 22px; border: 2px solid var(--card-border); box-shadow: var(--shadow); padding: 28px 26px; }
+  .login-card .logo { margin: 0 auto 14px; }
+  .login-card h1 { text-align: center; font-size: 24px; color: var(--title); margin: 0 0 4px; }
+  .login-card .sub { text-align: center; color: var(--ink-soft); font-size: 14px; margin: 0 0 20px; }
+  .login-card .hint { text-align: center; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 64 64" class="logo-cross"><path d="M26 10h12v16h16v12H38v16H26V38H10V26h16z" fill="currentColor"/></svg>
+    </div>
+    <h1>Hospital Management System</h1>
+    <p class="sub">Please log in to continue</p>
+    <form id="f-login" class="form-grid">
+      <div class="field"><label>Username</label>
+        <input type="text" name="username" placeholder="e.g. admin" required autofocus></div>
+      <div class="field"><label>Password</label>
+        <input type="password" name="password" placeholder="Your password" required></div>
+      <div id="login-error"></div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary" style="flex:1">Log In</button></div>
+    </form>
+    <p class="hint muted">First run? Default Admin account is <b>admin / admin123</b> — change it after login.</p>
+  </div>
+</div>
+<script>
+  document.getElementById("f-login").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const err = document.getElementById("login-error");
+    err.innerHTML = "";
+    let res;
+    try {
+      res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: f.get("username"), password: f.get("password") }),
+      });
+    } catch (e) {
+      err.innerHTML = '<div class="msg msg-err">Server se connect nahi ho raha. Terminal mein <b>python server.py</b> chalao.</div>';
+      return;
+    }
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* ignore */ }
+    if (res.ok && data.ok) {
+      location.href = "/";
+    } else {
+      err.innerHTML = '<div class="msg msg-err">' + (data.error || "Login failed — dobara try karo.") + "</div>";
+    }
+  });
+</script>
+</body>
+</html>

@@ -16,7 +16,42 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Shift Rotation**: Doctors rotate on duty through a circular queue.
 - **Dashboard**: Live counts — patients, doctors, waiting appointments, free beds.
 - **SQLite Persistence**: All data is saved to `hospital.db` (created automatically) on every change — patients, notes, doctors, appointments, beds, pharmacy queue and shifts all survive a restart. The CLI and the web dashboard share the same database file. Delete `hospital.db` to start fresh.
+- **Login & Roles**: Every user logs in with a username, password and role — Admin, Doctor or Receptionist — and can only do what their role allows (see [Login & Roles](#login--roles) below). Passwords are stored as salted hashes, never as plain text.
 - **Zero External Dependencies**: Runs on Python 3.9+ using only the standard library.
+
+## Login & Roles
+
+Both the CLI (`python hospital.py`) and the web dashboard ask you to log in first. On the very first run the system creates one default Admin account:
+
+| Username | Password |
+| -------- | -------- |
+| `admin`  | `admin123` |
+
+**Change this password after your first login** — in the CLI choose menu option **14. Change My Password**, or in the dashboard click **Change Password** at the top. An Admin can also reset any user's password from the **Users** tile.
+
+### Roles — what each role can do
+
+| Action | Admin | Doctor | Receptionist |
+| ------ | :---: | :----: | :----------: |
+| View patients, doctors, dashboard | ✅ | ✅ | ✅ |
+| Register patients | ✅ | ❌ | ✅ |
+| Add patient notes | ✅ | ✅ | ❌ |
+| Book appointments | ✅ | ❌ | ✅ |
+| Manage beds & pharmacy queue | ✅ | ❌ | ✅ |
+| Rotate shifts | ✅ | ✅ | ✅ |
+| Add doctors | ✅ | ❌ | ❌ |
+| Undo last action | ✅ | ❌ | ❌ |
+| Manage users (add user, reset password) | ✅ | ❌ | ❌ |
+| Change own password | ✅ | ✅ | ✅ |
+
+A Doctor account can be **linked to one doctor** (e.g. `D1`) — then the dashboard and the CLI show only that doctor's appointment queue. A Doctor with no linked doctor sees all queues.
+
+### Adding users (Admin only)
+
+- **CLI:** log in as Admin → menu option **13. Users (Admin)** → *Add user* — enter a username, password, role, and (for a Doctor) the linked doctor ID.
+- **Dashboard:** log in as Admin → **Users** tile → fill in the *Add User* form.
+
+Users are stored in the same `hospital.db` file, so they survive a restart. Sessions last 12 hours; closing the browser tab does not log you out, but restarting the server does (log in again).
 
 ## Quick Start
 
@@ -56,11 +91,13 @@ python hospital.py
 ```text
 .
 ├── hospital.py               # Hospital class — all data structures & operations
+├── auth.py                   # Login & roles — password hashing, users table, permissions
 ├── database.py               # SQLite persistence — save/load whole state to hospital.db
 ├── hospital.db               # Local database file (auto-created, gitignored, never committed)
 ├── server.py                 # ThreadingHTTPServer, static file serving, and JSON REST API
 ├── web/
 │   ├── index.html           # Single-page dashboard (all operations on one page)
+│   ├── login.html           # Login page (shown when not logged in)
 │   ├── styles.css           # Dashboard styling (light + dark mode)
 │   └── app.js               # Frontend state, API calls, and DOM updates
 ├── docs/
@@ -69,6 +106,7 @@ python hospital.py
 ├── tests/
 │   ├── test_hospital.py     # Unit tests for the Hospital class
 │   ├── test_server.py       # End-to-end API tests for the web server
+│   ├── test_auth.py         # Login, password hashing, and role permission tests
 │   └── test_database.py     # Persistence round-trip tests (save → restart → reload)
 ├── CONTRIBUTING.md
 └── LICENSE

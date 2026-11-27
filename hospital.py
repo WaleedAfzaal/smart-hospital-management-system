@@ -7,8 +7,10 @@ loaded back on the next start, so data survives a restart. With no
 The undo stack is session-only and starts empty after a restart.
 """
 
+import getpass
 import os
 
+from auth import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME, AuthStore, can
 from database import Database
 
 # SQLite file used by the CLI and the web server (same file, so both
@@ -266,12 +268,28 @@ class Hospital:
         self._persist()
         print("  Note added.")
 
-    def doctors_menu(self):
+    def show_doctor_queue(self, doc_id):
+        """Print one doctor's appointment queue in service order
+        (Emergency first). Used by the Doctor role's "My Appointments"."""
+        doc = self.doctors_map.get(doc_id.upper())
+        if not doc:
+            return print("  Doctor not found.")
+        rows = sorted(doc["queue"].heap, key=lambda r: (r[0], r[1]))
+        print(f"  {doc['name']} ({doc['spec']}) — {len(rows)} waiting:")
+        if not rows:
+            print("  Queue is empty.")
+        for row in rows:
+            print(f"  {row[2]} | Patient {row[3]} ({row[4]})"
+                  f"{' [EMERGENCY]' if row[0] == 1 else ''}")
+
+    def doctors_menu(self, role="Admin"):
         opt = input("  1. View Doctors  2. Add Doctor: ").strip()
         if opt == "1":
             for doc in self.doctors_map.values():
                 print(f"  {doc['id']} | {doc['name']} | {doc['spec']} | Fee: {doc['fee']}")
         elif opt == "2":
+            if not can(role, "add_doctor"):
+                return print("  Only Admin can add a doctor.")
             doc_id = input("  Doctor ID: ").strip().upper()
             if doc_id in self.doctors_map:
                 return print("  Doctor ID already exists.")
@@ -357,13 +375,124 @@ class Hospital:
         print(f"  Patients: {len(self.patients_map)} | Doctors: {len(self.doctors_map)} | Waiting: {waiting} | Free Beds: {free_beds}/{self.NUM_BEDS}")
 
 
+def login_prompt(auth):
+    """Ask for username/password until they are right.
+
+    Returns the logged-in user dict {"username", "role", "doctor_id"},
+    or None if the user quits (empty username). Wrong credentials just
+    print a message and ask again — nothing is locked out.
+    """
+    print("\n  === Login ===")
+    print(f"  (First run? Use {DEFAULT_ADMIN_USERNAME} / "
+          f"{DEFAULT_ADMIN_PASSWORD} — change it after login.)")
+    while True:
+        username = input("  Username (empty to quit): ").strip()
+        if not username:
+            return None
+        password = getpass.getpass("  Password: ")
+        user = auth.authenticate(username, password)
+        if user:
+            print(f"  Logged in as {user['username']} ({user['role']}).")
+            return user
+        print("  Wrong username or password — try again.")
+
+
+def users_menu(auth):
+    """Admin only: add a user, list users, reset a password."""
+    while True:
+        print("\n  --- Users (Admin) ---")
+        print("  1. List Users  2. Add User  3. Reset Password  4. Back")
+        choice = input("  Choice: ").strip()
+        if choice == "1":
+            for u in auth.list_users():
+                link = f" -> Doctor {u['doctor_id']}" if u["doctor_id"] else ""
+                print(f"  {u['username']} | {u['role']}{link}")
+        elif choice == "2":
+            username = input("  New username: ").strip()
+            password = getpass.getpass("  Password: ")
+            role = input("  Role (Admin/Doctor/Receptionist): ").strip().title()
+            doctor_id = ""
+            if role == "Doctor":
+                doctor_id = input("  Linked Doctor ID (e.g. D1, empty = all queues): ").strip()
+            try:
+                auth.create_user(username, password, role, doctor_id)
+                print(f"  User {username} ({role}) created.")
+            except ValueError as exc:
+                print(f"  {exc}")
+        elif choice == "3":
+            username = input("  Username: ").strip()
+            new_password = getpass.getpass("  New password: ")
+            try:
+                auth.reset_password(username, new_password)
+                print(f"  Password reset for {username}.")
+            except ValueError as exc:
+                print(f"  {exc}")
+        elif choice == "4":
+            return
+        else:
+            print("  Invalid choice.")
+
+
+def change_password_prompt(auth, user):
+    """Let the logged-in user change their own password."""
+    current = getpass.getpass("  Current password: ")
+    new = getpass.getpass("  New password: ")
+    again = getpass.getpass("  New password again: ")
+    if new != again:
+        return print("  New passwords do not match.")
+    try:
+        ok = auth.change_password(user["username"], current, new)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    print("  Password changed." if ok else "  Wrong current password.")
+
+
+# Menu choices and the permission each one needs. "view" actions are
+# open to every role; anything not listed here is Admin-only.
+MENU = [
+    ("1", "Add Patient", "add_patient"),
+    ("2", "View Sorted", "view"),
+    ("3", "Find Patient", "view"),
+    ("4", "Add Note", "add_note"),
+    ("5", "Doctors", "view"),
+    ("6", "Book Appt", "book_appointment"),
+    ("7", "Beds", "manage_beds"),
+    ("8", "Undo", "undo"),
+    ("9", "Pharmacy Q", "pharmacy"),
+    ("10", "Shifts", "view"),
+    ("11", "Dashboard & Exit", "view"),
+    ("12", "My Appointments", "view"),   # Doctor only (own queue)
+    ("13", "Users (Admin)", "manage_users"),
+    ("14", "Change My Password", "view"),
+]
+
+
 def main():
     hosp = Hospital(db_path=DEFAULT_DB_PATH)
+    auth = AuthStore(DEFAULT_DB_PATH)
+    user = login_prompt(auth)
+    if user is None:
+        print("  Bye.")
+        return
+    role = user["role"]
+    print(f"  Role: {role} — you can only use the options shown below.")
+
     while True:
-        print("\n1.Add Patient  2.View Sorted  3.Find Patient  4.Add Note    5.Doctors")
-        print("6.Book Appt    7.Beds         8.Undo          9.Pharmacy Q  10.Shifts")
-        print("11.Dashboard & Exit")
+        print("\n--- Menu ---")
+        for num, label, action in MENU:
+            if num == "12" and role != "Doctor":
+                continue  # My Appointments is only for Doctors
+            if not can(role, action):
+                continue
+            print(f"  {num}. {label}")
         choice = input("Choice: ").strip()
+        allowed = {num: action for num, _, action in MENU}
+        if choice == "12" and role != "Doctor":
+            print("  Only Doctors have 'My Appointments'.")
+            continue
+        if choice not in allowed or not can(role, allowed[choice]):
+            print(f"  Not allowed for your role ({role}).")
+            continue
         if choice == "1":
             hosp.add_patient(int(input("ID: ")), input("Name: "), int(input("Age: ")), input("Problem: "))
         elif choice == "2":
@@ -373,7 +502,7 @@ def main():
         elif choice == "4":
             hosp.add_note(int(input("ID: ")), input("Note: "))
         elif choice == "5":
-            hosp.doctors_menu()
+            hosp.doctors_menu(role)
         elif choice == "6":
             hosp.book_appointment(input("Doctor ID: "), int(input("Patient ID: ")), input("Emergency (E) or Normal (N): ").strip().upper() == "E")
         elif choice == "7":
@@ -387,6 +516,18 @@ def main():
         elif choice == "11":
             hosp.dashboard()
             break
+        elif choice == "12":
+            if user["doctor_id"]:
+                hosp.show_doctor_queue(user["doctor_id"])
+            else:
+                print("  No doctor linked to your account — ask Admin to link one.")
+                print("  Showing all queues for now:")
+                for doc_id in hosp.doctors_map:
+                    hosp.show_doctor_queue(doc_id)
+        elif choice == "13":
+            users_menu(auth)
+        elif choice == "14":
+            change_password_prompt(auth, user)
 
 
 if __name__ == "__main__":

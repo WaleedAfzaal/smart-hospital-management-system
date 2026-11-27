@@ -18,6 +18,13 @@
       <h1 class="brand-title">Hospital Management System</h1>
     </div>
     <div class="top-actions">
+      <span id="user-chip" class="pill-btn hidden" title="Logged in user"></span>
+      <button id="top-change-pw" class="pill-btn hidden" type="button" title="Change my password">
+        <span>Change Password</span>
+      </button>
+      <button id="top-logout" class="pill-btn hidden" type="button" title="Log out">
+        <span>Logout</span>
+      </button>
       <button id="top-undo" class="pill-btn" type="button" title="Undo last action">
         <svg viewBox="0 0 24 24" class="ic"><path d="M12 5V1L5 8l7 7V9c3.3 0 6 2.7 6 6s-2.7 6-6 6-6-2.7-6-6H4c0 4.4 3.6 8 8 8s8-3.6 8-8-3.6-8-8-8z" fill="currentColor"/></svg>
         <span>Undo</span>
@@ -115,6 +122,10 @@
         <button class="tile tile-blue" data-op="undo" type="button">
           <span class="tile-icon"><svg viewBox="0 0 24 24"><path d="M12 5V1L5 8l7 7V9c3.3 0 6 2.7 6 6s-2.7 6-6 6-6-2.7-6-6H4c0 4.4 3.6 8 8 8s8-3.6 8-8-3.6-8-8-8z" fill="currentColor"/></svg></span>
           <span class="tile-label">Undo</span>
+        </button>
+        <button class="tile tile-blue" data-op="users" type="button" id="tile-users">
+          <span class="tile-icon"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M2.5 20c.8-3.2 3.4-5 6.5-5s5.7 1.8 6.5 5M16 8.5a3 3 0 1 0-2-5.2M17.5 15.5c2 .6 3.5 2 4 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+          <span class="tile-label">Users</span>
         </button>
       </div>
     </section>

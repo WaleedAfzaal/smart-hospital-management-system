@@ -6,6 +6,57 @@ let state = null;
 let currentOp = "dashboard";
 let sortField = "id";
 let bookEmergency = false;
+let currentUser = null;
+
+/* Step 2 (Login): which tile each role may use. The server enforces
+   the same rules — this only hides what you cannot click. */
+const OP_PERMS = {
+  "add-patient": ["Admin", "Receptionist"],
+  "view-sorted": ["Admin", "Doctor", "Receptionist"],
+  "find-patient": ["Admin", "Doctor", "Receptionist"],
+  "add-note": ["Admin", "Doctor"],
+  "doctors": ["Admin", "Doctor", "Receptionist"],
+  "book-appointment": ["Admin", "Receptionist"],
+  "beds": ["Admin", "Receptionist"],
+  "pharmacy": ["Admin", "Receptionist"],
+  "shifts": ["Admin", "Doctor", "Receptionist"],
+  "dashboard": ["Admin", "Doctor", "Receptionist"],
+  "undo": ["Admin"],
+  "users": ["Admin"],
+  "change-password": ["Admin", "Doctor", "Receptionist"],
+};
+
+function canUse(op) {
+  if (!currentUser) return false;
+  return (OP_PERMS[op] || []).includes(currentUser.role);
+}
+
+function applyRoleVisibility() {
+  /* Hide tiles the logged-in role cannot use. */
+  document.querySelectorAll(".tile[data-op]").forEach((t) => {
+    t.classList.toggle("hidden", !canUse(t.dataset.op));
+  });
+  const chip = document.getElementById("user-chip");
+  if (currentUser) {
+    chip.textContent = `${currentUser.username} (${currentUser.role})`;
+    chip.classList.remove("hidden");
+    document.getElementById("top-logout").classList.remove("hidden");
+    document.getElementById("top-change-pw").classList.remove("hidden");
+  }
+}
+
+async function loadMe() {
+  /* Who is logged in? 401 means the session is gone (server
+     restarted) — back to the login page. */
+  const res = await api("/api/me");
+  if (res && res.ok) {
+    currentUser = res.user;
+    applyRoleVisibility();
+    return true;
+  }
+  location.href = "/";
+  return false;
+}
 
 const $ = (sel) => document.querySelector(sel);
 const body = document.getElementById("workspace-body");
@@ -56,6 +107,7 @@ async function api(path, method = "GET", payload = null) {
   if (!res.ok && data && !data.error) {
     data.error = `Server error (HTTP ${res.status}).`;
   }
+  data._status = res.status;
   return data;
 }
 
@@ -89,8 +141,13 @@ function refreshStats() {
 
 async function loadState() {
   /* Never throws and never kills the boot: on failure state stays
-     null and the dashboard shows the offline banner instead. */
+     null and the dashboard shows the offline banner instead.
+     A 401 means the login session ended — back to the login page. */
   const res = await api("/api/state");
+  if (res && res._status === 401) {
+    location.href = "/";
+    return null;
+  }
   if (res && res.ok) {
     state = res.state;
     setOnlineStatus(true);
@@ -116,6 +173,8 @@ const OPS = {
   "shifts": ["Shifts", "Circular doctor duty rotation"],
   "dashboard": ["Dashboard", "Live hospital overview"],
   "undo": ["Undo", "Revert the last recorded action"],
+  "users": ["Users", "Manage user accounts (Admin)"],
+  "change-password": ["Change Password", "Change your own password"],
 };
 
 function openOp(op) {
@@ -125,6 +184,10 @@ function openOp(op) {
   if (subEl) subEl.textContent = meta[1];
   document.querySelectorAll(".tile").forEach((t) =>
     t.classList.toggle("active", t.dataset.op === op));
+  if (!canUse(op)) {
+    body.innerHTML = `<div class="msg msg-err">Not allowed for your role (${currentUser ? currentUser.role : "—"}).</div>`;
+    return;
+  }
   ({
     "add-patient": renderAddPatient,
     "view-sorted": renderViewSorted,
@@ -137,6 +200,8 @@ function openOp(op) {
     "shifts": renderShifts,
     "dashboard": renderDashboard,
     "undo": renderUndo,
+    "users": renderUsers,
+    "change-password": renderChangePassword,
   })[op]();
 }
 
@@ -280,6 +345,7 @@ function renderDoctors(msg = "", ok = true) {
           ? "— " + d.queue.map((q) => `<span class="tag ${q.emergency ? "tag-emg" : "tag-nor"}">${esc(q.token)} · ${esc(q.patient_name)}</span>`).join(" ")
           : `<span class="muted">queue empty</span>`}</p>
       </div>`).join("") || `<p class="muted">No doctors yet.</p>`}
+    ${currentUser && currentUser.role === "Admin" ? `
     <h3 style="margin:16px 0 8px">Add Doctor</h3>
     <form id="f-doc" class="form-grid">
       <div class="field-row">
@@ -291,8 +357,10 @@ function renderDoctors(msg = "", ok = true) {
         <div class="field"><label>Token Fee (Rs)</label><input type="number" name="fee" min="0" placeholder="e.g. 1200" required></div>
       </div>
       <div class="btn-row"><button type="submit" class="btn btn-primary">Add Doctor +</button></div>
-    </form>`;
-  document.getElementById("f-doc").addEventListener("submit", async (e) => {
+    </form>` : `<p class="muted">Only Admin can add a doctor.</p>`}`;
+  const docForm = document.getElementById("f-doc");
+  if (!docForm) return;
+  docForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
     const res = await api("/api/doctors", "POST", {
@@ -524,6 +592,88 @@ async function doUndo() {
   else openOp(currentOp);
 }
 
+/* ------------------------------------------------------------------ users */
+
+async function renderUsers(msg = "", ok = true) {
+  const res = await api("/api/users");
+  const users = res.ok ? res.users : [];
+  body.innerHTML = `
+    ${msgHtml(msg, ok)}
+    ${res.ok ? "" : `<div class="msg msg-err">${esc(errOf(res))}</div>`}
+    <h3 style="margin:0 0 8px">All Users (${users.length})</h3>
+    ${users.length ? `<table class="tbl"><thead><tr>
+        <th>Username</th><th>Role</th><th>Linked Doctor</th><th></th>
+      </tr></thead><tbody>
+      ${users.map((u) => `<tr><td>${esc(u.username)}</td><td>${esc(u.role)}</td>
+        <td>${esc(u.doctor_id || "—")}</td>
+        <td><button type="button" class="btn btn-ghost" data-reset="${esc(u.username)}" style="padding:6px 12px;font-size:13px">Reset Password</button></td>
+      </tr>`).join("")}</tbody></table>` : `<p class="muted">No users.</p>`}
+    <div id="reset-result" style="margin-top:10px"></div>
+    <h3 style="margin:16px 0 8px">Add User</h3>
+    <form id="f-user" class="form-grid">
+      <div class="field-row">
+        <div class="field"><label>Username</label><input type="text" name="username" placeholder="e.g. reception1" required></div>
+        <div class="field"><label>Password</label><input type="password" name="password" placeholder="Password" required></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Role</label>
+          <select name="role" required>
+            <option value="Receptionist">Receptionist</option>
+            <option value="Doctor">Doctor</option>
+            <option value="Admin">Admin</option>
+          </select></div>
+        <div class="field"><label>Linked Doctor ID (Doctors only)</label>
+          <input type="text" name="doctor_id" placeholder="e.g. D1 (empty = all queues)"></div>
+      </div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Add User +</button></div>
+    </form>`;
+  document.querySelectorAll("[data-reset]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const username = btn.dataset.reset;
+      const np = prompt(`New password for ${username}:`);
+      if (!np) return;
+      const r = await api(`/api/users/${encodeURIComponent(username)}/reset`, "POST", { new_password: np });
+      document.getElementById("reset-result").innerHTML =
+        `<div class="msg ${r.ok ? "msg-ok" : "msg-err"}">${esc(r.ok ? r.message : errOf(r))}</div>`;
+    });
+  });
+  document.getElementById("f-user").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const res2 = await api("/api/users", "POST", {
+      username: f.get("username"), password: f.get("password"),
+      role: f.get("role"), doctor_id: f.get("doctor_id"),
+    });
+    toast(res2.ok ? res2.message : errOf(res2), !res2.ok);
+    renderUsers(res2.ok ? res2.message : errOf(res2), res2.ok);
+  });
+}
+
+function renderChangePassword(msg = "", ok = true) {
+  body.innerHTML = `
+    ${msgHtml(msg, ok)}
+    <form id="f-pw" class="form-grid">
+      <div class="field"><label>Current Password</label>
+        <input type="password" name="current_password" required></div>
+      <div class="field"><label>New Password</label>
+        <input type="password" name="new_password" required></div>
+      <div class="field"><label>New Password Again</label>
+        <input type="password" name="new_password_again" required></div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Change Password</button></div>
+    </form>`;
+  document.getElementById("f-pw").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const res = await api("/api/change-password", "POST", {
+      current_password: f.get("current_password"),
+      new_password: f.get("new_password"),
+      new_password_again: f.get("new_password_again"),
+    });
+    toast(res.ok ? res.message : errOf(res), !res.ok);
+    renderChangePassword(res.ok ? res.message : errOf(res), res.ok);
+  });
+}
+
 /* ------------------------------------------------------------------ boot */
 
 document.querySelectorAll(".tile").forEach((t) =>
@@ -548,6 +698,14 @@ document.querySelectorAll(".stat-card[data-stat]").forEach((c) => {
 
 document.getElementById("top-undo").addEventListener("click", doUndo);
 
+document.getElementById("top-logout").addEventListener("click", async () => {
+  await api("/api/logout", "POST", {});
+  location.href = "/";
+});
+
+document.getElementById("top-change-pw").addEventListener("click", () =>
+  openOp("change-password"));
+
 const themeBtn = document.getElementById("theme-toggle");
 function applyTheme(dark) {
   document.body.classList.toggle("dark", dark);
@@ -562,4 +720,7 @@ try {
   applyTheme(localStorage.getItem("hms-theme") === "dark");
 } catch (e) { applyTheme(false); }
 
-loadState().then(() => openOp("dashboard"));
+loadMe().then((ok) => {
+  if (!ok) return; // loadMe already sent us to the login page.
+  loadState().then(() => openOp("dashboard"));
+});

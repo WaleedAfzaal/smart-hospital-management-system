@@ -10,17 +10,27 @@ booking token is computed from the doctor's queue count after enqueue.
 Step 1 (SQLite): state is saved to hospital.db on every change and loaded
 on startup, so restarting the server no longer resets everything. The
 undo stack is session-only and starts empty after a restart.
+
+Step 2 (Login + roles): every API call needs a login (cookie session).
+Users live in the same hospital.db file (``users`` table, passwords
+hashed — see auth.py). Roles: Admin (everything), Doctor (patients +
+own appointments + notes), Receptionist (patients, bookings, beds,
+pharmacy). The dashboard page itself ("/" and "/index.html") shows
+the login page until you log in.
 """
 
 import argparse
 import json
 import os
+import secrets
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
+from auth import AuthStore, can
 from hospital import DEFAULT_DB_PATH, Hospital, PriorityQueue, binary_search, bubble_sort
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -31,6 +41,65 @@ PORT = 8000
 # CLI, so data added in one shows up in the other and survives restarts.
 hospital = Hospital(db_path=DEFAULT_DB_PATH)
 state_lock = threading.Lock()
+
+# Step 2 (Login): users live in the same hospital.db file. Sessions are
+# random tokens kept in memory (server restart logs everyone out) and
+# sent as an HttpOnly cookie. No expiry besides that — this is a
+# university project, not production.
+auth_store = AuthStore(DEFAULT_DB_PATH)
+SESSION_COOKIE = "hms_session"
+SESSION_MAX_AGE = 12 * 3600  # 12 hours
+_sessions: Dict[str, Dict[str, Any]] = {}
+_sessions_lock = threading.Lock()
+
+
+def _new_session(user: Dict[str, Any]) -> str:
+    """Create a login session token for ``user`` and remember it."""
+    token = secrets.token_hex(32)
+    with _sessions_lock:
+        _sessions[token] = {
+            "username": user["username"],
+            "role": user["role"],
+            "doctor_id": user.get("doctor_id"),
+            "created": time.time(),
+        }
+    return token
+
+
+def _drop_session(token: Optional[str]) -> None:
+    if token:
+        with _sessions_lock:
+            _sessions.pop(token, None)
+
+
+def _session_token(handler) -> Optional[str]:
+    """Read the session token from the request's Cookie header."""
+    cookie = handler.headers.get("Cookie", "")
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith(SESSION_COOKIE + "="):
+            return part[len(SESSION_COOKIE) + 1:]
+    return None
+
+
+def _session_user(handler) -> Optional[Dict[str, Any]]:
+    """The logged-in user for this request, or None if not logged in.
+
+    Returns only the user fields (username, role, doctor_id) — the
+    session's internal ``created`` timestamp is never exposed."""
+    token = _session_token(handler)
+    if not token:
+        return None
+    with _sessions_lock:
+        session = _sessions.get(token)
+        if session is None:
+            return None
+        if time.time() - session["created"] > SESSION_MAX_AGE:
+            _sessions.pop(token, None)
+            return None
+        return {"username": session["username"],
+                "role": session["role"],
+                "doctor_id": session["doctor_id"]}
 
 
 # ---------------------------------------------------------------- helpers
@@ -111,10 +180,17 @@ def _undo_last() -> Optional[List[Any]]:
     return list(top.val) if top is not None else None
 
 
-def _state_payload() -> Dict[str, Any]:
+def _state_payload(doctor_id: Optional[str] = None) -> Dict[str, Any]:
+    """Everything the UI needs. When ``doctor_id`` is given (a Doctor
+    user linked to one doctor), only that doctor's queue is included —
+    a Doctor sees their own appointments, not everyone else's. Stats
+    always cover the whole hospital."""
+    doctors = hospital.doctors_map.values()
+    if doctor_id is not None:
+        doctors = [d for d in doctors if d["id"] == doctor_id]
     return {
         "patients": [_serialize_patient(p) for p in hospital.patients_list],
-        "doctors": [_serialize_doctor(d) for d in hospital.doctors_map.values()],
+        "doctors": [_serialize_doctor(d) for d in doctors],
         "beds": [
             {"bed": i + 1, "patient_id": pid if pid != 0 else None,
              "status": "Free" if pid == 0 else "Occupied"}
@@ -154,14 +230,30 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
         print(f"  [HTTP] {self.command} {self.path} -> "
               f"{args[1] if len(args) > 1 else ''}")
 
-    def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+    def _send_json(self, payload: Dict[str, Any], status: int = 200,
+                   extra_headers: Optional[List[tuple]] = None) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or []):
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _forbidden(self, role: str) -> None:
+        """403 answer when a logged-in role tries something it may not do."""
+        self._send_json(
+            {"ok": False, "error": f"Not allowed for your role ({role})."}, 403)
+
+    def _doctor_filter(self) -> Optional[str]:
+        """Doctor id to filter queues by, or None (Admin/Receptionist,
+        or a Doctor with no linked doctor record)."""
+        user = getattr(self, "_user", None) or {}
+        if user.get("role") == "Doctor":
+            return user.get("doctor_id")
+        return None
 
     def _read_json_body(self) -> Dict[str, Any]:
         try:
@@ -182,9 +274,37 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if path.startswith("/api/"):
+            # Every API call needs a login — no session, no data.
+            user = _session_user(self)
+            if user is None:
+                return self._send_json(
+                    {"ok": False, "error": "Please log in first."}, 401)
+            self._user = user
+            return self._api_get(path, query)
+
+        # Static pages: the dashboard itself needs a login — without
+        # one, serve the login page instead. (CSS/JS/favicon stay
+        # public so the login page can load.)
+        if path in ("/", "/index.html") and _session_user(self) is None:
+            self.path = "/login.html"
+        return super().do_GET()
+
+    def _api_get(self, path: str, query: Dict[str, List[str]]) -> None:
+        """Authenticated GET /api/* routes (called only after login)."""
         with state_lock:
+            if path == "/api/me":
+                return self._send_json({"ok": True, "user": self._user})
+
             if path == "/api/state":
-                return self._send_json({"ok": True, "state": _state_payload()})
+                return self._send_json(
+                    {"ok": True,
+                     "state": _state_payload(self._doctor_filter())})
 
             if path == "/api/dashboard":
                 return self._send_json({"ok": True, "stats": _dashboard()})
@@ -214,10 +334,13 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     {"ok": True, "patient": _serialize_patient(found)})
 
             if path == "/api/doctors":
+                docs = hospital.doctors_map.values()
+                doctor_id = self._doctor_filter()
+                if doctor_id is not None:
+                    docs = [d for d in docs if d["id"] == doctor_id]
                 return self._send_json({
                     "ok": True,
-                    "doctors": [_serialize_doctor(d)
-                                for d in hospital.doctors_map.values()],
+                    "doctors": [_serialize_doctor(d) for d in docs],
                 })
 
             if path == "/api/beds":
@@ -235,19 +358,17 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "on_duty": shifts[0] if shifts else None,
                 })
 
-            if path == "/favicon.ico":
-                self.send_response(204)
-                self.end_headers()
-                return
-
-            if path.startswith("/api/"):
-                # Unknown API route: answer JSON, never an HTML 404 page —
-                # the frontend's res.json() would throw on HTML and the
-                # whole page would die silently with no error message.
+            if path == "/api/users":
+                if not can(self._user["role"], "manage_users"):
+                    return self._forbidden(self._user["role"])
                 return self._send_json(
-                    {"ok": False, "error": "Unknown endpoint."}, 404)
+                    {"ok": True, "users": auth_store.list_users()})
 
-        return super().do_GET()
+            # Unknown API route: answer JSON, never an HTML 404 page —
+            # the frontend's res.json() would throw on HTML and the
+            # whole page would die silently with no error message.
+            return self._send_json(
+                {"ok": False, "error": "Unknown endpoint."}, 404)
 
     # ----------------------------------------------------------- POST
     def do_POST(self) -> None:  # noqa: N802
@@ -255,9 +376,103 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         data = self._read_json_body()
 
+        # ---- Login / logout need no session (they make or break one).
+        if path == "/api/login":
+            username = str(data.get("username", "")).strip()
+            password = str(data.get("password", ""))
+            user = auth_store.authenticate(username, password)
+            if user is None:
+                return self._send_json(
+                    {"ok": False, "error": "Wrong username or password."}, 401)
+            token = _new_session(user)
+            cookie = (f"{SESSION_COOKIE}={token}; HttpOnly; Path=/;"
+                      f" SameSite=Lax; Max-Age={SESSION_MAX_AGE}")
+            return self._send_json(
+                {"ok": True, "message": f"Logged in as {user['username']}.",
+                 "user": user},
+                extra_headers=[("Set-Cookie", cookie)])
+
+        if path == "/api/logout":
+            _drop_session(_session_token(self))
+            return self._send_json(
+                {"ok": True, "message": "Logged out."},
+                extra_headers=[("Set-Cookie",
+                                f"{SESSION_COOKIE}=; HttpOnly; Path=/;"
+                                " SameSite=Lax; Max-Age=0")])
+
+        # ---- Everything else needs a login.
+        if not path.startswith("/api/"):
+            return self._send_json(
+                {"ok": False, "error": "Unknown endpoint."}, 404)
+        user = _session_user(self)
+        if user is None:
+            return self._send_json(
+                {"ok": False, "error": "Please log in first."}, 401)
+        self._user = user
+        return self._api_post(path, data)
+
+    def _api_post(self, path: str, data: Dict[str, Any]) -> None:
+        """Authenticated POST /api/* routes (called only after login)."""
+        role = self._user["role"]
+
         with state_lock:
+            # ---- Change my own password (every role)
+            if path == "/api/change-password":
+                current = str(data.get("current_password", ""))
+                new = str(data.get("new_password", ""))
+                again = str(data.get("new_password_again", new))
+                if new != again:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "New passwords do not match."}, 400)
+                try:
+                    ok = auth_store.change_password(
+                        self._user["username"], current, new)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                if not ok:
+                    return self._send_json(
+                        {"ok": False, "error": "Wrong current password."}, 400)
+                return self._send_json(
+                    {"ok": True, "message": "Password changed."})
+
+            # ---- Users (Admin only)
+            if path == "/api/users":
+                if not can(role, "manage_users"):
+                    return self._forbidden(role)
+                username = str(data.get("username", "")).strip()
+                password = str(data.get("password", ""))
+                new_role = str(data.get("role", "")).strip().title()
+                doctor_id = str(data.get("doctor_id", "")).strip()
+                try:
+                    created = auth_store.create_user(
+                        username, password, new_role, doctor_id)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json(
+                    {"ok": True, "message": f"User {username} created.",
+                     "user": created})
+
+            if path.startswith("/api/users/") and path.endswith("/reset"):
+                if not can(role, "manage_users"):
+                    return self._forbidden(role)
+                username = path.removeprefix("/api/users/").removesuffix("/reset").strip("/")
+                new_password = str(data.get("new_password", ""))
+                try:
+                    auth_store.reset_password(username, new_password)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json(
+                    {"ok": True,
+                     "message": f"Password reset for {username}."})
+
             # ---- Add Patient
             if path == "/api/patients":
+                if not can(role, "add_patient"):
+                    return self._forbidden(role)
                 pid = _parse_int(data.get("id"))
                 age = _parse_int(data.get("age"))
                 if pid is None or age is None:
@@ -288,6 +503,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Add Note
             if path.startswith("/api/patients/") and path.endswith("/notes"):
+                if not can(role, "add_note"):
+                    return self._forbidden(role)
                 raw = path.removeprefix("/api/patients/").removesuffix("/notes").strip("/")
                 try:
                     pid = int(raw)
@@ -314,6 +531,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Add Doctor
             if path == "/api/doctors":
+                if not can(role, "add_doctor"):
+                    return self._forbidden(role)
                 doc_id = str(data.get("id", "")).strip().upper()
                 name = str(data.get("name", "")).strip()
                 spec = str(data.get("spec", "")).strip()
@@ -343,6 +562,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Book Appointment
             if path == "/api/appointments":
+                if not can(role, "book_appointment"):
+                    return self._forbidden(role)
                 doc_id = str(data.get("doctor_id", "")).strip().upper()
                 pid = _parse_int(data.get("patient_id"))
                 if pid is None:
@@ -367,6 +588,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Beds: assign / free
             if path == "/api/beds/assign":
+                if not can(role, "manage_beds"):
+                    return self._forbidden(role)
                 bed_no = _parse_int(data.get("bed"))
                 pid = _parse_int(data.get("patient_id"))
                 if bed_no is None or pid is None:
@@ -389,6 +612,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "ok": True, "message": f"Bed {bed_no} assigned to patient {pid}."})
 
             if path == "/api/beds/free":
+                if not can(role, "manage_beds"):
+                    return self._forbidden(role)
                 bed_no = _parse_int(data.get("bed"))
                 if bed_no is None:
                     return self._send_json(
@@ -409,6 +634,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Undo
             if path == "/api/undo":
+                if not can(role, "undo"):
+                    return self._forbidden(role)
                 last = _undo_last()
                 if not last:
                     return self._send_json(
@@ -421,6 +648,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Pharmacy: add token / serve
             if path == "/api/pharmacy":
+                if not can(role, "pharmacy"):
+                    return self._forbidden(role)
                 token = str(data.get("token", "")).strip()
                 if not token:
                     return self._send_json(
@@ -431,6 +660,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     {"ok": True, "message": f"Token '{token}' added to pharmacy queue."})
 
             if path == "/api/pharmacy/serve":
+                if not can(role, "pharmacy"):
+                    return self._forbidden(role)
                 served = hospital.pharmacy_q.dequeue()
                 if served is not None:
                     hospital.save()
@@ -442,6 +673,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
 
             # ---- Shifts: rotate
             if path == "/api/shifts/rotate":
+                if not can(role, "rotate_shift"):
+                    return self._forbidden(role)
                 now = hospital.shift_q.rotate()
                 if now is not None:
                     hospital.save()
