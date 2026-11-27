@@ -23,7 +23,7 @@
     </div>
     <h1>Hospital Management System</h1>
     <p class="sub">Please log in to continue</p>
-    <form id="f-login" class="form-grid">
+    <form id="f-login" class="form-grid" method="POST" action="/login">
       <div class="field"><label>Username</label>
         <input type="text" name="username" placeholder="e.g. admin" required autofocus></div>
       <div class="field"><label>Password</label>
@@ -35,28 +35,78 @@
   </div>
 </div>
 <script>
-  document.getElementById("f-login").addEventListener("submit", async (e) => {
+  // Check URL query for error or logout
+  const urlParams = new URLSearchParams(window.location.search);
+  const errParam = urlParams.get("error");
+  const isLogout = urlParams.get("logout");
+
+  if (errParam) {
+    document.getElementById("login-error").innerHTML =
+      '<div class="msg msg-err">' + decodeURIComponent(errParam) + '</div>';
+  }
+
+  // If user is already logged in and not explicitly logging out, go to dashboard
+  if (!isLogout) {
+    const existingToken = localStorage.getItem("hms_token");
+    if (existingToken) {
+      fetch("/api/me", {
+        headers: { "Authorization": "Bearer " + existingToken },
+        credentials: "same-origin"
+      }).then(r => r.json()).then(data => {
+        if (data && data.ok) {
+          window.location.replace("/index.html?token=" + encodeURIComponent(existingToken));
+        }
+      }).catch(() => {});
+    }
+  }
+
+  const form = document.getElementById("f-login");
+  const submitBtn = form.querySelector("button[type='submit']");
+  const err = document.getElementById("login-error");
+
+  form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const f = new FormData(e.target);
-    const err = document.getElementById("login-error");
     err.innerHTML = "";
-    let res;
-    try {
-      res = await fetch("/api/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: f.get("username"), password: f.get("password") }),
-      });
-    } catch (e) {
-      err.innerHTML = '<div class="msg msg-err">Server se connect nahi ho raha. Terminal mein <b>python server.py</b> chalao.</div>';
+    const f = new FormData(form);
+    const username = (f.get("username") || "").trim();
+    const password = (f.get("password") || "").trim();
+
+    if (!username || !password) {
+      err.innerHTML = '<div class="msg msg-err">Username aur password dono likhein.</div>';
       return;
     }
-    let data = {};
-    try { data = await res.json(); } catch (e) { /* ignore */ }
-    if (res.ok && data.ok) {
-      location.href = "/";
-    } else {
-      err.innerHTML = '<div class="msg msg-err">' + (data.error || "Login failed — dobara try karo.") + "</div>";
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Logging in...";
+
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ username, password }),
+      });
+      let data = {};
+      try { data = await res.json(); } catch(e){}
+
+      if (res.ok && data.ok) {
+        if (data.token) {
+          try { localStorage.setItem("hms_token", data.token); } catch(e){}
+          try { document.cookie = "hms_session=" + data.token + "; path=/; credentials=same-origin; max-age=43200; SameSite=Lax"; } catch(e){}
+        }
+        submitBtn.textContent = "Opening Dashboard...";
+        const targetUrl = data.token ? ("/index.html?token=" + encodeURIComponent(data.token)) : "/index.html";
+        window.location.replace(targetUrl);
+        return;
+      } else {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Log In";
+        err.innerHTML = '<div class="msg msg-err">' + (data.error || "Wrong username or password.") + "</div>";
+        return;
+      }
+    } catch (e) {
+      // Fallback: submit natively
+      form.submit();
     }
   });
 </script>

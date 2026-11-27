@@ -94,7 +94,23 @@ def _drop_session(token: Optional[str]) -> None:
 
 
 def _session_token(handler) -> Optional[str]:
-    """Read the session token from the request's Cookie header."""
+    """Read the session token from Authorization header, query string, or Cookie."""
+    # 1. Bearer header
+    auth_header = handler.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        val = auth_header[7:].strip()
+        if val:
+            return val
+
+    # 2. Query parameter (?token=...)
+    parsed = urllib.parse.urlparse(getattr(handler, "path", ""))
+    query = urllib.parse.parse_qs(parsed.query)
+    if "token" in query and query["token"]:
+        val = query["token"][0].strip()
+        if val:
+            return val
+
+    # 3. Cookie header
     cookie = handler.headers.get("Cookie", "")
     for part in cookie.split(";"):
         part = part.strip()
@@ -257,9 +273,18 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=WEB_DIR, **kwargs)
 
+    def end_headers(self) -> None:
+        # Prevent caching of HTML pages and API routes so login transitions smoothly
+        path = getattr(self, "path", "")
+        if path in ("/", "/index.html", "/login.html") or path.endswith(".html") or path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         print(f"  [HTTP] {self.command} {self.path} -> "
-              f"{args[1] if len(args) > 1 else ''}")
+              f"{args[1] if len(args) > 1 else ''}", flush=True)
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200,
                    extra_headers: Optional[List[tuple]] = None) -> None:
@@ -336,8 +361,21 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
         # Static pages: the dashboard itself needs a login — without
         # one, serve the login page instead. (CSS/JS/favicon stay
         # public so the login page can load.)
-        if path in ("/", "/index.html") and _session_user(self) is None:
-            self.path = "/login.html"
+        if path == "/login.html":
+            user = _session_user(self)
+            if user is not None:
+                token = _session_token(self)
+                target = f"/index.html?token={token}" if token else "/index.html"
+                self.send_response(303)
+                self.send_header("Location", target)
+                self.end_headers()
+                return
+
+        if path in ("/", "/index.html"):
+            if _session_user(self) is None:
+                self.path = "/login.html"
+            else:
+                self.path = "/index.html"
         return super().do_GET()
 
     def _api_get(self, path: str, query: Dict[str, List[str]]) -> None:
@@ -508,10 +546,37 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        # Support native HTML form POST to /login or /api/login
+        ctype = self.headers.get("Content-Type", "")
+        if path in ("/login", "/api/login") and "application/x-www-form-urlencoded" in ctype:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
+            params = urllib.parse.parse_qs(raw)
+            username = params.get("username", [""])[0].strip()
+            password = params.get("password", [""])[0].strip()
+            user = auth_store.authenticate(username, password)
+            if user is None:
+                self.send_response(303)
+                self.send_header("Location", "/login.html?error=Wrong%20username%20or%20password")
+                self.end_headers()
+                return
+            token = _new_session(user)
+            cookie = (f"{SESSION_COOKIE}={token}; Path=/;"
+                      f" SameSite=Lax; Max-Age={SESSION_MAX_AGE}")
+            self.send_response(303)
+            self.send_header("Set-Cookie", cookie)
+            self.send_header("Location", f"/index.html?token={token}")
+            self.end_headers()
+            return
+
         data = self._read_json_body()
 
         # ---- Login / logout need no session (they make or break one).
-        if path == "/api/login":
+        if path in ("/login", "/api/login"):
             username = str(data.get("username", "")).strip()
             password = str(data.get("password", ""))
             user = auth_store.authenticate(username, password)
@@ -523,7 +588,7 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                       f" SameSite=Lax; Max-Age={SESSION_MAX_AGE}")
             return self._send_json(
                 {"ok": True, "message": f"Logged in as {user['username']}.",
-                 "user": user},
+                 "user": user, "token": token},
                 extra_headers=[("Set-Cookie", cookie)])
 
         if path == "/api/logout":
@@ -1016,7 +1081,14 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
-    server = _ReusableThreadingHTTPServer((args.host, args.port), HospitalRequestHandler)
+    try:
+        server = _ReusableThreadingHTTPServer((args.host, args.port), HospitalRequestHandler)
+    except OSError as err:
+        print(f"\n[ERROR] Port {args.port} pehle se use ho raha hai (already in use).")
+        print("Hal (Solutions):")
+        print(f"  1. Pehle chalte hue terminal ko Ctrl+C daba kar band karein.")
+        print(f"  2. Ya doosre port par chalayein: python server.py --port 8080\n")
+        return
     url = f"http://{args.host}:{args.port}"
     print(f"Hospital Management System running at {url}")
     print("Press Ctrl+C to stop.")

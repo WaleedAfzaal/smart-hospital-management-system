@@ -149,10 +149,10 @@ class AuthStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT username, password_hash, role, doctor_id FROM users"
-                " WHERE username = ?",
+                " WHERE username = ? COLLATE NOCASE",
                 (username.strip(),),
             ).fetchone()
-        if not row or not verify_password(password, row[1]):
+        if not row or not (verify_password(password, row[1]) or verify_password(password.strip(), row[1])):
             return None
         return {"username": row[0], "role": row[2], "doctor_id": row[3]}
 
@@ -161,7 +161,7 @@ class AuthStore:
         """Public user record (no password hash) or None."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT username, role, doctor_id FROM users WHERE username = ?",
+                "SELECT username, role, doctor_id FROM users WHERE username = ? COLLATE NOCASE",
                 (username.strip(),),
             ).fetchone()
         if not row:
@@ -189,7 +189,7 @@ class AuthStore:
         doctor_id = (doctor_id or "").strip().upper() or None
         with self._lock:
             exists = self._conn.execute(
-                "SELECT 1 FROM users WHERE username = ?", (username,)
+                "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)
             ).fetchone()
             if exists:
                 raise ValueError("Username already exists.")
@@ -207,14 +207,14 @@ class AuthStore:
             raise ValueError("New password is required.")
         with self._lock:
             row = self._conn.execute(
-                "SELECT password_hash FROM users WHERE username = ?",
+                "SELECT username, password_hash FROM users WHERE username = ? COLLATE NOCASE",
                 (username.strip(),),
             ).fetchone()
-            if not row or not verify_password(current_password, row[0]):
+            if not row or not (verify_password(current_password, row[1]) or verify_password(current_password.strip(), row[1])):
                 return False
             self._conn.execute(
                 "UPDATE users SET password_hash = ? WHERE username = ?",
-                (hash_password(new_password), username.strip()),
+                (hash_password(new_password.strip()), row[0]),
             )
             self._conn.commit()
         return True
@@ -225,12 +225,12 @@ class AuthStore:
             raise ValueError("New password is required.")
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM users WHERE username = ?", (username.strip(),)
+                "SELECT username FROM users WHERE username = ? COLLATE NOCASE", (username.strip(),)
             ).fetchone()
             if not row:
                 raise ValueError("User not found.")
             self._conn.execute(
                 "UPDATE users SET password_hash = ? WHERE username = ?",
-                (hash_password(new_password), username.strip()),
+                (hash_password(new_password.strip()), row[0]),
             )
             self._conn.commit()

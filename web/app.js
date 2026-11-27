@@ -56,13 +56,19 @@ function applyRoleVisibility() {
 async function loadMe() {
   /* Who is logged in? 401 means the session is gone (server
      restarted) — back to the login page. */
+  const urlToken = new URLSearchParams(window.location.search).get("token");
+  if (urlToken) {
+    try { localStorage.setItem("hms_token", urlToken); } catch(e){}
+    try { document.cookie = "hms_session=" + urlToken + "; path=/; max-age=43200; SameSite=Lax"; } catch(e){}
+  }
   const res = await api("/api/me");
   if (res && res.ok) {
     currentUser = res.user;
     applyRoleVisibility();
     return true;
   }
-  location.href = "/";
+  try { localStorage.removeItem("hms_token"); } catch(e){}
+  window.location.replace("/login.html?logout=1");
   return false;
 }
 
@@ -96,10 +102,20 @@ async function api(path, method = "GET", payload = null) {
      silently. (Old version threw on fetch/JSON failure and the
      whole page went blank with no message at all.) */
   let res;
+  const headers = { "Content-Type": "application/json" };
+  const urlToken = new URLSearchParams(window.location.search).get("token");
+  let token = urlToken;
+  if (!token) {
+    try { token = localStorage.getItem("hms_token"); } catch(e){}
+  }
+  if (token) {
+    headers["Authorization"] = "Bearer " + token;
+  }
   try {
     res = await fetch(path, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers,
+      credentials: "same-origin",
       body: payload ? JSON.stringify(payload) : null,
     });
   } catch (e) {
@@ -153,7 +169,9 @@ async function loadState() {
      A 401 means the login session ended — back to the login page. */
   const res = await api("/api/state");
   if (res && res._status === 401) {
-    location.href = "/";
+    try { localStorage.removeItem("hms_token"); } catch(e){}
+    try { document.cookie = "hms_session=; path=/; max-age=0"; } catch(e){}
+    window.location.replace("/login.html?logout=1");
     return null;
   }
   if (res && res.ok) {
@@ -1029,7 +1047,9 @@ document.getElementById("top-undo").addEventListener("click", doUndo);
 
 document.getElementById("top-logout").addEventListener("click", async () => {
   await api("/api/logout", "POST", {});
-  location.href = "/";
+  try { localStorage.removeItem("hms_token"); } catch(e){}
+  try { document.cookie = "hms_session=; path=/; max-age=0"; } catch(e){}
+  window.location.replace("/login.html?logout=1");
 });
 
 document.getElementById("top-change-pw").addEventListener("click", () =>
