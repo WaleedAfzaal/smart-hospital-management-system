@@ -3,10 +3,10 @@
 Base URL: `http://127.0.0.1:8000` (default). All responses are JSON with an
 `ok` flag. Errors return `{"ok": false, "error": "..."}` with a 4xx status.
 
-The server keeps all data in memory (from `hospital.py` — `Hospital`,
-`Node`/`LinkedList`, `Stack`, `Queue`, `CircularQueue`, `PriorityQueue`
-(binary heap), `bubble_sort`, `binary_search`). Restarting the server
-resets everything. The 5 starter doctors are `STARTER_DOCTORS` in
+The server saves all data to `hospital.db` (SQLite, created automatically
+next to `server.py`) on every change, so restarting the server keeps
+everything — patients, notes, doctors, appointments, beds, pharmacy
+queue and shifts. The 5 starter doctors are `STARTER_DOCTORS` in
 `hospital.py`: D1 Dr. Tariq (Neurosurgeon, 2500), D2 Dr. Ayesha
 (Cardiologist, 2000), D3 Dr. Bilal (Orthopedic, 1800), D4 Dr. Sana
 (Physician, 1200), D5 Dr. Kamran (Pediatrician, 1500).

@@ -1,3 +1,22 @@
+"""Hospital Management System — core logic (data structures + operations).
+
+Step 1 (SQLite): the Hospital can now be opened with a database file
+(``Hospital(db_path="hospital.db")``) — every change is saved at once and
+loaded back on the next start, so data survives a restart. With no
+``db_path`` it works exactly as before: fully in memory, nothing written.
+The undo stack is session-only and starts empty after a restart.
+"""
+
+import os
+
+from database import Database
+
+# SQLite file used by the CLI and the web server (same file, so both
+# see the same patients, appointments and beds).
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "hospital.db")
+
+
 class Node:
     def __init__(self, val):
         self.val, self.next = val, None
@@ -190,13 +209,29 @@ class Hospital:
         ("D5", "Dr. Kamran", "Pediatrician", 1500),
     ]
 
-    def __init__(self):
+    def __init__(self, db_path=None):
         self.patients_map, self.patients_list, self.doctors_map = {}, [], {}
         self.beds = [0] * self.NUM_BEDS
         self.undo_stack, self.pharmacy_q, self.shift_q = Stack(), Queue(), CircularQueue(20)
         for doc_id, name, spec, fee in self.STARTER_DOCTORS:
             self.doctors_map[doc_id] = {"id": doc_id, "name": name, "spec": spec, "fee": fee, "queue": PriorityQueue()}
             self.shift_q.enqueue(f"{doc_id} - {name}")
+        # Persistence (Step 1): with a db file, load saved state (or seed
+        # the file with this fresh starter state on first run). Without
+        # one, everything stays in memory as before.
+        self.db_path = db_path
+        self.db = Database(db_path) if db_path else None
+        if self.db is not None:
+            self.db.load(self)
+
+    def save(self):
+        """Write the current state to the database file (no-op in memory)."""
+        if self.db is not None:
+            self.db.save(self)
+
+    def _persist(self):
+        """Save after every change, so a restart never loses data."""
+        self.save()
 
     def add_patient(self, pid, name, age, problem, save_undo=True):
         if pid in self.patients_map:
@@ -206,6 +241,7 @@ class Hospital:
         self.patients_list.append(pat)
         if save_undo:
             self.undo_stack.push(("ADD_PATIENT", pid))
+        self._persist()
         print("  Patient added.")
 
     def show_sorted(self, field):
@@ -227,6 +263,7 @@ class Hospital:
         p["notes"].add_last(note_text)
         p["visits"] += 1
         self.undo_stack.push(("ADD_NOTE", pid))
+        self._persist()
         print("  Note added.")
 
     def doctors_menu(self):
@@ -242,6 +279,7 @@ class Hospital:
             fee = int(input("  Token Fee: "))
             self.doctors_map[doc_id] = {"id": doc_id, "name": name, "spec": spec, "fee": fee, "queue": PriorityQueue()}
             self.shift_q.enqueue(f"{doc_id} - {name}")
+            self._persist()
             print("  Doctor added.")
 
     def book_appointment(self, doc_id, pid, is_emg):
@@ -251,6 +289,7 @@ class Hospital:
         pat["visits"] += 1
         token = doc["queue"].enqueue(is_emg, pid, pat["name"], doc["fee"])
         self.undo_stack.push(("BOOK_APPT", doc["id"], token, pid))
+        self._persist()
         print(f"  Booked {token} for {pat['name']} with {doc['name']} | Fee: {doc['fee']}")
 
     def beds_menu(self):
@@ -262,12 +301,14 @@ class Hospital:
             if 0 <= idx < self.NUM_BEDS and self.beds[idx] == 0 and pid in self.patients_map:
                 self.beds[idx] = pid
                 self.undo_stack.push(("BED", idx, 0))
+                self._persist()
                 print("  Bed assigned.")
         elif opt == "2":
             idx = int(input(f"  Bed (1-{self.NUM_BEDS}): ")) - 1
             if 0 <= idx < self.NUM_BEDS and self.beds[idx] != 0:
                 old_pid, self.beds[idx] = self.beds[idx], 0
                 self.undo_stack.push(("BED", idx, old_pid))
+                self._persist()
                 print("  Bed freed.")
 
     def undo(self):
@@ -288,14 +329,17 @@ class Hospital:
                 self.patients_map[act[3]]["visits"] = max(0, self.patients_map[act[3]]["visits"] - 1)
         elif kind == "BED":
             self.beds[act[1]] = act[2]
+        self._persist()
         print(f"  Undid {kind}.")
 
     def pharmacy_menu(self):
         opt = input("  1. Add Token  2. Serve  3. View: ").strip()
         if opt == "1":
             self.pharmacy_q.enqueue(input("  Token or Name: ").strip())
+            self._persist()
         elif opt == "2":
             print("  Served:", self.pharmacy_q.dequeue())
+            self._persist()
         elif opt == "3":
             self.pharmacy_q.show()
 
@@ -305,6 +349,7 @@ class Hospital:
             self.shift_q.show()
         elif opt == "2":
             print("  Now on duty:", self.shift_q.rotate())
+            self._persist()
 
     def dashboard(self):
         free_beds = sum(1 for b in self.beds if b == 0)
@@ -313,7 +358,7 @@ class Hospital:
 
 
 def main():
-    hosp = Hospital()
+    hosp = Hospital(db_path=DEFAULT_DB_PATH)
     while True:
         print("\n1.Add Patient  2.View Sorted  3.Find Patient  4.Add Note    5.Doctors")
         print("6.Book Appt    7.Beds         8.Undo          9.Pharmacy Q  10.Shifts")

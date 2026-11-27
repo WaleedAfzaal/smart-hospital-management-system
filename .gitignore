@@ -1,3 +1,8 @@
+# Local database (Step 1 — SQLite persistence). Each install keeps its own
+# hospital.db; it is data, not source, and must never be committed.
+hospital.db
+*.db
+
 # Python
 __pycache__/
 *.py[cod]

@@ -6,6 +6,10 @@ Hospital class from hospital.py (Ali's file — kept as-is, no changes).
 Hospital's methods print instead of returning, so success is determined
 from state before/after each call (e.g. pid in patients_map), and the
 booking token is computed from the doctor's queue count after enqueue.
+
+Step 1 (SQLite): state is saved to hospital.db on every change and loaded
+on startup, so restarting the server no longer resets everything. The
+undo stack is session-only and starts empty after a restart.
 """
 
 import argparse
@@ -17,13 +21,15 @@ import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
-from hospital import Hospital, PriorityQueue, binary_search, bubble_sort
+from hospital import DEFAULT_DB_PATH, Hospital, PriorityQueue, binary_search, bubble_sort
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOST = "127.0.0.1"
 PORT = 8000
 
-hospital = Hospital()
+# Step 1 (SQLite): the server shares the same hospital.db file as the
+# CLI, so data added in one shows up in the other and survives restarts.
+hospital = Hospital(db_path=DEFAULT_DB_PATH)
 state_lock = threading.Lock()
 
 
@@ -329,6 +335,7 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "queue": PriorityQueue(),
                 }
                 hospital.shift_q.enqueue(f"{doc_id} - {name}")
+                hospital.save()
                 return self._send_json({
                     "ok": True, "message": "Doctor added.",
                     "doctor": _serialize_doctor(hospital.doctors_map[doc_id]),
@@ -377,6 +384,7 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                         {"ok": False, "error": "Patient not found."}, 404)
                 hospital.beds[idx] = pid
                 hospital.undo_stack.push(("BED", idx, 0))
+                hospital.save()
                 return self._send_json({
                     "ok": True, "message": f"Bed {bed_no} assigned to patient {pid}."})
 
@@ -395,6 +403,7 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 old_pid = hospital.beds[idx]
                 hospital.beds[idx] = 0
                 hospital.undo_stack.push(("BED", idx, old_pid))
+                hospital.save()
                 return self._send_json({
                     "ok": True, "message": f"Bed {bed_no} freed (was patient {old_pid})."})
 
@@ -417,11 +426,14 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     return self._send_json(
                         {"ok": False, "error": "Token or Name is required."}, 400)
                 hospital.pharmacy_q.enqueue(token)
+                hospital.save()
                 return self._send_json(
                     {"ok": True, "message": f"Token '{token}' added to pharmacy queue."})
 
             if path == "/api/pharmacy/serve":
                 served = hospital.pharmacy_q.dequeue()
+                if served is not None:
+                    hospital.save()
                 if served is None:
                     return self._send_json(
                         {"ok": False, "error": "Pharmacy queue is empty."}, 400)
@@ -431,6 +443,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
             # ---- Shifts: rotate
             if path == "/api/shifts/rotate":
                 now = hospital.shift_q.rotate()
+                if now is not None:
+                    hospital.save()
                 if now is None:
                     return self._send_json(
                         {"ok": False, "error": "No shifts to rotate."}, 400)

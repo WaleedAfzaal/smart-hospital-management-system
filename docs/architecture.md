@@ -22,6 +22,27 @@ D2 Dr. Ayesha (Cardiologist, 2000), D3 Dr. Bilal (Orthopedic, 1800),
 D4 Dr. Sana (Physician, 1200), D5 Dr. Kamran (Pediatrician, 1500).
 They also seed the shift rotation.
 
+## Database — Step 1 (SQLite persistence)
+
+- `database.py` — `Database` class (stdlib `sqlite3` only, no new
+  dependencies). One file, `hospital.db`, next to `hospital.py`.
+- `Hospital(db_path="hospital.db")` loads saved state on start (or seeds
+  the file with the 5 starter doctors on first run) and saves after
+  every change — add patient/note/doctor, book appointment, bed
+  assign/free, undo, pharmacy add/serve, shift rotate. `Hospital()`
+  with no path stays fully in-memory (used by the tests).
+- Saved: patients + notes (in order), doctors + token counters,
+  appointment heaps (heap order kept, so Emergency-first still works
+  and token numbers keep counting up), beds, pharmacy queue (FIFO
+  order), shift rotation (duty order). The undo stack is session-only
+  and starts empty after a restart.
+- The CLI (`hospital.py`) and the server (`server.py`) open the same
+  `hospital.db`, so a patient added in one shows up in the other.
+- `hospital.db` is local data, not source: it is in `.gitignore` and
+  is never committed. Delete it to start fresh.
+- Tests: `tests/test_database.py` — save → restart → reload round-trips
+  for patients/notes, appointments, beds, pharmacy, shifts, doctors.
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -32,8 +53,9 @@ They also seed the shift rotation.
 - `hospital.py` methods print instead of returning, so the server
   determines success from state before/after each call and computes the
   booking token from the doctor's queue count after enqueue.
-- Everything is in-memory: restarting the server resets all data.
-  This is a university project, not for production.
+- State is saved to `hospital.db` on every change (see Database above),
+  so restarting the server keeps all data. This is a university
+  project, not for production.
 
 ## Frontend (`web/`)
 

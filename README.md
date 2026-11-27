@@ -15,6 +15,7 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Pharmacy Queue**: FIFO token queue — add a token, serve the next one, or view the line.
 - **Shift Rotation**: Doctors rotate on duty through a circular queue.
 - **Dashboard**: Live counts — patients, doctors, waiting appointments, free beds.
+- **SQLite Persistence**: All data is saved to `hospital.db` (created automatically) on every change — patients, notes, doctors, appointments, beds, pharmacy queue and shifts all survive a restart. The CLI and the web dashboard share the same database file. Delete `hospital.db` to start fresh.
 - **Zero External Dependencies**: Runs on Python 3.9+ using only the standard library.
 
 ## Quick Start
@@ -55,6 +56,8 @@ python hospital.py
 ```text
 .
 ├── hospital.py               # Hospital class — all data structures & operations
+├── database.py               # SQLite persistence — save/load whole state to hospital.db
+├── hospital.db               # Local database file (auto-created, gitignored, never committed)
 ├── server.py                 # ThreadingHTTPServer, static file serving, and JSON REST API
 ├── web/
 │   ├── index.html           # Single-page dashboard (all operations on one page)
@@ -64,7 +67,9 @@ python hospital.py
 │   ├── architecture.md      # Data structures, concurrency model, and state lifecycle
 │   └── api.md               # REST API reference and payload examples
 ├── tests/
-│   └── test_hospital.py     # Unit tests for the Hospital class
+│   ├── test_hospital.py     # Unit tests for the Hospital class
+│   ├── test_server.py       # End-to-end API tests for the web server
+│   └── test_database.py     # Persistence round-trip tests (save → restart → reload)
 ├── CONTRIBUTING.md
 └── LICENSE
 ```
