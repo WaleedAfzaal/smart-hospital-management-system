@@ -26,6 +26,20 @@ changes name/age/problem (the ID never changes, and a renamed
 patient's queued appointments show the new name); ``delete_patient``
 removes the record + notes + queued appointments and frees their bed,
 while their bills are KEPT as financial records.
+
+Step 6 (Appointment Statuses + History): every appointment carries a
+status — Pending, Confirmed, Checked In, In Progress, Completed,
+Cancelled or No Show — as the 10th field of the heap row. New
+appointments start Pending; old rows (before Step 6) load as Pending.
+Every status change is written to the status-history table (see
+status_history.py) with the old/new status, the user who changed it
+and the time — the history is an audit trail and is never deleted,
+even when the patient or the appointment goes away. Booking refuses
+a double booking: the same doctor cannot have two ACTIVE
+appointments (anything except Cancelled / No Show) at the same date
+and time. Doctors may only move their OWN queue's appointments to
+Checked In, In Progress or Completed; Admin and Receptionist may set
+any status.
 """
 
 import datetime
@@ -36,6 +50,44 @@ import re
 from auth import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME, AuthStore, can
 from billing import Billing
 from database import Database
+from status_history import StatusHistory
+
+# Step 6: appointment statuses. "Pending" is the default for a new
+# booking; old rows (booked before Step 6) load as Pending too.
+APPOINTMENT_STATUSES = ("Pending", "Confirmed", "Checked In",
+                        "In Progress", "Completed", "Cancelled", "No Show")
+# Statuses a Doctor may set — only on their OWN queue (Admin and
+# Receptionist may set any status on any doctor's queue).
+DOCTOR_STATUSES = ("Checked In", "In Progress", "Completed")
+# Appointments in these statuses no longer occupy their time slot —
+# a new booking at the same date/time is allowed after one of these.
+_INACTIVE_STATUSES = ("Cancelled", "No Show")
+
+
+def _row_status(row):
+    """An appointment heap row's status — "Pending" when the row was
+    built before Step 6 (9 fields) or its stored status is empty."""
+    if len(row) > 9 and row[9]:
+        return row[9]
+    return "Pending"
+
+
+def _public_appointment(doc, row):
+    """A plain dict for one heap row — the shape the API and the CLI
+    both use, so the status is the same everywhere."""
+    return {
+        "token": row[2],
+        "doctor_id": doc["id"],
+        "doctor_name": doc["name"],
+        "patient_id": row[3],
+        "patient_name": row[4],
+        "fee": row[5],
+        "emergency": row[0] == 1,
+        "booked_date": row[6] if len(row) > 6 else None,
+        "appt_date": row[7] if len(row) > 7 else None,
+        "appt_time": row[8] if len(row) > 8 else None,
+        "status": _row_status(row),
+    }
 
 # SQLite file used by the CLI and the web server (same file, so both
 # see the same patients, appointments and beds).
@@ -250,9 +302,11 @@ class PriorityQueue:
         # Empty date means today, empty time means "no fixed time".
         # Bad values raise ValueError (see validate_appt_datetime).
         appt_date, appt_time = validate_appt_datetime(appt_date, appt_time)
+        # Step 6: the status rides as the 10th field — every new
+        # appointment starts Pending.
         self.heap.append((1 if is_emg else 2, self.count, token, pid, name,
                           fee, datetime.date.today().isoformat(),
-                          appt_date, appt_time))
+                          appt_date, appt_time, "Pending"))
         self._move_up(len(self.heap) - 1)
         return token
 
@@ -309,6 +363,11 @@ class Hospital:
         # Step 3: bills live in their own store (same file when a db is
         # given, pure in-memory otherwise — see billing.py).
         self.billing = Billing(db_path)
+        # Step 6: status history lives in its own store (same file when
+        # a db is given, pure in-memory otherwise — see
+        # status_history.py). It is an audit trail: only appended to,
+        # never rewritten by Database.save().
+        self.status_history = StatusHistory(db_path)
         if self.db is not None:
             self.db.load(self)
 
@@ -461,6 +520,7 @@ class Hospital:
             when = _appt_when(row)
             print(f"  {row[2]} | Patient {row[3]} ({row[4]})"
                   f"{' | ' + when if when else ''}"
+                  f" | {_row_status(row)}"
                   f"{' [EMERGENCY]' if row[0] == 1 else ''}")
 
     def add_doctor(self, doc_id, name, spec, fee):
@@ -509,10 +569,25 @@ class Hospital:
         ``appt_time`` (HH:MM 24-hour, empty = no fixed time) say WHEN
         the patient should come. A bad date/time just prints the reason
         and books nothing — the CLI never crashes on it.
+        Step 6: a double booking is refused — the same doctor cannot
+        have two ACTIVE appointments at the same date and time. The
+        new appointment starts with status Pending.
         """
         doc, pat = self.doctors_map.get(doc_id.upper()), self.patients_map.get(pid)
         if not doc or not pat:
             print("  Invalid doctor or patient ID.")
+            return None
+        try:
+            appt_date, appt_time = validate_appt_datetime(appt_date, appt_time)
+        except ValueError as exc:
+            print(f"  {exc}")
+            return None
+        conflict = self.find_conflicting_appointment(
+            doc["id"], appt_date, appt_time)
+        if conflict is not None:
+            print(f"  {doc['name']} already has an appointment at "
+                  f"{appt_date} {appt_time} (token {conflict['token']}, "
+                  f"{conflict['status']}). Pick another time.")
             return None
         try:
             token = doc["queue"].enqueue(
@@ -526,8 +601,98 @@ class Hospital:
         row = next((r for r in doc["queue"].heap if r[2] == token), None)
         when = _appt_when(row) if row is not None else ""
         print(f"  Booked {token} for {pat['name']} with {doc['name']} | Fee: {doc['fee']}"
-              f"{' | ' + when if when else ''}")
+              f"{' | ' + when if when else ''} | Pending")
         return token
+
+    # ------------------------------------------------ Step 6: statuses
+    def find_conflicting_appointment(self, doc_id, appt_date, appt_time):
+        """The ACTIVE appointment that already occupies ``appt_date`` +
+        ``appt_time`` for ``doc_id`` — or None when the slot is free.
+
+        Only timed appointments can collide: a booking with no fixed
+        time never blocks (or is blocked by) anything, and an empty
+        date/time simply has no slot to check. Cancelled and No Show
+        appointments no longer occupy their slot.
+        """
+        if not appt_date or not appt_time:
+            return None
+        doc = self.doctors_map.get(str(doc_id or "").upper())
+        if not doc:
+            return None
+        for row in doc["queue"].heap:
+            row_date = row[7] if len(row) > 7 else None
+            row_time = row[8] if len(row) > 8 else None
+            if (row_date == appt_date and row_time == appt_time
+                    and _row_status(row) not in _INACTIVE_STATUSES):
+                return _public_appointment(doc, row)
+        return None
+
+    def get_appointment(self, doc_id, token):
+        """One appointment as a public dict, or None when the doctor
+        or the token does not exist."""
+        doc = self.doctors_map.get(str(doc_id or "").upper())
+        if not doc:
+            return None
+        token = str(token or "").strip().upper()
+        for row in doc["queue"].heap:
+            if row[2] == token:
+                return _public_appointment(doc, row)
+        return None
+
+    def appointment_history(self, doc_id, token):
+        """Recorded status changes for one appointment, oldest first."""
+        return self.status_history.history(
+            str(doc_id or "").upper(), str(token or "").strip().upper())
+
+    def update_status(self, doc_id, token, new_status, changed_by="system",
+                      role="Admin", user_doctor_id=None):
+        """Change an appointment's status and record the change.
+
+        Returns the updated appointment. Raises ValueError for an
+        unknown doctor/token or a status that is not one of the seven,
+        and PermissionError when the role may not make this change:
+        a Doctor may only move appointments in their OWN queue (their
+        linked doctor; a Doctor with no link may use any queue) to
+        Checked In, In Progress or Completed — Admin and Receptionist
+        may set any status on any queue. Setting the status it already
+        has is a no-op (no history row). The heap order never changes
+        (priority/seq are untouched), and the change is saved at once.
+        """
+        if new_status not in APPOINTMENT_STATUSES:
+            raise ValueError(
+                "Status must be one of: "
+                + ", ".join(APPOINTMENT_STATUSES) + ".")
+        doc = self.doctors_map.get(str(doc_id or "").upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        token = str(token or "").strip().upper()
+        idx = next((i for i, r in enumerate(doc["queue"].heap)
+                    if r[2] == token), None)
+        if idx is None:
+            raise ValueError(f"Token {token} not found for {doc['name']}.")
+        if role == "Doctor":
+            if (user_doctor_id is not None
+                    and user_doctor_id.upper() != doc["id"]):
+                raise PermissionError(
+                    "Doctors can only update appointments in their own queue.")
+            if new_status not in DOCTOR_STATUSES:
+                raise PermissionError(
+                    "Doctors can only set Checked In, In Progress or Completed.")
+        elif role not in ("Admin", "Receptionist"):
+            raise PermissionError(
+                f"Role {role} cannot update appointment statuses.")
+        row = doc["queue"].heap[idx]
+        old_status = _row_status(row)
+        if old_status == new_status:
+            return _public_appointment(doc, row)
+        # Heap order is untouched (priority/seq never change), so the
+        # heap stays valid — only the 10th field changes.
+        base = row[:9] if len(row) > 9 else row
+        doc["queue"].heap[idx] = base + (new_status,)
+        self.status_history.record(
+            doc["id"], token, old_status, new_status, changed_by)
+        self._persist()
+        return _public_appointment(doc, doc["queue"].heap[idx])
 
     def appointments_for_date(self, date=None, doctor_id=None):
         """All appointments scheduled for ``date`` (today by default).
@@ -551,18 +716,7 @@ class Hospital:
                 appt_date = row[7] if len(row) > 7 else None
                 if appt_date != date:
                     continue
-                out.append({
-                    "token": row[2],
-                    "doctor_id": doc["id"],
-                    "doctor_name": doc["name"],
-                    "patient_id": row[3],
-                    "patient_name": row[4],
-                    "fee": row[5],
-                    "emergency": row[0] == 1,
-                    "booked_date": row[6] if len(row) > 6 else None,
-                    "appt_date": appt_date,
-                    "appt_time": row[8] if len(row) > 8 else None,
-                })
+                out.append(_public_appointment(doc, row))
         out.sort(key=lambda a: (a["appt_time"] or "99:99",
                                 0 if a["emergency"] else 1,
                                 a["token"]))
@@ -937,8 +1091,55 @@ def schedule_menu(hosp):
     for row in rows:
         when = row["appt_time"] or "no fixed time"
         print(f"  {when} | {row['token']} | {row['patient_name']} "
-              f"(#{row['patient_id']}) | {row['doctor_name']}"
+              f"(#{row['patient_id']}) | {row['doctor_name']} | {row['status']}"
               f"{' [EMERGENCY]' if row['emergency'] else ''}")
+
+
+def appointment_status_menu(hosp, role, user):
+    """Change an appointment's status (Step 6) and show its history.
+
+    Shows the current status and every recorded change (old -> new,
+    who, when), then lets the user pick one of the seven statuses.
+    Doctors may only move their OWN queue's appointments to Checked
+    In, In Progress or Completed — Admin and Receptionist may set any
+    status. The server enforces the same rules (403 otherwise).
+    """
+    doc_id = input("  Doctor ID: ").strip().upper()
+    token = input("  Token (e.g. N-1): ").strip().upper()
+    appt = hosp.get_appointment(doc_id, token)
+    if appt is None:
+        return print("  Appointment not found.")
+    when = appt["appt_date"] or ""
+    if appt["appt_time"]:
+        when += f" {appt['appt_time']}"
+    print(f"  {appt['token']} | {appt['patient_name']} "
+          f"(#{appt['patient_id']}) with {appt['doctor_name']}"
+          f"{' | ' + when if when else ''}"
+          f" | Status: {appt['status']}")
+    history = hosp.appointment_history(doc_id, token)
+    if history:
+        print("  History:")
+        for h in history:
+            old = h["old_status"] or "—"
+            print(f"    {h['changed_at']} | {old} -> {h['new_status']} "
+                  f"by {h['changed_by']}")
+    else:
+        print("  No status changes yet.")
+    print("  Statuses:")
+    for i, status in enumerate(APPOINTMENT_STATUSES, 1):
+        print(f"    {i}. {status}")
+    try:
+        choice = int(input("  New status (number 1-7): ").strip())
+        new_status = APPOINTMENT_STATUSES[choice - 1]
+    except (ValueError, IndexError):
+        return print("  Pick a number 1-7.")
+    try:
+        updated = hosp.update_status(
+            doc_id, token, new_status, changed_by=user["username"],
+            role=role, user_doctor_id=user.get("doctor_id"))
+    except (ValueError, PermissionError) as exc:
+        return print(f"  {exc}")
+    print(f"  Status updated: {token} is now {updated['status']}.")
 
 
 def find_patient_menu(hosp):
@@ -1059,6 +1260,7 @@ MENU = [
     ("17", "Schedule", "view"),   # Step 4: appointments by date
     ("18", "Edit Patient", "edit_patient"),    # Step 5
     ("19", "Delete Patient", "delete_patient"),  # Step 5, Admin only
+    ("20", "Appointment Status", "update_appointment_status"),  # Step 6
 ]
 
 
@@ -1140,6 +1342,8 @@ def main():
             edit_patient_menu(hosp)
         elif choice == "19":
             delete_patient_menu(hosp)
+        elif choice == "20":
+            appointment_status_menu(hosp, role, user)
 
 
 if __name__ == "__main__":

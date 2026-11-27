@@ -36,6 +36,16 @@ when nothing matches); ``POST /api/patients/<id>`` edits name/age/
 problem (Admin + Receptionist); ``DELETE /api/patients/<id>`` deletes
 a patient — Admin only — removing their record, notes and queued
 appointments and freeing their bed, while their bills are kept.
+
+Step 6 (Appointment Statuses + History): every appointment carries a
+status (Pending by default). ``POST /api/appointments/<doctor>/<token>/status``
+changes it (Admin/Receptionist: any status; Doctor: only their own
+queue, only Checked In / In Progress / Completed — otherwise 403);
+``GET /api/appointments/<doctor>/<token>/history`` reads the recorded
+changes (old -> new, who, when). Booking refuses a double booking —
+the same doctor, same date, same time, while the existing appointment
+is still active — with a 400 that says so plainly. Queue items and
+schedule rows now include each appointment's status.
 """
 
 import argparse
@@ -174,8 +184,8 @@ def _serialize_patient(patient: Dict[str, Any]) -> Dict[str, Any]:
 
 def _serialize_doctor(doc: Dict[str, Any]) -> Dict[str, Any]:
     # heap rows: (priority, count, token, pid, name, fee, booked date,
-    # appt_date, appt_time). Sort a copy so the displayed queue is in
-    # real service order (Emergency first).
+    # appt_date, appt_time, status). Sort a copy so the displayed queue
+    # is in real service order (Emergency first).
     rows = sorted(doc["queue"].heap, key=lambda r: (r[0], r[1]))
     return {
         "id": doc["id"],
@@ -193,6 +203,9 @@ def _serialize_doctor(doc: Dict[str, Any]) -> Dict[str, Any]:
                 "booked_date": row[6] if len(row) > 6 else None,
                 "appt_date": row[7] if len(row) > 7 else None,
                 "appt_time": row[8] if len(row) > 8 else None,
+                # Step 6: every appointment carries its status
+                # ("Pending" for rows built before Step 6).
+                "status": row[9] if len(row) > 9 and row[9] else "Pending",
             }
             for row in rows
         ],
@@ -461,6 +474,31 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "ok": True, "date": date,
                     "appointments": hospital.appointments_for_date(
                         date, doctor_id),
+                })
+
+            # ---- Step 6: status history for one appointment
+            # (doctor + token). Every role may read it; a Doctor
+            # linked to one doctor may only read their own queue's.
+            if path.startswith("/api/appointments/") and path.endswith("/history"):
+                parts = path.removeprefix("/api/appointments/").removesuffix("/history").strip("/").split("/")
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                doc_id = parts[0].strip().upper()
+                token = parts[1].strip().upper()
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None and doctor_filter != doc_id:
+                    return self._forbidden(self._user["role"])
+                if doc_id not in hospital.doctors_map:
+                    return self._send_json(
+                        {"ok": False, "error": "Doctor not found."}, 404)
+                appt = hospital.get_appointment(doc_id, token)
+                if appt is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Appointment not found."}, 404)
+                return self._send_json({
+                    "ok": True, "appointment": appt,
+                    "history": hospital.appointment_history(doc_id, token),
                 })
 
             if path == "/api/beds":
@@ -834,6 +872,17 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 if not doc or not pat:
                     return self._send_json(
                         {"ok": False, "error": "Invalid doctor or patient ID."}, 400)
+                # ---- Step 6: no double booking — the same doctor,
+                # same date, same time, while the existing appointment
+                # is still active. The 400 says exactly what is taken.
+                conflict = hospital.find_conflicting_appointment(
+                    doc_id, appt_date, appt_time)
+                if conflict is not None:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": f"Doctor {doc['name']} already has an appointment at "
+                                  f"{appt_date} {appt_time} (token {conflict['token']}, "
+                                  f"{conflict['status']}). Pick another time."}, 400)
                 token = hospital.book_appointment(
                     doc_id, pid, is_emg, appt_date, appt_time)
                 if token is None:
@@ -847,6 +896,42 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "patient": pat["name"], "fee": doc["fee"],
                     "emergency": is_emg,
                     "date": appt_date, "time": appt_time,
+                    "status": "Pending",
+                })
+
+            # ---- Step 6: change an appointment's status.
+            # Admin/Receptionist: any status, any queue. Doctor: only
+            # their own queue, only Checked In / In Progress /
+            # Completed — Hospital.update_status enforces it (403).
+            if path.startswith("/api/appointments/") and path.endswith("/status"):
+                if not can(role, "update_appointment_status"):
+                    return self._forbidden(role)
+                parts = path.removeprefix("/api/appointments/").removesuffix("/status").strip("/").split("/")
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                doc_id = parts[0].strip().upper()
+                token = parts[1].strip().upper()
+                new_status = str(data.get("status", "")).strip()
+                if not new_status:
+                    return self._send_json(
+                        {"ok": False, "error": "Status is required."}, 400)
+                try:
+                    updated = hospital.update_status(
+                        doc_id, token, new_status,
+                        changed_by=self._user["username"], role=role,
+                        user_doctor_id=self._user.get("doctor_id"))
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "message": f"Status updated: {token} is now {updated['status']}.",
+                    "appointment": updated,
+                    "history": hospital.appointment_history(doc_id, token),
                 })
 
             # ---- Beds: assign / free

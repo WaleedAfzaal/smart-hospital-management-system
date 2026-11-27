@@ -213,6 +213,87 @@ doctor also joins the shift rotation.
   update + 400s + 404, role rules for edit and delete, delete removes
   record/notes/appointments/frees bed/keeps bill, delete 404).
 
+## Appointment Statuses + History — Step 6 (`hospital.py` + `status_history.py` + `database.py` + `auth.py` + `server.py` + `web/`)
+
+- **Status** (`hospital.py`): the seven statuses are
+  `APPOINTMENT_STATUSES` = Pending, Confirmed, Checked In, In
+  Progress, Completed, Cancelled, No Show; `DOCTOR_STATUSES` is the
+  three a Doctor may set. The status rides as the **10th field** of
+  the heap row `(priority, seq, token, pid, name, fee, booked_date,
+  appt_date, appt_time, status)`; `_row_status(row)` returns
+  `"Pending"` for 9-field rows (booked before Step 6) or an empty
+  stored value, and `_public_appointment(doc, row)` is the one
+  dict shape the CLI, the API and the schedule views all use, so the
+  status is the same everywhere. `Hospital.update_status(doc_id,
+  token, new_status, changed_by, role, user_doctor_id)` validates the
+  status, the doctor and the token (ValueError), enforces the role
+  rule (PermissionError — Doctor: own queue only, and only the three
+  consultation statuses; Admin/Receptionist: any status on any
+  queue), then changes only the 10th field (priority/seq untouched,
+  so the heap stays valid), records the change and saves at once.
+  Setting the status it already has is a no-op — no history row.
+- **History** (`status_history.py`): a new `StatusHistory` class,
+  following the `billing.py` pattern — its own locked sqlite3
+  connection to the same `hospital.db`, table
+  `appointment_status_history(id, doctor_id, token, old_status,
+  new_status, changed_by, changed_at)` with an index on
+  `(doctor_id, token, changed_at)`, `record()` + `history()` (oldest
+  first), in-memory list fallback when no db path is given. The key
+  is doctor_id + token (stable until a global appointment ID arrives
+  in Step 8 of the appointment module plan). History is append-only
+  audit — never edited or deleted, and kept even when the patient or
+  the appointment is deleted or undone. `Database.save()` never
+  touches it.
+- **Database** (`database.py`): `appointments` gains a `status`
+  column (schema + `_migrate` ALTER TABLE for older files); old rows
+  save/load as Pending (`status_ if status_ else "Pending"` on
+  load). A database built before Step 6 is verified to load this way
+  in the tests (hand-built old table without the column + a NULL
+  status in a new table).
+- **No double booking** (`Hospital.find_conflicting_appointment`):
+  the same doctor, same `appt_date`, same `appt_time`, while the
+  existing appointment is ACTIVE (anything except Cancelled / No
+  Show — Completed still blocks its slot). Untimed appointments
+  never collide. `book_appointment` checks first and refuses with a
+  plain message naming the token in the way; the API returns the
+  same as a 400.
+- **Permissions** (`auth.py`): `update_appointment_status` is
+  Admin + Doctor + Receptionist in PERMISSIONS (every role may open
+  the action); the fine rule lives in `Hospital.update_status` and
+  the server returns 403 on PermissionError.
+- **API:** `POST /api/appointments/<doctor>/<token>/status`
+  (`{status}` — 400 on a bad status/missing token, 403 on the role
+  rule; returns the updated appointment + its full history) and
+  `GET /api/appointments/<doctor>/<token>/history` (404 on a missing
+  doctor/token; a linked Doctor may only read their own queue's).
+  The booking route checks the guard before booking (400). Queue
+  items in `_serialize_doctor` and rows in
+  `appointments_for_date` now include `status`.
+- **CLI:** menu **20. Appointment Status**
+  (`appointment_status_menu`) — shows the current status and the
+  full history, then lets the user pick 1–7; the same role rules
+  apply. Doctor queues and the Schedule view print the status too.
+- **Web:** queue tokens carry a coloured status badge (7 CSS
+  classes in `styles.css`); each doctor card has an Appointment
+  dropdown + New status dropdown (Doctors only get their three) +
+  Update Status and History buttons; the Schedule table has a Status
+  column; the booking result card says "Status: Pending".
+- Tests: `tests/test_appointment_status.py` (default Pending,
+  transitions + history with user + timestamp, full journey, no-op,
+  bad status/token, heap order unchanged, schedule view, old-table
+  and NULL-status migration, double-booking rejection vs allowed
+  cases — different doctor/time/date, Cancelled/No Show freeing the
+  slot, Completed still blocking, untimed never colliding — role
+  enforcement incl. unlinked Doctor, history persistence across
+  restart and across patient delete) and
+  `tests/test_appointment_status.py::TestStatusServer` (status +
+  history endpoints, Doctor 403 on Cancel, Doctor check-in allowed,
+  Receptionist any status, double-booking 400, state + schedule
+  include status). One older test changed: `test_appointments.py`
+  `test_same_time_emergency_first` books its second 09:00 on D2
+  instead of D1, because the guard now refuses it on D1 (the test's
+  point — same time, Emergency first — is unchanged).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -253,6 +334,10 @@ doctor also joins the shift rotation.
 note / booking / bed), pharmacy FIFO, shift rotation. Step 5 adds
 `tests/test_patients.py` (name search, edit, delete + delete rule)
 and `tests/test_server.py::TestServerPatients` (the same over HTTP).
+Step 6 adds `tests/test_appointment_status.py` (default Pending,
+transitions + history, old-row migration, double-booking guard,
+role enforcement, history persistence, plus
+`TestStatusServer` over HTTP).
 Run with:
 
 ```bash

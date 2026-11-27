@@ -11,6 +11,7 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Doctor Directory**: Starts empty — add your own doctors with specialty and token fee. View doctors or add a new one.
 - **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…).
 - **Appointment Date & Time**: Every appointment is scheduled for a date (`YYYY-MM-DD`, empty = today) and a time (`HH:MM`, 24-hour, empty = no fixed time). The **Schedule** view lists a day's appointments — for one doctor or all — sorted by time, then Emergency-first. The queue order itself never changes: date/time is for scheduling and display only.
+- **Appointment Statuses**: Every appointment has a status — Pending, Confirmed, Checked In, In Progress, Completed, Cancelled or No Show. New appointments start Pending; every change is recorded with who made it and when, and the history survives a restart. Booking refuses a double booking: the same doctor cannot have two active appointments at the same date and time. Admin and Receptionist can set any status; a Doctor can only move their own queue's appointments to Checked In, In Progress or Completed.
 - **Beds**: 10 beds — assign a patient to a free bed or free an occupied one.
 - **Undo**: One-click undo for the last action (add patient, add note, book appointment, bed assign/free), powered by an undo stack.
 - **Pharmacy Queue**: FIFO token queue — add a token, serve the next one, or view the line.
@@ -138,6 +139,37 @@ confirmation dialog.
 - **Dashboard:** the **Find Patient** tile has a *Search by Name* form
   (results as a list of patient cards), and every patient card has
   **Edit** (Admin/Receptionist) and **Delete** (Admin only) buttons.
+
+## Appointment Statuses
+
+Every appointment has a status — **Pending, Confirmed, Checked In, In
+Progress, Completed, Cancelled** or **No Show**. A new appointment
+starts **Pending**; appointments booked before this feature was added
+also show as Pending. Every status change is recorded — the old status,
+the new status, who changed it and when — and the history is kept even
+if the patient or the appointment is later deleted. The queue order
+never changes when a status changes: Emergency is still served first.
+
+**Who can change what:** Admin and Receptionist can set any status on
+any doctor's queue. A Doctor can only change appointments in their own
+queue, and only to **Checked In**, **In Progress** or **Completed** —
+they cannot cancel or confirm an appointment.
+
+**No double booking:** booking refuses a new appointment when the same
+doctor already has an active appointment at the same date and time, and
+says plainly which token is in the way. A Cancelled or No Show
+appointment no longer blocks its slot, so a new booking can take it.
+Appointments with no fixed time never collide with anything.
+
+- **CLI:** menu option **20. Appointment Status** — type the doctor ID
+  and token, see the current status and the full history, then pick the
+  new status (1–7). Doctor queues and the Schedule view (menu 17) also
+  show each appointment's status.
+- **Dashboard:** every doctor card shows each token's status as a
+  coloured badge, with a dropdown to change it and a **History** button
+  that shows every recorded change. The Schedule table has a Status
+  column too. Doctors only get the three statuses they are allowed to
+  set in the dropdown.
 
 ## Quick Start
 

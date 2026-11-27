@@ -69,10 +69,12 @@ their own with the Add Doctor form (CLI menu or web dashboard).
 
 | Method | Path | Body | Description |
 | ------ | ---- | ---- | ----------- |
-| POST | `/api/appointments` | `{doctor_id, patient_id, emergency, date?, time?}` | Book a token. Emergency → `E-n`, Normal → `N-n` (n = that doctor's queue count). PriorityQueue (binary heap) serves Emergency first. `date` is `YYYY-MM-DD` (empty = today), `time` is `HH:MM` 24-hour (empty = no fixed time); bad values get a 400 with a plain message. Returns the token + fee + scheduled date/time |
+| POST | `/api/appointments` | `{doctor_id, patient_id, emergency, date?, time?}` | Book a token. Emergency → `E-n`, Normal → `N-n` (n = that doctor's queue count). PriorityQueue (binary heap) serves Emergency first. `date` is `YYYY-MM-DD` (empty = today), `time` is `HH:MM` 24-hour (empty = no fixed time); bad values get a 400 with a plain message. Returns the token + fee + scheduled date/time. **Step 6:** a double booking — same doctor, same date, same time, while the existing appointment is still active — gets a 400 that says which token is in the way. New appointments start Pending |
 | GET | `/api/appointments?date=YYYY-MM-DD&doctor_id=D1` | — | Appointments scheduled for that date (today by default), sorted by time then Emergency-first. `doctor_id` is optional; a Doctor user linked to one doctor only ever sees that doctor's appointments |
+| POST | `/api/appointments/<doctor>/<token>/status` | `{status}` | Step 6: change an appointment's status (one of the seven). Admin/Receptionist: any status, any queue. Doctor: only their own queue, only Checked In / In Progress / Completed — otherwise 403. Bad status or missing token gets a 400. Returns the updated appointment + its full history |
+| GET | `/api/appointments/<doctor>/<token>/history` | — | Step 6: the recorded status changes for one appointment, oldest first — old status, new status, who changed it, when. A Doctor linked to one doctor may only read their own queue's. Missing doctor/token gets a 404 |
 
-Each queue item in `GET /api/doctors` and `/api/state` now also carries `booked_date` (when the token was issued), `appt_date` and `appt_time` (when the patient should come — `null` for appointments booked before Step 4).
+Each queue item in `GET /api/doctors` and `/api/state` now also carries `booked_date` (when the token was issued), `appt_date` and `appt_time` (when the patient should come — `null` for appointments booked before Step 4) and `status` (Step 6 — `Pending` for appointments booked before Step 6).
 
 ## Beds (op 7)
 

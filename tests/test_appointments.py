@@ -142,11 +142,16 @@ class TestScheduleViews(unittest.TestCase):
         self.assertTrue(rows[0]["emergency"])
 
     def test_same_time_emergency_first(self):
-        self.h.book_appointment("D1", 101, False, _today(), "09:00")
+        # Step 6: the no-double-booking guard refuses a second
+        # appointment for the SAME doctor at the same date/time, so
+        # the second 09:00 booking here goes to a DIFFERENT doctor —
+        # the test's point (same time -> Emergency first in the
+        # schedule sort) is unchanged.
+        self.h.book_appointment("D2", 101, False, _today(), "09:00")
         rows = self.h.appointments_for_date(_today())
         times = [a["appt_time"] for a in rows]
         self.assertEqual(times, ["09:00", "09:00", "11:00"])
-        self.assertTrue(rows[0]["emergency"])  # E-2 before N-3 at 09:00
+        self.assertTrue(rows[0]["emergency"])  # E-2 before N-1 at 09:00
 
     def test_doctor_schedule_filters_by_doctor(self):
         d1 = self.h.doctor_schedule("D1", _today())

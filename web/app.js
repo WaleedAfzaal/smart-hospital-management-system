@@ -39,6 +39,23 @@ function canUse(op) {
   return (OP_PERMS[op] || []).includes(currentUser.role);
 }
 
+/* Step 6 (Appointment Statuses): the seven statuses. A Doctor may
+   only set Checked In / In Progress / Completed — the server enforces
+   it, this only offers the right options in the dropdown. */
+const APPOINTMENT_STATUSES = ["Pending", "Confirmed", "Checked In",
+  "In Progress", "Completed", "Cancelled", "No Show"];
+const DOCTOR_STATUSES = ["Checked In", "In Progress", "Completed"];
+function statusOptions() {
+  return (currentUser && currentUser.role === "Doctor")
+    ? DOCTOR_STATUSES : APPOINTMENT_STATUSES;
+}
+function statusTagClass(status) {
+  return {"Pending": "tag-pending", "Confirmed": "tag-confirmed",
+    "Checked In": "tag-checkin", "In Progress": "tag-progress",
+    "Completed": "tag-done", "Cancelled": "tag-cancel",
+    "No Show": "tag-noshow"}[status] || "tag-nor";
+}
+
 function applyRoleVisibility() {
   /* Hide tiles the logged-in role cannot use. */
   document.querySelectorAll(".tile[data-op]").forEach((t) => {
@@ -460,11 +477,29 @@ function renderDoctors(msg = "", ok = true) {
         <h3>${esc(d.name)} <span class="muted">${esc(d.id)} • ${esc(d.spec || "—")} • Fee Rs ${d.fee ?? "—"}</span></h3>
         <p>Waiting: <b>${d.waiting ?? 0}</b> ${d.queue.length
           ? "— " + d.queue.map((q) => {
-              /* Step 4: show when the appointment is scheduled for. */
+              /* Step 4: show when the appointment is scheduled for.
+                 Step 6: show its status as a coloured badge. */
               const when = [q.appt_date, q.appt_time].filter(Boolean).join(" ");
-              return `<span class="tag ${q.emergency ? "tag-emg" : "tag-nor"}">${esc(q.token)} · ${esc(q.patient_name)}${when ? " · " + esc(when) : ""}</span>`;
+              const st = q.status || "Pending";
+              return `<span class="tag ${q.emergency ? "tag-emg" : "tag-nor"}">${esc(q.token)} · ${esc(q.patient_name)}${when ? " · " + esc(when) : ""}</span> <span class="tag ${statusTagClass(st)}">${esc(st)}</span>`;
             }).join(" ")
           : `<span class="muted">queue empty</span>`}</p>
+        ${d.queue.length ? `
+        <div class="field-row" style="margin-top:10px">
+          <div class="field"><label>Appointment</label>
+            <select id="st-token-${esc(d.id)}">
+              ${d.queue.map((q) => `<option value="${esc(q.token)}">${esc(q.token)} · ${esc(q.patient_name)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>New status</label>
+            <select id="st-status-${esc(d.id)}">
+              ${statusOptions().map((s) => `<option>${s}</option>`).join("")}
+            </select></div>
+          <div class="btn-row" style="align-items:flex-end">
+            <button type="button" class="btn btn-primary" data-doc="${esc(d.id)}" data-act="set-status">Update Status</button>
+            <button type="button" class="btn btn-ghost" data-doc="${esc(d.id)}" data-act="show-history">History</button>
+          </div>
+        </div>
+        <div id="st-history-${esc(d.id)}" style="margin-top:8px"></div>` : ""}
       </div>`).join("") || `<p class="muted">No doctors yet.</p>`}
     ${currentUser && currentUser.role === "Admin" ? `
     <h3 style="margin:16px 0 8px">Add Doctor</h3>
@@ -480,6 +515,42 @@ function renderDoctors(msg = "", ok = true) {
       <div class="btn-row"><button type="submit" class="btn btn-primary">Add Doctor +</button></div>
     </form>` : `<p class="muted">Only Admin can add a doctor.</p>`}`;
   const docForm = document.getElementById("f-doc");
+  /* Step 6: status controls on each doctor card — change a status or
+     read its history. The server enforces the role rules; a failed
+     change just shows the server's message. */
+  document.querySelectorAll('[data-act="set-status"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const docId = btn.dataset.doc;
+      const token = document.getElementById(`st-token-${docId}`).value;
+      const status = document.getElementById(`st-status-${docId}`).value;
+      const res = await api(`/api/appointments/${docId}/${token}/status`, "POST", { status });
+      await loadState();
+      if (res.ok) {
+        toast(res.message);
+        renderDoctors(res.message, true);
+      } else {
+        const msg = errOf(res);
+        toast(msg, true);
+        renderDoctors(msg, false);
+      }
+    });
+  });
+  document.querySelectorAll('[data-act="show-history"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const docId = btn.dataset.doc;
+      const token = document.getElementById(`st-token-${docId}`).value;
+      const box = document.getElementById(`st-history-${docId}`);
+      const res = await api(`/api/appointments/${docId}/${token}/history`);
+      if (!res.ok) {
+        box.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+        return;
+      }
+      const rows = res.history || [];
+      box.innerHTML = rows.length
+        ? `<div class="card"><h3>History — ${esc(token)}</h3>${rows.map((h) => `<p>${esc(h.changed_at)} | ${esc(h.old_status || "—")} → ${esc(h.new_status)} by ${esc(h.changed_by)}</p>`).join("")}</div>`
+        : `<p class="muted">No status changes yet for ${esc(token)}.</p>`;
+    });
+  });
   if (!docForm) return;
   docForm.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -568,7 +639,7 @@ function renderBook(msg = "", ok = true) {
       document.getElementById("book-result").innerHTML = `
         <div class="card"><h3>Token ${esc(res.token)} ${res.emergency ? '<span class="tag tag-emg">EMERGENCY</span>' : '<span class="tag tag-nor">NORMAL</span>'}</h3>
         <p>${esc(res.patient)} with ${esc(res.doctor)} — Fee Rs ${res.fee}</p>
-        <p>${esc(res.date)}${res.time ? " at " + esc(res.time) : ""}</p></div>`;
+        <p>${esc(res.date)}${res.time ? " at " + esc(res.time) : ""} · Status: Pending</p></div>`;
     } else {
       const msg = errOf(res);
       toast(msg, true);
@@ -1006,12 +1077,12 @@ async function renderSchedule(date, doctorId) {
     </div>
     <h3 style="margin:6px 0 8px">Schedule — ${esc(res.date)} (${rows.length} appointment${rows.length === 1 ? "" : "s"})</h3>
     ${rows.length ? `<table class="tbl"><thead><tr>
-        <th>Time</th><th>Token</th><th>Patient</th><th>Doctor</th><th>Fee</th>
+        <th>Time</th><th>Token</th><th>Patient</th><th>Doctor</th><th>Status</th><th>Fee</th>
       </tr></thead><tbody>
       ${rows.map((a) => `<tr><td>${a.appt_time ? esc(a.appt_time) : "—"}</td>
         <td>${esc(a.token)} ${a.emergency ? '<span class="tag tag-emg">EMERGENCY</span>' : ""}</td>
         <td>${esc(a.patient_name)} (#${a.patient_id})</td>
-        <td>${esc(a.doctor_name)}</td><td>Rs ${a.fee}</td></tr>`).join("")}
+        <td>${esc(a.doctor_name)}</td><td><span class="tag ${statusTagClass(a.status || "Pending")}">${esc(a.status || "Pending")}</span></td><td>Rs ${a.fee}</td></tr>`).join("")}
     </tbody></table>`
       : `<p class="muted">No appointments on this date.</p>`}`;
   document.getElementById("sch-load").addEventListener("click", () => {

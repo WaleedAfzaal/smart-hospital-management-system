@@ -66,6 +66,12 @@ PERMISSIONS = {
     # Admin only (with a confirmation step in the CLI / dashboard).
     "edit_patient": {"Admin", "Receptionist"},
     "delete_patient": {"Admin"},
+    # Step 6 (Appointment statuses): every role may open the status
+    # action, but the fine rule lives in Hospital.update_status —
+    # a Doctor may only move their OWN queue's appointments to
+    # Checked In, In Progress or Completed; Admin and Receptionist
+    # may set any status on any queue.
+    "update_appointment_status": {"Admin", "Doctor", "Receptionist"},
 }
 
 _USERS_SCHEMA = """

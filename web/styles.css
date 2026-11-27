@@ -203,6 +203,14 @@ button { font-family: inherit; cursor: pointer; }
 }
 .tag-emg { background: #fee2e2; color: #991b1b; border: 1.5px solid #dc2626; }
 .tag-nor { background: #dbeafe; color: #0b3d91; border: 1.5px solid #2f7de1; }
+/* Step 6: appointment status badges. */
+.tag-pending { background: #f1f5f9; color: #475569; border: 1.5px solid #94a3b8; }
+.tag-confirmed { background: #dbeafe; color: #0b3d91; border: 1.5px solid #2f7de1; }
+.tag-checkin { background: #fef3c7; color: #92400e; border: 1.5px solid #d97706; }
+.tag-progress { background: #ede9fe; color: #5b21b6; border: 1.5px solid #7c3aed; }
+.tag-done { background: #dcfce7; color: #166534; border: 1.5px solid #16a34a; }
+.tag-cancel { background: #fee2e2; color: #991b1b; border: 1.5px solid #dc2626; }
+.tag-noshow { background: #f3f4f6; color: #6b7280; border: 1.5px solid #9ca3af; }
 .tag-free { background: #dcfce7; color: #166534; border: 1.5px solid #22c55e; }
 .tag-occ { background: #dbeafe; color: #0b3d91; border: 1.5px solid #2f7de1; }
 .tag-duty { background: #fef9c3; color: #854d0e; border: 1.5px solid #eab308; }
