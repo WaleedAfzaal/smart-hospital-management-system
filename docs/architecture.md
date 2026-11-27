@@ -81,6 +81,50 @@ They also seed the shift rotation.
   `tests/test_server.py::TestServerAuth` (401 without login, 403 per
   role, doctor queue filtering, logout).
 
+## Billing + Reports — Step 3 (`billing.py` + `hospital.py`)
+
+- `billing.py` — `Billing` class (stdlib `sqlite3` + `csv` only). Two
+  tables in the same `hospital.db` file, managed only here (like the
+  users table): `bills` (`id`, `patient_id`, `patient_name`,
+  `doctor_id`, `doctor_name`, `token`, `date`, `status`) and
+  `bill_items` (`bill_id`, `position`, `label`, `amount`). With no
+  database path the store is purely in-memory (used by the tests).
+- **Billing flow:** a bill is created from a booked appointment
+  (`Hospital.create_bill(patient_id, doctor_id, token)`) — the first
+  line item is always that appointment's consultation fee. Extra
+  charges (medicine, bed charges, lab...) are added with
+  `add_charge(bill_id, label, amount)`. A token can be billed only
+  once. Amounts are whole rupees (integers); a bill's total is always
+  the SUM of its line items, never a stored number. No tax or discount
+  logic. Status is `Unpaid` or `Paid` (`mark_paid` / `mark_unpaid`).
+- **Dates for reports:** patients remember their registration date
+  (`registered`) and appointments their booking date (7th field of the
+  heap row) — both stored in `hospital.db`. Databases made before Step
+  3 are migrated on connect (`ALTER TABLE ... ADD COLUMN`); old rows
+  get NULL ("date unknown") and are never counted for any day.
+- **Reports** (`Hospital.daily_report(date)`, today by default) are
+  computed from live data: patients registered that day, appointments
+  booked that day, money billed / collected that day, per-doctor
+  appointments (that day + waiting now), bed occupancy, unpaid bills
+  (count + total owed, all time). CSV export (`Billing.to_csv()`) is
+  one header row + one row per bill, items as `label: Rs amount`.
+- **Permissions** (see `PERMISSIONS` in `auth.py`): Admin and
+  Receptionist create and change bills; every role may view bills and
+  reports (Doctor read-only). Enforced in the CLI menu and on every
+  API route (401 without login, 403 for a disallowed role).
+- **CLI:** menu **15. Billing** (create bill, add charge, view/list
+  bills, mark paid/unpaid, export `bills.csv`) and **16. Reports**
+  (daily report for today or any date you type).
+- **Web:** **Billing** tile (create-bill form, bills table, bill
+  detail with items + add-charge + pay/unpay, Download CSV link) and
+  **Reports** tile (date picker + stat cards + per-doctor table). The
+  dashboard also shows Billed Today / Collected Today cards.
+- Tests: `tests/test_billing.py` (bill creation, duplicate-token guard,
+  charges, totals, paid/unpaid, report numbers, CSV contents,
+  restart persistence, old-database migration) and
+  `tests/test_server.py::TestServerBilling` (API flow, 401/403 per
+  role, reports, CSV download, dashboard money stats).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -98,7 +142,7 @@ They also seed the shift rotation.
 ## Frontend (`web/`)
 
 - `index.html` — single page: header (logo + Undo + dark-mode toggle),
-  live stat strip (Patients / Doctors / Waiting / Free Beds), all 11
+  live stat strip (Patients / Doctors / Waiting / Free Beds), all 14
   operations as tiles grouped in sections (Patients / Doctors &
   Appointments / Hospital), and a central workspace panel where the
   clicked operation opens its form. No separate pages.

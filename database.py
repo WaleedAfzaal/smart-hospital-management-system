@@ -26,6 +26,12 @@ Design notes
   numbers keep counting up after a restart (no duplicate E-1/N-1).
 * Shift rotation is stored in duty order (front of the circular queue
   first) and rebuilt by enqueueing in that order.
+* Step 3 (Billing + Reports): patients carry a ``registered`` date and
+  appointments a booking ``date`` (see hospital.py), so the daily
+  report can count "today". Older database files that lack these
+  columns are migrated on connect (``ALTER TABLE ... ADD COLUMN``) —
+  old rows just get NULL, i.e. "date unknown", and are never counted
+  for any day.
 """
 
 import os
@@ -44,7 +50,8 @@ CREATE TABLE IF NOT EXISTS patients(
     age INTEGER NOT NULL,
     problem TEXT NOT NULL,
     visits INTEGER NOT NULL DEFAULT 0,
-    position INTEGER NOT NULL
+    position INTEGER NOT NULL,
+    registered TEXT
 );
 CREATE TABLE IF NOT EXISTS patient_notes(
     patient_id INTEGER NOT NULL,
@@ -68,7 +75,8 @@ CREATE TABLE IF NOT EXISTS appointments(
     token TEXT NOT NULL,
     patient_id INTEGER NOT NULL,
     patient_name TEXT NOT NULL,
-    fee INTEGER NOT NULL
+    fee INTEGER NOT NULL,
+    date TEXT
 );
 CREATE TABLE IF NOT EXISTS beds(
     bed_no INTEGER PRIMARY KEY,
@@ -121,7 +129,26 @@ class Database:
         conn = sqlite3.connect(self.path)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA)
+        self._migrate(conn)
         return conn
+
+    @staticmethod
+    def _migrate(conn):
+        """Add Step 3 columns to databases created before Step 3.
+
+        ``CREATE TABLE IF NOT EXISTS`` never touches an existing table,
+        so an older hospital.db would otherwise miss ``registered`` /
+        ``date`` and the INSERTs below would fail. Old rows keep NULL
+        (date unknown) — the daily report simply never counts them.
+        """
+        for table, column in (("patients", "registered"),
+                             ("appointments", "date")):
+            cols = [row[1] for row in conn.execute(
+                f"PRAGMA table_info({table})")]
+            if column not in cols:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        conn.commit()
 
     # ------------------------------------------------------------ save
     def save(self, hospital):
@@ -137,10 +164,10 @@ class Database:
 
             for pos, pat in enumerate(hospital.patients_list):
                 conn.execute(
-                    "INSERT INTO patients(id, name, age, problem, visits, position)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO patients(id, name, age, problem, visits,"
+                    " position, registered) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (pat["id"], pat["name"], pat["age"], pat["problem"],
-                     pat["visits"], pos),
+                     pat["visits"], pos, pat.get("registered")),
                 )
                 for npos, note in enumerate(_notes_of(pat)):
                     conn.execute(
@@ -157,13 +184,14 @@ class Database:
                      doc["queue"].count),
                 )
                 for hpos, row in enumerate(doc["queue"].heap):
-                    # heap row: (priority, count, token, pid, name, fee)
+                    # heap row: (priority, count, token, pid, name, fee, date)
+                    # Rows built before Step 3 have no 7th field.
                     conn.execute(
                         "INSERT INTO appointments(doctor_id, heap_pos, priority,"
-                        " seq, token, patient_id, patient_name, fee)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        " seq, token, patient_id, patient_name, fee, date)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (doc["id"], hpos, row[0], row[1], row[2], row[3],
-                         row[4], row[5]),
+                         row[4], row[5], row[6] if len(row) > 6 else None),
                     )
 
             for i, pid in enumerate(hospital.beds):
@@ -214,8 +242,8 @@ class Database:
 
             # ---- patients (+ notes), in original insertion order
             hospital.patients_map, hospital.patients_list = {}, []
-            for pid, name, age, problem, visits in conn.execute(
-                "SELECT id, name, age, problem, visits FROM patients"
+            for pid, name, age, problem, visits, registered in conn.execute(
+                "SELECT id, name, age, problem, visits, registered FROM patients"
                 " ORDER BY position"
             ):
                 notes = LinkedList()
@@ -226,7 +254,8 @@ class Database:
                 ):
                     notes.add_last(note)
                 pat = {"id": pid, "name": name, "age": age,
-                       "problem": problem, "visits": visits, "notes": notes}
+                       "problem": problem, "visits": visits, "notes": notes,
+                       "registered": registered}
                 hospital.patients_map[pid] = pat
                 hospital.patients_list.append(pat)
 
@@ -238,9 +267,9 @@ class Database:
                 queue = PriorityQueue()
                 queue.count = count
                 queue.heap = [
-                    (priority, seq, token, pat_id, pat_name, fee_)
-                    for priority, seq, token, pat_id, pat_name, fee_ in conn.execute(
-                        "SELECT priority, seq, token, patient_id, patient_name, fee"
+                    (priority, seq, token, pat_id, pat_name, fee_, date_)
+                    for priority, seq, token, pat_id, pat_name, fee_, date_ in conn.execute(
+                        "SELECT priority, seq, token, patient_id, patient_name, fee, date"
                         " FROM appointments WHERE doctor_id = ? ORDER BY heap_pos",
                         (doc_id,),
                     )

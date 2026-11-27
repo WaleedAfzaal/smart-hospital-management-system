@@ -17,9 +17,16 @@ hashed — see auth.py). Roles: Admin (everything), Doctor (patients +
 own appointments + notes), Receptionist (patients, bookings, beds,
 pharmacy). The dashboard page itself ("/" and "/index.html") shows
 the login page until you log in.
+
+Step 3 (Billing + Reports): bills are created from booked appointments
+(consultation fee first, then extra charges), and the daily report
+counts patients/appointments/money for a date. Admin and Receptionist
+make and change bills; Doctors can view bills and reports (read-only).
+Bills export as CSV from ``GET /api/bills/export``.
 """
 
 import argparse
+import datetime
 import json
 import os
 import secrets
@@ -166,12 +173,18 @@ def _shifts() -> List[str]:
 def _dashboard() -> Dict[str, Any]:
     free_beds = sum(1 for b in hospital.beds if b == 0)
     waiting = sum(len(doc["queue"].heap) for doc in hospital.doctors_map.values())
+    # Step 3: today's money at a glance (bills dated today).
+    today = datetime.date.today().isoformat()
+    money = hospital.billing.summary_for_date(today)
     return {
         "patients": len(hospital.patients_map),
         "doctors": len(hospital.doctors_map),
         "waiting": waiting,
         "free_beds": free_beds,
         "total_beds": hospital.NUM_BEDS,
+        "billed_today": money["billed"],
+        "collected_today": money["collected"],
+        "unpaid_total": hospital.billing.unpaid_total(),
     }
 
 
@@ -239,6 +252,20 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         for name, value in (extra_headers or []):
             self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, content_type: str,
+                   filename: Optional[str] = None) -> None:
+        """Plain-text response (used for the CSV export)."""
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(body)
 
@@ -363,6 +390,58 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     return self._forbidden(self._user["role"])
                 return self._send_json(
                     {"ok": True, "users": auth_store.list_users()})
+
+            # ---- Step 3: Billing + Reports (read-only for every role)
+            if path == "/api/bills":
+                pid = None
+                if query.get("patient_id"):
+                    pid = _parse_int(query.get("patient_id")[0])
+                    if pid is None:
+                        return self._send_json(
+                            {"ok": False,
+                             "error": "Patient ID must be a number."}, 400)
+                status = query.get("status", [None])[0]
+                if status not in (None, "Paid", "Unpaid"):
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "Status must be Paid or Unpaid."}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "bills": hospital.billing.list_bills(
+                        patient_id=pid, status=status),
+                })
+
+            if path == "/api/bills/export":
+                # CSV download — a plain link, the browser sends the
+                # session cookie with it, so it stays behind the login.
+                return self._send_text(
+                    hospital.billing.to_csv(),
+                    "text/csv; charset=utf-8", "bills.csv")
+
+            if path.startswith("/api/bills/"):
+                raw = path.removeprefix("/api/bills/").strip("/")
+                try:
+                    bill_id = int(raw)
+                except ValueError:
+                    return self._send_json(
+                        {"ok": False, "error": "Bill ID must be a number."}, 400)
+                bill = hospital.billing.get_bill(bill_id)
+                if bill is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Bill not found."}, 404)
+                return self._send_json({"ok": True, "bill": bill})
+
+            if path == "/api/reports":
+                date = query.get("date", [None])[0] or \
+                    datetime.date.today().isoformat()
+                try:
+                    datetime.date.fromisoformat(date)
+                except ValueError:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "Date must look like 2026-11-27."}, 400)
+                return self._send_json(
+                    {"ok": True, "report": hospital.daily_report(date)})
 
             # Unknown API route: answer JSON, never an HTML 404 page —
             # the frontend's res.json() would throw on HTML and the
@@ -683,6 +762,84 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                         {"ok": False, "error": "No shifts to rotate."}, 400)
                 return self._send_json(
                     {"ok": True, "message": f"Now on duty: {now}", "on_duty": now})
+
+            # ---- Step 3: Billing (create/change: Admin + Receptionist;
+            # reading is open to every role — see _api_get above)
+            if path == "/api/bills":
+                if not can(role, "create_bill"):
+                    return self._forbidden(role)
+                doc_id = str(data.get("doctor_id", "")).strip().upper()
+                token = str(data.get("token", "")).strip().upper()
+                pid = _parse_int(data.get("patient_id"))
+                if pid is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Patient ID must be a number."}, 400)
+                if not doc_id or not token:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "Doctor ID and Token are required."}, 400)
+                try:
+                    bill = hospital.create_bill(pid, doc_id, token)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "message": f"Bill #{bill['id']} created — Rs {bill['total']}.",
+                    "bill": bill,
+                })
+
+            if path.startswith("/api/bills/") and path.endswith("/charges"):
+                if not can(role, "manage_bills"):
+                    return self._forbidden(role)
+                raw = path.removeprefix("/api/bills/").removesuffix("/charges").strip("/")
+                try:
+                    bill_id = int(raw)
+                except ValueError:
+                    return self._send_json(
+                        {"ok": False, "error": "Bill ID must be a number."}, 400)
+                label = str(data.get("label", "")).strip()
+                amount = _parse_int(data.get("amount"))
+                if not label:
+                    return self._send_json(
+                        {"ok": False, "error": "Charge label is required."}, 400)
+                if amount is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Amount must be a number."}, 400)
+                try:
+                    bill = hospital.billing.add_charge(bill_id, label, amount)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "message": f"Charge added. Bill #{bill_id} total is now Rs {bill['total']}.",
+                    "bill": bill,
+                })
+
+            if path.startswith("/api/bills/") and (
+                    path.endswith("/pay") or path.endswith("/unpay")):
+                if not can(role, "manage_bills"):
+                    return self._forbidden(role)
+                raw = path.removeprefix("/api/bills/")
+                raw = raw.removesuffix("/pay").removesuffix("/unpay").strip("/")
+                try:
+                    bill_id = int(raw)
+                except ValueError:
+                    return self._send_json(
+                        {"ok": False, "error": "Bill ID must be a number."}, 400)
+                try:
+                    bill = (hospital.billing.mark_paid(bill_id)
+                            if path.endswith("/pay")
+                            else hospital.billing.mark_unpaid(bill_id))
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "message": f"Bill #{bill_id} is now {bill['status']}.",
+                    "bill": bill,
+                })
 
         return self._send_json(
             {"ok": False, "error": "Unknown endpoint."}, 404)

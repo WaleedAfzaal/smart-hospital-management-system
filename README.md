@@ -17,6 +17,8 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Dashboard**: Live counts — patients, doctors, waiting appointments, free beds.
 - **SQLite Persistence**: All data is saved to `hospital.db` (created automatically) on every change — patients, notes, doctors, appointments, beds, pharmacy queue and shifts all survive a restart. The CLI and the web dashboard share the same database file. Delete `hospital.db` to start fresh.
 - **Login & Roles**: Every user logs in with a username, password and role — Admin, Doctor or Receptionist — and can only do what their role allows (see [Login & Roles](#login--roles) below). Passwords are stored as salted hashes, never as plain text.
+- **Billing**: Create a bill from a booked appointment — the consultation fee is the first line item — then add extra charges (medicine, bed charges, lab...). Mark bills Paid / Unpaid. A token is billed only once, and totals are always the sum of the line items.
+- **Reports**: Daily report — patients registered today, appointments booked today, money billed and collected today, appointments per doctor, bed occupancy, unpaid bills. Export all bills as CSV.
 - **Zero External Dependencies**: Runs on Python 3.9+ using only the standard library.
 
 ## Login & Roles
@@ -42,6 +44,9 @@ Both the CLI (`python hospital.py`) and the web dashboard ask you to log in firs
 | Add doctors | ✅ | ❌ | ❌ |
 | Undo last action | ✅ | ❌ | ❌ |
 | Manage users (add user, reset password) | ✅ | ❌ | ❌ |
+| Create bills & add charges | ✅ | ❌ | ✅ |
+| Mark bills Paid / Unpaid | ✅ | ❌ | ✅ |
+| View bills, reports & CSV export | ✅ | ✅ | ✅ |
 | Change own password | ✅ | ✅ | ✅ |
 
 A Doctor account can be **linked to one doctor** (e.g. `D1`) — then the dashboard and the CLI show only that doctor's appointment queue. A Doctor with no linked doctor sees all queues.
@@ -52,6 +57,31 @@ A Doctor account can be **linked to one doctor** (e.g. `D1`) — then the dashbo
 - **Dashboard:** log in as Admin → **Users** tile → fill in the *Add User* form.
 
 Users are stored in the same `hospital.db` file, so they survive a restart. Sessions last 12 hours; closing the browser tab does not log you out, but restarting the server does (log in again).
+
+## Billing & Reports
+
+**How a bill is made:** book an appointment first (the token is
+issued with the doctor's fee), then create the bill from that token —
+the consultation fee becomes the first line item. Add extra charges
+afterwards: medicine, bed charges, lab tests, anything (label +
+amount in whole rupees). Mark the bill **Paid** when the patient pays.
+A token can be billed only once, and the total is always the sum of
+the line items — no tax, no discount, nothing hidden.
+
+- **CLI:** log in → menu option **15. Billing** (create bill, add
+  charge, view/list bills, mark paid/unpaid, export `bills.csv`) and
+  **16. Reports** (daily report for today or any date you type).
+- **Dashboard:** **Billing** tile (create-bill form, bills table, bill
+  detail with items + add-charge + pay/unpay, Download CSV button)
+  and **Reports** tile (date picker, patients / appointments / billed
+  / collected / unpaid / beds cards, appointments per doctor). The
+  dashboard itself also shows **Billed Today** and **Collected Today**.
+
+The daily report counts patients registered that day, appointments
+booked that day, money billed and collected that day, appointments per
+doctor, bed occupancy, and unpaid bills (count + total owed, all
+time). Only Admin and Receptionist can create or change bills —
+Doctors can view bills and reports (read-only).
 
 ## Quick Start
 
@@ -92,6 +122,7 @@ python hospital.py
 .
 ├── hospital.py               # Hospital class — all data structures & operations
 ├── auth.py                   # Login & roles — password hashing, users table, permissions
+├── billing.py                # Billing & reports data — bills table, totals, CSV export
 ├── database.py               # SQLite persistence — save/load whole state to hospital.db
 ├── hospital.db               # Local database file (auto-created, gitignored, never committed)
 ├── server.py                 # ThreadingHTTPServer, static file serving, and JSON REST API
@@ -107,6 +138,7 @@ python hospital.py
 │   ├── test_hospital.py     # Unit tests for the Hospital class
 │   ├── test_server.py       # End-to-end API tests for the web server
 │   ├── test_auth.py         # Login, password hashing, and role permission tests
+│   ├── test_billing.py      # Billing, reports, CSV export, and persistence tests
 │   └── test_database.py     # Persistence round-trip tests (save → restart → reload)
 ├── CONTRIBUTING.md
 └── LICENSE

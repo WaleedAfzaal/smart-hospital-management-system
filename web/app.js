@@ -24,6 +24,11 @@ const OP_PERMS = {
   "undo": ["Admin"],
   "users": ["Admin"],
   "change-password": ["Admin", "Doctor", "Receptionist"],
+  /* Step 3 (Billing + Reports): every role may open them; creating or
+     changing a bill is Admin/Receptionist only — the server enforces
+     it, the forms below just hide those buttons for Doctors. */
+  "billing": ["Admin", "Doctor", "Receptionist"],
+  "reports": ["Admin", "Doctor", "Receptionist"],
 };
 
 function canUse(op) {
@@ -175,6 +180,8 @@ const OPS = {
   "undo": ["Undo", "Revert the last recorded action"],
   "users": ["Users", "Manage user accounts (Admin)"],
   "change-password": ["Change Password", "Change your own password"],
+  "billing": ["Billing", "Bills from appointments + extra charges"],
+  "reports": ["Reports", "Daily summary — patients, money, beds"],
 };
 
 function openOp(op) {
@@ -202,6 +209,8 @@ function openOp(op) {
     "undo": renderUndo,
     "users": renderUsers,
     "change-password": renderChangePassword,
+    "billing": renderBilling,
+    "reports": renderReports,
   })[op]();
 }
 
@@ -549,6 +558,8 @@ function renderDashboard() {
       <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Doctors</span><span class="stat-num">${s.doctors ?? 0}</span></div></div>
       <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Waiting</span><span class="stat-num">${s.waiting ?? 0}</span></div></div>
       <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Free Beds</span><span class="stat-num">${s.free_beds ?? 0}/${s.total_beds ?? 10}</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Billed Today</span><span class="stat-num">Rs ${s.billed_today ?? 0}</span></div></div>
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Collected Today</span><span class="stat-num">Rs ${s.collected_today ?? 0}</span></div></div>
     </div>
     <h3 style="margin:6px 0 8px">Doctor queues</h3>
     ${docs.map((d) => `<p><b>${esc(d.name)}</b> <span class="muted">(${esc(d.spec || "—")})</span> — waiting <b>${d.waiting ?? 0}</b></p>`).join("") || `<p class="muted">No doctors.</p>`}
@@ -671,6 +682,174 @@ function renderChangePassword(msg = "", ok = true) {
     });
     toast(res.ok ? res.message : errOf(res), !res.ok);
     renderChangePassword(res.ok ? res.message : errOf(res), res.ok);
+  });
+}
+
+/* ------------------------------------------------------------------ billing */
+
+function billRow(b) {
+  return `<tr><td>#${b.id}</td><td>${esc(b.date)}</td>
+    <td>${esc(b.patient_name)} (#${b.patient_id})</td>
+    <td>${esc(b.doctor_name)} ${esc(b.token)}</td>
+    <td>Rs ${b.total}</td>
+    <td>${b.status === "Paid"
+      ? '<span class="tag tag-free">Paid</span>'
+      : '<span class="tag tag-emg">Unpaid</span>'}</td>
+    <td><button type="button" class="btn btn-ghost" data-view-bill="${b.id}"
+      style="padding:6px 12px;font-size:13px">View</button></td></tr>`;
+}
+
+function billDetailHtml(b, canEdit) {
+  return `<div class="card">
+    <h3>Bill #${b.id} <span class="muted">${esc(b.date)} • ${b.status}</span></h3>
+    <p>Patient: <b>${esc(b.patient_name)} (#${b.patient_id})</b> &nbsp;•&nbsp;
+       Doctor: <b>${esc(b.doctor_name)}</b> &nbsp;•&nbsp; Token <b>${esc(b.token)}</b></p>
+    <table class="tbl"><thead><tr><th>Charge</th><th>Amount (Rs)</th></tr></thead><tbody>
+      ${b.items.map((it) => `<tr><td>${esc(it.label)}</td><td>${it.amount}</td></tr>`).join("")}
+      <tr><td><b>Total</b></td><td><b>Rs ${b.total}</b></td></tr>
+    </tbody></table>
+    ${canEdit ? `
+    <form id="f-charge" class="form-grid" style="margin-top:12px">
+      <div class="field-row">
+        <div class="field"><label>Extra charge</label>
+          <input type="text" name="label" placeholder="e.g. Medicine — Paracetamol" required></div>
+        <div class="field"><label>Amount (Rs)</label>
+          <input type="number" name="amount" min="1" placeholder="e.g. 350" required></div>
+      </div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Add Charge +</button></div>
+    </form>
+    <div class="btn-row" style="margin-top:10px">
+      <button type="button" id="btn-pay" class="btn btn-green">Mark Paid</button>
+      <button type="button" id="btn-unpay" class="btn btn-ghost">Mark Unpaid</button>
+    </div>` : `<p class="muted">Doctors can view bills only — only Admin / Receptionist can change them.</p>`}
+  </div>`;
+}
+
+async function renderBilling(msg = "", ok = true) {
+  const canEdit = currentUser && ["Admin", "Receptionist"].includes(currentUser.role);
+  const res = await api("/api/bills");
+  const bills = res.ok ? res.bills : [];
+  const docs = state ? state.doctors : [];
+  body.innerHTML = `
+    ${msgHtml(msg, ok)}
+    ${res.ok ? "" : `<div class="msg msg-err">${esc(errOf(res))}</div>`}
+    ${canEdit ? `
+    <h3 style="margin:0 0 8px">Create Bill from Appointment</h3>
+    <form id="f-bill" class="form-grid">
+      <div class="field-row">
+        <div class="field"><label>Patient ID</label>
+          <input type="number" name="patient_id" min="1" placeholder="e.g. 101" required></div>
+        <div class="field"><label>Doctor</label>
+          <select name="doctor_id" required>
+            ${docs.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — ${esc(d.spec || "—")}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Token</label>
+          <input type="text" name="token" placeholder="e.g. N-1" required></div>
+      </div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Create Bill +</button></div>
+    </form>` : `<p class="muted">Only Admin / Receptionist can create bills — Doctors view them here.</p>`}
+    <h3 style="margin:16px 0 8px">All Bills (${bills.length})</h3>
+    ${bills.length ? `<table class="tbl"><thead><tr>
+        <th>Bill</th><th>Date</th><th>Patient</th><th>Doctor</th><th>Total</th><th>Status</th><th></th>
+      </tr></thead><tbody>${bills.map(billRow).join("")}</tbody></table>`
+      : `<p class="muted">No bills yet. Book an appointment first, then create a bill from its token.</p>`}
+    <div class="btn-row" style="margin-top:12px">
+      <a class="btn btn-ghost" href="/api/bills/export" style="text-decoration:none">Download Bills CSV ↓</a>
+    </div>
+    <div id="bill-detail" style="margin-top:14px"></div>`;
+  const billForm = document.getElementById("f-bill");
+  if (billForm) {
+    billForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const r = await api("/api/bills", "POST", {
+        patient_id: Number(f.get("patient_id")),
+        doctor_id: f.get("doctor_id"), token: f.get("token"),
+      });
+      await loadState();
+      toast(r.ok ? r.message : errOf(r), !r.ok);
+      renderBilling(r.ok ? r.message : errOf(r), r.ok);
+    });
+  }
+  document.querySelectorAll("[data-view-bill]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const r = await api(`/api/bills/${btn.dataset.viewBill}`);
+      const detail = document.getElementById("bill-detail");
+      if (!r.ok) {
+        detail.innerHTML = `<div class="msg msg-err">${esc(errOf(r))}</div>`;
+        return;
+      }
+      detail.innerHTML = billDetailHtml(r.bill, canEdit);
+      const chargeForm = document.getElementById("f-charge");
+      if (chargeForm) {
+        chargeForm.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const f = new FormData(e.target);
+          const r2 = await api(`/api/bills/${r.bill.id}/charges`, "POST", {
+            label: f.get("label"), amount: Number(f.get("amount")),
+          });
+          toast(r2.ok ? r2.message : errOf(r2), !r2.ok);
+          renderBilling(r2.ok ? r2.message : errOf(r2), r2.ok);
+        });
+      }
+      const payBtn = document.getElementById("btn-pay");
+      if (payBtn) {
+        payBtn.addEventListener("click", async () => {
+          const r2 = await api(`/api/bills/${r.bill.id}/pay`, "POST", {});
+          toast(r2.ok ? r2.message : errOf(r2), !r2.ok);
+          renderBilling(r2.ok ? r2.message : errOf(r2), r2.ok);
+        });
+      }
+      const unpayBtn = document.getElementById("btn-unpay");
+      if (unpayBtn) {
+        unpayBtn.addEventListener("click", async () => {
+          const r2 = await api(`/api/bills/${r.bill.id}/unpay`, "POST", {});
+          toast(r2.ok ? r2.message : errOf(r2), !r2.ok);
+          renderBilling(r2.ok ? r2.message : errOf(r2), r2.ok);
+        });
+      }
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ reports */
+
+async function renderReports(date) {
+  const day = date || new Date().toISOString().slice(0, 10);
+  const res = await api(`/api/reports?date=${encodeURIComponent(day)}`);
+  if (!res.ok) {
+    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+    return;
+  }
+  const r = res.report;
+  body.innerHTML = `
+    <div class="field" style="margin-bottom:12px"><label>Date</label>
+      <div class="field-row">
+        <input type="date" id="rep-date" value="${esc(r.date)}" style="flex:1">
+        <button type="button" id="rep-load" class="btn btn-primary">Load Report</button>
+      </div>
+    </div>
+    <h3 style="margin:6px 0 8px">Daily Report — ${esc(r.date)}</h3>
+    <div class="stats" style="grid-template-columns: repeat(2, 1fr); margin-bottom: 14px">
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Patients Today</span><span class="stat-num">${r.patients_today}</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Appointments Today</span><span class="stat-num">${r.appointments_today}</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Billed Today</span><span class="stat-num">Rs ${r.billed_today}</span></div></div>
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Collected Today</span><span class="stat-num">Rs ${r.collected_today}</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Unpaid (All Time)</span><span class="stat-num">Rs ${r.unpaid_total}</span></div></div>
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Beds Occupied</span><span class="stat-num">${r.beds_occupied}/${r.beds_total}</span></div></div>
+    </div>
+    <p class="muted">${r.bills_today} bill(s) on this date — ${r.paid_today} paid, ${r.unpaid_today} unpaid. ${r.unpaid_count} unpaid bill(s) overall.</p>
+    <h3 style="margin:14px 0 8px">Appointments per Doctor</h3>
+    <table class="tbl"><thead><tr>
+        <th>Doctor</th><th>That Day</th><th>Waiting Now</th>
+      </tr></thead><tbody>
+      ${r.per_doctor.map((d) => `<tr><td>${esc(d.name)} (${esc(d.doctor_id)})</td>
+        <td>${d.appointments_today}</td><td>${d.waiting}</td></tr>`).join("")}
+    </tbody></table>`;
+  document.getElementById("rep-load").addEventListener("click", () => {
+    const picked = document.getElementById("rep-date").value;
+    if (!picked) { toast("Pick a date first.", true); return; }
+    renderReports(picked);
   });
 }
 

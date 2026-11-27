@@ -99,10 +99,42 @@ queue and shifts. The 5 starter doctors are `STARTER_DOCTORS` in
 | GET | `/api/shifts` | — | Shift rotation list + who is on duty now |
 | POST | `/api/shifts/rotate` | — | Rotate the circular queue — next doctor on duty |
 
+## Billing (op 15)
+
+Bills are created from a booked appointment — the first line item is
+that appointment's consultation fee; extra charges (medicine, bed,
+lab...) are added afterwards. Amounts are whole rupees; a bill's total
+is always the sum of its line items. A token can be billed only once.
+**Create / change needs Admin or Receptionist; reading is open to
+every role (Doctor read-only).**
+
+| Method | Path | Body | Description |
+| ------ | ---- | ---- | ----------- |
+| GET | `/api/bills` | — | All bills, newest last. Optional `?patient_id=<id>` and `?status=Paid\|Unpaid` filters |
+| GET | `/api/bills/<id>` | — | One bill with its line items + total + status |
+| POST | `/api/bills` | `{patient_id, doctor_id, token}` | Create a bill from a booked appointment. Fails if the token is unknown, belongs to another patient, or was already billed |
+| POST | `/api/bills/<id>/charges` | `{label, amount}` | Add an extra charge (amount must be a whole number above 0) |
+| POST | `/api/bills/<id>/pay` | — | Mark the bill Paid |
+| POST | `/api/bills/<id>/unpay` | — | Mark the bill Unpaid again |
+| GET | `/api/bills/export` | — | Download all bills as CSV (`bills.csv`) — `text/csv`, still needs a login |
+
+## Reports (op 16)
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/reports` | Daily report for today: patients registered, appointments booked, billed / collected, per-doctor appointments, bed occupancy, unpaid bills |
+| GET | `/api/reports?date=YYYY-MM-DD` | Same report for any date |
+
+The dashboard (`GET /api/dashboard` and the stats inside
+`GET /api/state`) also carries `billed_today`, `collected_today` and
+`unpaid_total`.
+
 ## Notes
 
-- `hospital.py` methods print instead of returning. The server decides
-  success from state before/after each call (e.g. `pid in patients_map`,
+- `hospital.py` methods print instead of returning — except
+  `create_bill()` and `daily_report()` (Step 3), which return their
+  results so the server can use them. The server decides success from
+  state before/after each call (e.g. `pid in patients_map`,
   notes count +1) and computes the booking token from the doctor's queue
   count after enqueue. `hospital.py` itself is not modified.
 - There is no Exit operation in the web UI (op 12 in the CLI menu is

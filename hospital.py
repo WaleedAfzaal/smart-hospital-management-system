@@ -5,12 +5,20 @@ Step 1 (SQLite): the Hospital can now be opened with a database file
 loaded back on the next start, so data survives a restart. With no
 ``db_path`` it works exactly as before: fully in memory, nothing written.
 The undo stack is session-only and starts empty after a restart.
+
+Step 3 (Billing + Reports): patients remember the date they registered
+and appointments remember the date they were booked, so the daily
+report can count "today" honestly. Bills live in ``hospital.billing``
+(see billing.py) and are created from a booked appointment — the first
+line item is that appointment's consultation fee.
 """
 
+import datetime
 import getpass
 import os
 
 from auth import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME, AuthStore, can
+from billing import Billing
 from database import Database
 
 # SQLite file used by the CLI and the web server (same file, so both
@@ -162,7 +170,11 @@ class PriorityQueue:
     def enqueue(self, is_emg, pid, name, fee):
         self.count += 1
         token = f"{'E' if is_emg else 'N'}-{self.count}"
-        self.heap.append((1 if is_emg else 2, self.count, token, pid, name, fee))
+        # Step 3: the booking date rides along as the 7th field, so the
+        # daily report can count appointments booked "today". Readers
+        # that only need the first six fields are unaffected.
+        self.heap.append((1 if is_emg else 2, self.count, token, pid, name,
+                          fee, datetime.date.today().isoformat()))
         self._move_up(len(self.heap) - 1)
         return token
 
@@ -223,6 +235,9 @@ class Hospital:
         # one, everything stays in memory as before.
         self.db_path = db_path
         self.db = Database(db_path) if db_path else None
+        # Step 3: bills live in their own store (same file when a db is
+        # given, pure in-memory otherwise — see billing.py).
+        self.billing = Billing(db_path)
         if self.db is not None:
             self.db.load(self)
 
@@ -238,7 +253,10 @@ class Hospital:
     def add_patient(self, pid, name, age, problem, save_undo=True):
         if pid in self.patients_map:
             return print("  ID already exists.")
-        pat = {"id": pid, "name": name, "age": age, "problem": problem, "visits": 0, "notes": LinkedList()}
+        # Step 3: remember the registration date for the daily report.
+        pat = {"id": pid, "name": name, "age": age, "problem": problem,
+               "visits": 0, "notes": LinkedList(),
+               "registered": datetime.date.today().isoformat()}
         self.patients_map[pid] = pat
         self.patients_list.append(pat)
         if save_undo:
@@ -374,6 +392,75 @@ class Hospital:
         waiting = sum(len(doc["queue"].heap) for doc in self.doctors_map.values())
         print(f"  Patients: {len(self.patients_map)} | Doctors: {len(self.doctors_map)} | Waiting: {waiting} | Free Beds: {free_beds}/{self.NUM_BEDS}")
 
+    # ------------------------------------------------ Step 3: billing
+    def create_bill(self, patient_id, doctor_id, token):
+        """Create a bill from a booked appointment. Returns the bill dict.
+
+        The first line item is that appointment's consultation fee. Raises
+        ValueError if the patient/doctor/token is wrong, the token
+        belongs to another patient, or the token was already billed.
+        Unlike the older print-style methods, this one RETURNS its result
+        so the web server can use it too (see the refactor note in
+        ideas.md).
+        """
+        doc = self.doctors_map.get(doctor_id.upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        pat = self.patients_map.get(patient_id)
+        if not pat:
+            raise ValueError("Patient not found.")
+        row = next((r for r in doc["queue"].heap if r[2] == token), None)
+        if row is None:
+            raise ValueError(f"Token {token} not found for {doc['name']}.")
+        if row[3] != patient_id:
+            raise ValueError(f"Token {token} belongs to another patient.")
+        return self.billing.create_bill(
+            patient_id, pat["name"], doc["id"], doc["name"], token, row[5])
+
+    def daily_report(self, date=None):
+        """The daily report for ``date`` (today by default).
+
+        Counts come from live data, not stored numbers: patients whose
+        registration date is that day, appointments booked that day,
+        money billed/collected that day (from bills), per-doctor
+        appointments, bed occupancy, and unpaid bills overall.
+        Appointments booked before Step 3 have no date and are not
+        counted for any day — they still show in the waiting counts.
+        """
+        if date is None:
+            date = datetime.date.today().isoformat()
+        patients_today = sum(
+            1 for p in self.patients_list if p.get("registered") == date)
+        appointments_today = 0
+        per_doctor = []
+        for doc in self.doctors_map.values():
+            today_rows = [r for r in doc["queue"].heap
+                          if len(r) > 6 and r[6] == date]
+            appointments_today += len(today_rows)
+            per_doctor.append({
+                "doctor_id": doc["id"], "name": doc["name"],
+                "appointments_today": len(today_rows),
+                "waiting": len(doc["queue"].heap),
+            })
+        money = self.billing.summary_for_date(date)
+        occupied = sum(1 for b in self.beds if b != 0)
+        return {
+            "date": date,
+            "patients_today": patients_today,
+            "appointments_today": appointments_today,
+            "billed_today": money["billed"],
+            "collected_today": money["collected"],
+            "bills_today": money["bills"],
+            "paid_today": money["paid_count"],
+            "unpaid_today": money["unpaid_count"],
+            "unpaid_total": self.billing.unpaid_total(),
+            "unpaid_count": len(self.billing.list_bills(status="Unpaid")),
+            "beds_occupied": occupied,
+            "beds_total": self.NUM_BEDS,
+            "beds_free": self.NUM_BEDS - occupied,
+            "per_doctor": per_doctor,
+        }
+
 
 def login_prompt(auth):
     """Ask for username/password until they are right.
@@ -433,6 +520,156 @@ def users_menu(auth):
             print("  Invalid choice.")
 
 
+def billing_menu(hosp, role):
+    """Billing (Step 3): create bills from appointments, add charges,
+    view/list bills, mark paid/unpaid, export CSV.
+
+    Creating and changing bills needs Admin/Receptionist; every role may
+    view bills and export the CSV (Doctor read-only).
+    """
+    can_edit = can(role, "manage_bills")
+    while True:
+        print("\n  --- Billing ---")
+        print("  1. Create Bill (from appointment)")
+        if can_edit:
+            print("  2. Add Charge to Bill")
+        print("  3. View Bill")
+        print("  4. List Bills")
+        if can_edit:
+            print("  5. Mark Bill Paid / Unpaid")
+        print("  6. Export Bills to CSV")
+        print("  7. Back")
+        choice = input("  Choice: ").strip()
+        if choice == "1":
+            if not can(role, "create_bill"):
+                print("  Only Admin / Receptionist can create bills.")
+                continue
+            try:
+                pid = int(input("  Patient ID: "))
+            except ValueError:
+                print("  Patient ID must be a number.")
+                continue
+            try:
+                bill = hosp.create_bill(
+                    pid, input("  Doctor ID: ").strip(),
+                    input("  Token (e.g. N-1): ").strip().upper())
+            except ValueError as exc:
+                print(f"  {exc}")
+                continue
+            print(f"  Bill #{bill['id']} created for {bill['patient_name']} — "
+                  f"Total Rs {bill['total']} ({bill['status']}).")
+        elif choice == "2":
+            if not can_edit:
+                print("  Only Admin / Receptionist can add charges.")
+                continue
+            try:
+                bill_id = int(input("  Bill ID: "))
+                amount = int(input("  Amount (Rs): "))
+            except ValueError:
+                print("  Bill ID and Amount must be numbers.")
+                continue
+            try:
+                bill = hosp.billing.add_charge(
+                    bill_id,
+                    input("  Charge (e.g. Medicine — Paracetamol): ").strip(),
+                    amount)
+            except ValueError as exc:
+                print(f"  {exc}")
+                continue
+            print(f"  Charge added. Bill #{bill['id']} total is now Rs {bill['total']}.")
+        elif choice == "3":
+            try:
+                bill = hosp.billing.get_bill(int(input("  Bill ID: ")))
+            except ValueError:
+                print("  Bill ID must be a number.")
+                continue
+            if bill is None:
+                print("  Bill not found.")
+                continue
+            _print_bill(bill)
+        elif choice == "4":
+            pid_raw = input("  Patient ID (empty = all bills): ").strip()
+            try:
+                pid = int(pid_raw) if pid_raw else None
+            except ValueError:
+                print("  Patient ID must be a number.")
+                continue
+            bills = hosp.billing.list_bills(patient_id=pid)
+            if not bills:
+                print("  No bills yet.")
+                continue
+            for bill in bills:
+                print(f"  #{bill['id']} | {bill['date']} | {bill['patient_name']} "
+                      f"(#{bill['patient_id']}) | {bill['doctor_name']} {bill['token']} | "
+                      f"Rs {bill['total']} | {bill['status']}")
+        elif choice == "5":
+            if not can_edit:
+                print("  Only Admin / Receptionist can change bill status.")
+                continue
+            try:
+                bill_id = int(input("  Bill ID: "))
+            except ValueError:
+                print("  Bill ID must be a number.")
+                continue
+            status = input("  Mark (P)aid or (U)npaid: ").strip().upper()
+            try:
+                bill = (hosp.billing.mark_paid(bill_id) if status == "P"
+                        else hosp.billing.mark_unpaid(bill_id) if status == "U"
+                        else None)
+            except ValueError as exc:
+                print(f"  {exc}")
+                continue
+            if bill is None:
+                print("  Type P for Paid or U for Unpaid.")
+                continue
+            print(f"  Bill #{bill['id']} is now {bill['status']}.")
+        elif choice == "6":
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "bills.csv")
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(hosp.billing.to_csv())
+            print(f"  Bills exported to {path}")
+        elif choice == "7":
+            return
+        else:
+            print("  Invalid choice.")
+
+
+def _print_bill(bill):
+    """Print one bill with its line items (CLI view)."""
+    print(f"  Bill #{bill['id']} | {bill['date']} | {bill['status']}")
+    print(f"  Patient: {bill['patient_name']} (#{bill['patient_id']})")
+    print(f"  Doctor: {bill['doctor_name']} | Token {bill['token']}")
+    for item in bill["items"]:
+        print(f"    - {item['label']}: Rs {item['amount']}")
+    print(f"  Total: Rs {bill['total']}")
+
+
+def reports_menu(hosp):
+    """Daily report (Step 3): today by default, or any date you type."""
+    date = input("  Date (YYYY-MM-DD, empty = today): ").strip()
+    if not date:
+        date = datetime.date.today().isoformat()
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        return print("  Date must look like 2026-11-27.")
+    rep = hosp.daily_report(date)
+    print(f"\n  --- Daily Report — {rep['date']} ---")
+    print(f"  Patients registered today: {rep['patients_today']}")
+    print(f"  Appointments booked today: {rep['appointments_today']}")
+    print(f"  Billed today: Rs {rep['billed_today']} ({rep['bills_today']} bills)")
+    print(f"  Collected today: Rs {rep['collected_today']} "
+          f"({rep['paid_today']} paid, {rep['unpaid_today']} unpaid)")
+    print(f"  Unpaid bills (all time): {rep['unpaid_count']} bills, "
+          f"Rs {rep['unpaid_total']} owed")
+    print(f"  Beds: {rep['beds_occupied']}/{rep['beds_total']} occupied")
+    print("  Appointments per doctor:")
+    for doc in rep["per_doctor"]:
+        print(f"    {doc['name']} ({doc['doctor_id']}): "
+              f"{doc['appointments_today']} today, {doc['waiting']} waiting")
+
+
 def change_password_prompt(auth, user):
     """Let the logged-in user change their own password."""
     current = getpass.getpass("  Current password: ")
@@ -464,6 +701,8 @@ MENU = [
     ("12", "My Appointments", "view"),   # Doctor only (own queue)
     ("13", "Users (Admin)", "manage_users"),
     ("14", "Change My Password", "view"),
+    ("15", "Billing", "view_bills"),
+    ("16", "Reports", "view_reports"),
 ]
 
 
@@ -528,6 +767,10 @@ def main():
             users_menu(auth)
         elif choice == "14":
             change_password_prompt(auth, user)
+        elif choice == "15":
+            billing_menu(hosp, role)
+        elif choice == "16":
+            reports_menu(hosp)
 
 
 if __name__ == "__main__":

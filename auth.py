@@ -55,6 +55,12 @@ PERMISSIONS = {
     "undo": {"Admin"},
     "add_doctor": {"Admin"},
     "manage_users": {"Admin"},
+    # Step 3 (Billing + Reports): Admin and Receptionist make and manage
+    # bills; every role may VIEW bills and reports (Doctor read-only).
+    "create_bill": {"Admin", "Receptionist"},
+    "manage_bills": {"Admin", "Receptionist"},
+    "view_bills": {"Admin", "Doctor", "Receptionist"},
+    "view_reports": {"Admin", "Doctor", "Receptionist"},
 }
 
 _USERS_SCHEMA = """

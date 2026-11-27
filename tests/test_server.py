@@ -272,5 +272,187 @@ class TestServerAuth(TestServerAPI):
         self.assertEqual(status, 401)
 
 
+class TestServerBilling(TestServerAPI):
+    """Step 3: billing + reports on the HTTP API."""
+
+    def _raw_request(self, method: str, path: str, body: dict | None = None,
+                     cookie: str | None = None):
+        """Like _request, but returns (status, content-type, raw text) —
+        the CSV export is not JSON."""
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        if cookie is None:
+            cookie = self.cookie
+        if cookie:
+            headers["Cookie"] = cookie
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return (resp.status,
+                        resp.headers.get("Content-Type", ""),
+                        resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            return (err.code, err.headers.get("Content-Type", ""),
+                    err.read().decode("utf-8"))
+
+    def _booked_patient(self, pid: int = 101) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": pid, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        status, _ = self._request(
+            "POST", "/api/appointments",
+            {"doctor_id": "D1", "patient_id": pid, "emergency": False})
+        self.assertEqual(status, 200)
+
+    def test_unauthenticated_billing_calls_rejected(self) -> None:
+        for method, path in [("GET", "/api/bills"), ("GET", "/api/reports"),
+                             ("GET", "/api/bills/export"),
+                             ("POST", "/api/bills")]:
+            status, payload = self._request(method, path, {}, cookie="")
+            self.assertEqual(status, 401, path)
+
+    def test_create_bill_charge_pay_flow(self) -> None:
+        self._booked_patient()
+        status, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["bill"]["total"], 2500)
+        self.assertEqual(payload["bill"]["status"], "Unpaid")
+        bill_id = payload["bill"]["id"]
+
+        status, payload = self._request(
+            "POST", f"/api/bills/{bill_id}/charges",
+            {"label": "Medicine — Paracetamol", "amount": 350})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["bill"]["total"], 2850)
+
+        status, payload = self._request("GET", f"/api/bills/{bill_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["bill"]["items"]), 2)
+
+        status, payload = self._request(
+            "POST", f"/api/bills/{bill_id}/pay", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["bill"]["status"], "Paid")
+
+        status, payload = self._request(
+            "POST", f"/api/bills/{bill_id}/unpay", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["bill"]["status"], "Unpaid")
+
+    def test_create_bill_bad_token_and_duplicate_rejected(self) -> None:
+        self._booked_patient()
+        status, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-9"})
+        self.assertEqual(status, 400)
+        self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        status, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        self.assertEqual(status, 400)
+
+    def test_bad_charge_rejected(self) -> None:
+        self._booked_patient()
+        _, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        bill_id = payload["bill"]["id"]
+        for body in [{"label": "Medicine", "amount": 0},
+                     {"label": "Medicine", "amount": -5},
+                     {"label": "", "amount": 100},
+                     {"label": "Medicine", "amount": "abc"}]:
+            status, payload = self._request(
+                "POST", f"/api/bills/{bill_id}/charges", body)
+            self.assertEqual(status, 400, body)
+        status, payload = self._request(
+            "POST", "/api/bills/999/charges",
+            {"label": "Medicine", "amount": 100})
+        self.assertEqual(status, 400)
+
+    def test_doctor_read_only_and_receptionist_can_bill(self) -> None:
+        self._booked_patient()
+        server.auth_store.create_user("doc1", "pw123", "Doctor", "D1")
+        doc_cookie = self._login("doc1", "pw123")
+        status, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"},
+            cookie=doc_cookie)
+        self.assertEqual(status, 403)
+        status, payload = self._request("GET", "/api/bills", cookie=doc_cookie)
+        self.assertEqual(status, 200)
+        status, payload = self._request("GET", "/api/reports", cookie=doc_cookie)
+        self.assertEqual(status, 200)
+
+        server.auth_store.create_user("recep1", "pw123", "Receptionist")
+        recep_cookie = self._login("recep1", "pw123")
+        status, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"},
+            cookie=recep_cookie)
+        self.assertEqual(status, 200)
+        status, payload = self._request(
+            "POST", f"/api/bills/{payload['bill']['id']}/pay", {},
+            cookie=recep_cookie)
+        self.assertEqual(status, 200)
+
+    def test_reports_endpoint_matches_data(self) -> None:
+        self._booked_patient()
+        _, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        bill_id = payload["bill"]["id"]
+        self._request("POST", f"/api/bills/{bill_id}/charges",
+                      {"label": "Medicine", "amount": 500})
+        self._request("POST", f"/api/bills/{bill_id}/pay", {})
+        status, payload = self._request("GET", "/api/reports")
+        self.assertEqual(status, 200)
+        rep = payload["report"]
+        self.assertEqual(rep["patients_today"], 1)
+        self.assertEqual(rep["appointments_today"], 1)
+        self.assertEqual(rep["billed_today"], 3000)
+        self.assertEqual(rep["collected_today"], 3000)
+        self.assertEqual(rep["unpaid_total"], 0)
+        self.assertEqual(rep["per_doctor"][0]["doctor_id"], "D1")
+        self.assertEqual(rep["per_doctor"][0]["appointments_today"], 1)
+
+        status, payload = self._request("GET", "/api/reports?date=2020-01-01")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["report"]["billed_today"], 0)
+        status, payload = self._request("GET", "/api/reports?date=not-a-date")
+        self.assertEqual(status, 400)
+
+    def test_csv_export_download(self) -> None:
+        self._booked_patient()
+        _, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        status, content_type, text = self._raw_request(
+            "GET", "/api/bills/export")
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", content_type)
+        self.assertIn("Bill ID", text)
+        self.assertIn("Ali Khan", text)
+        self.assertIn("2500", text)
+        status, _, _ = self._raw_request("GET", "/api/bills/export", cookie="")
+        self.assertEqual(status, 401)
+
+    def test_dashboard_stats_include_today_money(self) -> None:
+        self._booked_patient()
+        self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        status, payload = self._request("GET", "/api/dashboard")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["stats"]["billed_today"], 2500)
+        self.assertEqual(payload["stats"]["collected_today"], 0)
+        self.assertEqual(payload["stats"]["unpaid_total"], 2500)
+
+
 if __name__ == "__main__":
     unittest.main()
