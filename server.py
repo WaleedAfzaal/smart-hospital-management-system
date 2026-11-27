@@ -23,6 +23,12 @@ Step 3 (Billing + Reports): bills are created from booked appointments
 counts patients/appointments/money for a date. Admin and Receptionist
 make and change bills; Doctors can view bills and reports (read-only).
 Bills export as CSV from ``GET /api/bills/export``.
+
+Step 4 (Appointment Date & Time): booking takes a date (YYYY-MM-DD,
+empty = today) and a time (HH:MM 24-hour, empty = no fixed time) —
+both validated, bad values get a 400 with a plain message. Queues show
+the scheduled date/time, and ``GET /api/appointments?date=...`` lists
+that day's appointments (a Doctor sees only their own doctor's).
 """
 
 import argparse
@@ -38,7 +44,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 from auth import AuthStore, can
-from hospital import DEFAULT_DB_PATH, Hospital, PriorityQueue, binary_search, bubble_sort
+from hospital import (DEFAULT_DB_PATH, Hospital, PriorityQueue,
+                      binary_search, bubble_sort, validate_appt_datetime)
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOST = "127.0.0.1"
@@ -143,8 +150,9 @@ def _serialize_patient(patient: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _serialize_doctor(doc: Dict[str, Any]) -> Dict[str, Any]:
-    # heap rows: (priority, count, token, pid, name, fee). Sort a copy so
-    # the displayed queue is in real service order (Emergency first).
+    # heap rows: (priority, count, token, pid, name, fee, booked date,
+    # appt_date, appt_time). Sort a copy so the displayed queue is in
+    # real service order (Emergency first).
     rows = sorted(doc["queue"].heap, key=lambda r: (r[0], r[1]))
     return {
         "id": doc["id"],
@@ -159,6 +167,9 @@ def _serialize_doctor(doc: Dict[str, Any]) -> Dict[str, Any]:
                 "patient_name": row[4],
                 "fee": row[5],
                 "emergency": row[0] == 1,
+                "booked_date": row[6] if len(row) > 6 else None,
+                "appt_date": row[7] if len(row) > 7 else None,
+                "appt_time": row[8] if len(row) > 8 else None,
             }
             for row in rows
         ],
@@ -368,6 +379,31 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 return self._send_json({
                     "ok": True,
                     "doctors": [_serialize_doctor(d) for d in docs],
+                })
+
+            # ---- Step 4: appointments scheduled for a date (today by
+            # default). A Doctor user linked to one doctor only ever
+            # sees that doctor's appointments, whatever they ask for.
+            if path == "/api/appointments":
+                date = query.get("date", [None])[0] or \
+                    datetime.date.today().isoformat()
+                try:
+                    date, _ = validate_appt_datetime(date, None)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                doctor_id = self._doctor_filter()
+                if doctor_id is None:
+                    doctor_id = query.get("doctor_id", [None])[0]
+                if doctor_id is not None:
+                    doctor_id = doctor_id.strip().upper()
+                    if doctor_id not in hospital.doctors_map:
+                        return self._send_json(
+                            {"ok": False, "error": "Doctor not found."}, 404)
+                return self._send_json({
+                    "ok": True, "date": date,
+                    "appointments": hospital.appointments_for_date(
+                        date, doctor_id),
                 })
 
             if path == "/api/beds":
@@ -639,7 +675,8 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "doctor": _serialize_doctor(hospital.doctors_map[doc_id]),
                 })
 
-            # ---- Book Appointment
+            # ---- Book Appointment (Step 4: date/time — date empty =
+            # today, time empty = no fixed time; bad values get a 400)
             if path == "/api/appointments":
                 if not can(role, "book_appointment"):
                     return self._forbidden(role)
@@ -649,20 +686,30 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     return self._send_json(
                         {"ok": False, "error": "Patient ID must be a number."}, 400)
                 is_emg = bool(data.get("emergency"))
+                try:
+                    appt_date, appt_time = validate_appt_datetime(
+                        data.get("date"), data.get("time"))
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
                 doc = hospital.doctors_map.get(doc_id)
                 pat = hospital.patients_map.get(pid)
                 if not doc or not pat:
                     return self._send_json(
                         {"ok": False, "error": "Invalid doctor or patient ID."}, 400)
-                hospital.book_appointment(doc_id, pid, is_emg)
-                # Token is f"{E|N}-{queue.count}" — computed from the
-                # doctor's queue count after enqueue.
-                token = f"{'E' if is_emg else 'N'}-{doc['queue'].count}"
+                token = hospital.book_appointment(
+                    doc_id, pid, is_emg, appt_date, appt_time)
+                if token is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Could not book appointment."}, 400)
+                when = appt_date + (f" {appt_time}" if appt_time else "")
                 return self._send_json({
-                    "ok": True, "message": f"Booked {token} for {pat['name']}.",
+                    "ok": True,
+                    "message": f"Booked {token} for {pat['name']} ({when}).",
                     "token": token, "doctor": doc["name"],
                     "patient": pat["name"], "fee": doc["fee"],
                     "emergency": is_emg,
+                    "date": appt_date, "time": appt_time,
                 })
 
             # ---- Beds: assign / free

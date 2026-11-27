@@ -1,5 +1,5 @@
 /* Hospital Management System — single-page UI logic.
-   All 11 operations live on the front page; clicking a tile opens its
+   All operations live on the front page; clicking a tile opens its
    form in the central workspace. No page reloads, no separate pages. */
 
 let state = null;
@@ -29,6 +29,9 @@ const OP_PERMS = {
      it, the forms below just hide those buttons for Doctors. */
   "billing": ["Admin", "Doctor", "Receptionist"],
   "reports": ["Admin", "Doctor", "Receptionist"],
+  /* Step 4 (Schedule): every role may view appointments by date — a
+     Doctor linked to one doctor only sees that doctor's day. */
+  "schedule": ["Admin", "Doctor", "Receptionist"],
 };
 
 function canUse(op) {
@@ -182,6 +185,7 @@ const OPS = {
   "change-password": ["Change Password", "Change your own password"],
   "billing": ["Billing", "Bills from appointments + extra charges"],
   "reports": ["Reports", "Daily summary — patients, money, beds"],
+  "schedule": ["Schedule", "Appointments by date — today or any day"],
 };
 
 function openOp(op) {
@@ -211,6 +215,7 @@ function openOp(op) {
     "change-password": renderChangePassword,
     "billing": renderBilling,
     "reports": renderReports,
+    "schedule": renderSchedule,
   })[op]();
 }
 
@@ -351,7 +356,11 @@ function renderDoctors(msg = "", ok = true) {
       <div class="card">
         <h3>${esc(d.name)} <span class="muted">${esc(d.id)} • ${esc(d.spec || "—")} • Fee Rs ${d.fee ?? "—"}</span></h3>
         <p>Waiting: <b>${d.waiting ?? 0}</b> ${d.queue.length
-          ? "— " + d.queue.map((q) => `<span class="tag ${q.emergency ? "tag-emg" : "tag-nor"}">${esc(q.token)} · ${esc(q.patient_name)}</span>`).join(" ")
+          ? "— " + d.queue.map((q) => {
+              /* Step 4: show when the appointment is scheduled for. */
+              const when = [q.appt_date, q.appt_time].filter(Boolean).join(" ");
+              return `<span class="tag ${q.emergency ? "tag-emg" : "tag-nor"}">${esc(q.token)} · ${esc(q.patient_name)}${when ? " · " + esc(when) : ""}</span>`;
+            }).join(" ")
           : `<span class="muted">queue empty</span>`}</p>
       </div>`).join("") || `<p class="muted">No doctors yet.</p>`}
     ${currentUser && currentUser.role === "Admin" ? `
@@ -399,6 +408,10 @@ function renderBook(msg = "", ok = true) {
     <p class="muted">Jab server connect ho jayega to yahan 5 starter doctors aa jayenge.</p>`;
     return;
   }
+  /* Step 4: today's date in local time (toISOString is UTC and can
+     be yesterday after midnight in Pakistan). */
+  const now = new Date();
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   body.innerHTML = `
     ${msgHtml(msg, ok)}
     <form id="f-book" class="form-grid">
@@ -408,6 +421,12 @@ function renderBook(msg = "", ok = true) {
         </select></div>
       <div class="field"><label>Patient ID</label>
         <input type="number" name="patient_id" min="1" placeholder="e.g. 101" required></div>
+      <div class="field-row">
+        <div class="field"><label>Date</label>
+          <input type="date" name="date" value="${todayLocal}" required></div>
+        <div class="field"><label>Time (24-hour, optional)</label>
+          <input type="time" name="time" placeholder="e.g. 10:30"></div>
+      </div>
       <div class="field"><label>Priority</label>
         <div class="seg">
           <button type="button" id="pri-n" class="${!bookEmergency ? "on" : ""}">Normal</button>
@@ -437,13 +456,16 @@ function renderBook(msg = "", ok = true) {
       doctor_id: f.get("doctor_id"),
       patient_id: Number(f.get("patient_id")),
       emergency: bookEmergency,
+      date: f.get("date") || "",
+      time: f.get("time") || "",
     });
     await loadState();
     if (res.ok) {
       toast(res.message);
       document.getElementById("book-result").innerHTML = `
         <div class="card"><h3>Token ${esc(res.token)} ${res.emergency ? '<span class="tag tag-emg">EMERGENCY</span>' : '<span class="tag tag-nor">NORMAL</span>'}</h3>
-        <p>${esc(res.patient)} with ${esc(res.doctor)} — Fee Rs ${res.fee}</p></div>`;
+        <p>${esc(res.patient)} with ${esc(res.doctor)} — Fee Rs ${res.fee}</p>
+        <p>${esc(res.date)}${res.time ? " at " + esc(res.time) : ""}</p></div>`;
     } else {
       const msg = errOf(res);
       toast(msg, true);
@@ -850,6 +872,49 @@ async function renderReports(date) {
     const picked = document.getElementById("rep-date").value;
     if (!picked) { toast("Pick a date first.", true); return; }
     renderReports(picked);
+  });
+}
+
+/* Step 4 (Schedule): appointments for one date, one doctor or all.
+   Sorted by time, then Emergency-first — the server already sorts. */
+async function renderSchedule(date, doctorId) {
+  const now = new Date();
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const day = date || todayLocal;
+  const docs = state ? state.doctors : [];
+  const params = new URLSearchParams({ date: day });
+  if (doctorId) params.set("doctor_id", doctorId);
+  const res = await api(`/api/appointments?${params.toString()}`);
+  if (!res.ok) {
+    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+    return;
+  }
+  const rows = res.appointments || [];
+  body.innerHTML = `
+    <div class="field" style="margin-bottom:12px"><label>Date</label>
+      <div class="field-row">
+        <input type="date" id="sch-date" value="${esc(day)}" style="flex:1">
+        <select id="sch-doctor" style="flex:1">
+          <option value="">All doctors</option>
+          ${docs.map((d) => `<option value="${esc(d.id)}" ${doctorId === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}
+        </select>
+        <button type="button" id="sch-load" class="btn btn-primary">Show</button>
+      </div>
+    </div>
+    <h3 style="margin:6px 0 8px">Schedule — ${esc(res.date)} (${rows.length} appointment${rows.length === 1 ? "" : "s"})</h3>
+    ${rows.length ? `<table class="tbl"><thead><tr>
+        <th>Time</th><th>Token</th><th>Patient</th><th>Doctor</th><th>Fee</th>
+      </tr></thead><tbody>
+      ${rows.map((a) => `<tr><td>${a.appt_time ? esc(a.appt_time) : "—"}</td>
+        <td>${esc(a.token)} ${a.emergency ? '<span class="tag tag-emg">EMERGENCY</span>' : ""}</td>
+        <td>${esc(a.patient_name)} (#${a.patient_id})</td>
+        <td>${esc(a.doctor_name)}</td><td>Rs ${a.fee}</td></tr>`).join("")}
+    </tbody></table>`
+      : `<p class="muted">No appointments on this date.</p>`}`;
+  document.getElementById("sch-load").addEventListener("click", () => {
+    const picked = document.getElementById("sch-date").value;
+    if (!picked) { toast("Pick a date first.", true); return; }
+    renderSchedule(picked, document.getElementById("sch-doctor").value || null);
   });
 }
 

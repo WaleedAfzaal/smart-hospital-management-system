@@ -11,11 +11,20 @@ and appointments remember the date they were booked, so the daily
 report can count "today" honestly. Bills live in ``hospital.billing``
 (see billing.py) and are created from a booked appointment — the first
 line item is that appointment's consultation fee.
+
+Step 4 (Appointment Date & Time): every appointment also carries the
+date and time it is SCHEDULED for (fields 8 and 9 of the heap row).
+The booking date (field 7) is when the token was issued; the
+appointment date/time is when the patient should come. The queue order
+is unchanged — Emergency still comes first; date/time is for
+scheduling and display only. ``appointments_for_date`` / ``doctor_schedule``
+list appointments for a given day, sorted by time, then priority.
 """
 
 import datetime
 import getpass
 import os
+import re
 
 from auth import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME, AuthStore, can
 from billing import Billing
@@ -25,6 +34,49 @@ from database import Database
 # see the same patients, appointments and beds).
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "hospital.db")
+
+
+# ------------------------------------------------ Step 4: date & time
+_APPT_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def validate_appt_datetime(appt_date, appt_time):
+    """Check an appointment date/time and return (date, time) cleaned up.
+
+    Date: ``YYYY-MM-DD``; empty/None means today. Time: ``HH:MM`` in
+    24-hour format; empty/None means "no fixed time". Raises
+    ValueError with a plain message on anything else (a wrong month,
+    30 February, 25:00, 10:60, or a date written any other way).
+    """
+    if appt_date in (None, ""):
+        date_str = datetime.date.today().isoformat()
+    else:
+        try:
+            date_str = datetime.date.fromisoformat(str(appt_date).strip()).isoformat()
+        except ValueError:
+            raise ValueError(
+                "Date must look like YYYY-MM-DD (e.g. 2026-11-28).")
+    if appt_time in (None, ""):
+        time_str = None
+    else:
+        time_str = str(appt_time).strip()
+        if not _APPT_TIME_RE.match(time_str):
+            raise ValueError(
+                "Time must look like HH:MM in 24-hour format (e.g. 10:30).")
+    return date_str, time_str
+
+
+def _appt_when(row):
+    """'2026-11-28 10:30' / '2026-11-28' / '' for a heap row.
+
+    Rows booked before Step 4 have no appointment date/time (fields 8
+    and 9 are missing or None) — they show nothing, they never crash.
+    """
+    appt_date = row[7] if len(row) > 7 else None
+    appt_time = row[8] if len(row) > 8 else None
+    if not appt_date:
+        return ""
+    return f"{appt_date} {appt_time}" if appt_time else appt_date
 
 
 class Node:
@@ -167,14 +219,19 @@ class PriorityQueue:
             self.heap[i], self.heap[best] = self.heap[best], self.heap[i]
             i = best
 
-    def enqueue(self, is_emg, pid, name, fee):
+    def enqueue(self, is_emg, pid, name, fee, appt_date=None, appt_time=None):
         self.count += 1
         token = f"{'E' if is_emg else 'N'}-{self.count}"
         # Step 3: the booking date rides along as the 7th field, so the
         # daily report can count appointments booked "today". Readers
         # that only need the first six fields are unaffected.
+        # Step 4: the SCHEDULED date/time are the 8th and 9th fields.
+        # Empty date means today, empty time means "no fixed time".
+        # Bad values raise ValueError (see validate_appt_datetime).
+        appt_date, appt_time = validate_appt_datetime(appt_date, appt_time)
         self.heap.append((1 if is_emg else 2, self.count, token, pid, name,
-                          fee, datetime.date.today().isoformat()))
+                          fee, datetime.date.today().isoformat(),
+                          appt_date, appt_time))
         self._move_up(len(self.heap) - 1)
         return token
 
@@ -297,7 +354,9 @@ class Hospital:
         if not rows:
             print("  Queue is empty.")
         for row in rows:
+            when = _appt_when(row)
             print(f"  {row[2]} | Patient {row[3]} ({row[4]})"
+                  f"{' | ' + when if when else ''}"
                   f"{' [EMERGENCY]' if row[0] == 1 else ''}")
 
     def doctors_menu(self, role="Admin"):
@@ -318,15 +377,80 @@ class Hospital:
             self._persist()
             print("  Doctor added.")
 
-    def book_appointment(self, doc_id, pid, is_emg):
+    def book_appointment(self, doc_id, pid, is_emg, appt_date=None, appt_time=None):
+        """Book an appointment and return its token (None on failure).
+
+        Step 4: ``appt_date`` (YYYY-MM-DD, empty = today) and
+        ``appt_time`` (HH:MM 24-hour, empty = no fixed time) say WHEN
+        the patient should come. A bad date/time just prints the reason
+        and books nothing — the CLI never crashes on it.
+        """
         doc, pat = self.doctors_map.get(doc_id.upper()), self.patients_map.get(pid)
         if not doc or not pat:
-            return print("  Invalid doctor or patient ID.")
+            print("  Invalid doctor or patient ID.")
+            return None
+        try:
+            token = doc["queue"].enqueue(
+                is_emg, pid, pat["name"], doc["fee"], appt_date, appt_time)
+        except ValueError as exc:
+            print(f"  {exc}")
+            return None
         pat["visits"] += 1
-        token = doc["queue"].enqueue(is_emg, pid, pat["name"], doc["fee"])
         self.undo_stack.push(("BOOK_APPT", doc["id"], token, pid))
         self._persist()
-        print(f"  Booked {token} for {pat['name']} with {doc['name']} | Fee: {doc['fee']}")
+        row = next((r for r in doc["queue"].heap if r[2] == token), None)
+        when = _appt_when(row) if row is not None else ""
+        print(f"  Booked {token} for {pat['name']} with {doc['name']} | Fee: {doc['fee']}"
+              f"{' | ' + when if when else ''}")
+        return token
+
+    def appointments_for_date(self, date=None, doctor_id=None):
+        """All appointments scheduled for ``date`` (today by default).
+
+        Each item is a dict with token, doctor, patient, fee, emergency,
+        booking date and the scheduled date/time. Sorted by time first
+        (no fixed time goes last), then Emergency-first, then token
+        order. Appointments booked before Step 4 have no scheduled date
+        and never appear in a dated view — they still show in the
+        doctor's queue. ``doctor_id`` limits the list to one doctor.
+        """
+        if date is None:
+            date = datetime.date.today().isoformat()
+        else:
+            date, _ = validate_appt_datetime(date, None)
+        out = []
+        for doc in self.doctors_map.values():
+            if doctor_id is not None and doc["id"] != doctor_id.upper():
+                continue
+            for row in doc["queue"].heap:
+                appt_date = row[7] if len(row) > 7 else None
+                if appt_date != date:
+                    continue
+                out.append({
+                    "token": row[2],
+                    "doctor_id": doc["id"],
+                    "doctor_name": doc["name"],
+                    "patient_id": row[3],
+                    "patient_name": row[4],
+                    "fee": row[5],
+                    "emergency": row[0] == 1,
+                    "booked_date": row[6] if len(row) > 6 else None,
+                    "appt_date": appt_date,
+                    "appt_time": row[8] if len(row) > 8 else None,
+                })
+        out.sort(key=lambda a: (a["appt_time"] or "99:99",
+                                0 if a["emergency"] else 1,
+                                a["token"]))
+        return out
+
+    def doctor_schedule(self, doctor_id, date=None):
+        """One doctor's appointments for ``date`` (today by default).
+
+        Raises ValueError if the doctor does not exist.
+        """
+        if doctor_id.upper() not in self.doctors_map:
+            raise ValueError("Doctor not found.")
+        return self.appointments_for_date(date, doctor_id)
 
     def beds_menu(self):
         for i, bed in enumerate(self.beds, 1):
@@ -670,6 +794,28 @@ def reports_menu(hosp):
               f"{doc['appointments_today']} today, {doc['waiting']} waiting")
 
 
+def schedule_menu(hosp):
+    """Appointments for a date (Step 4): today by default, or any date
+    you type; one doctor or all of them. Sorted by time, then
+    Emergency-first. Every role may view it."""
+    date = input("  Date (YYYY-MM-DD, empty = today): ").strip()
+    if not date:
+        date = datetime.date.today().isoformat()
+    doc_id = input("  Doctor ID (empty = all doctors): ").strip().upper()
+    try:
+        rows = hosp.appointments_for_date(date, doc_id or None)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    print(f"\n  --- Appointments — {date} ---")
+    if not rows:
+        return print("  No appointments on this date.")
+    for row in rows:
+        when = row["appt_time"] or "no fixed time"
+        print(f"  {when} | {row['token']} | {row['patient_name']} "
+              f"(#{row['patient_id']}) | {row['doctor_name']}"
+              f"{' [EMERGENCY]' if row['emergency'] else ''}")
+
+
 def change_password_prompt(auth, user):
     """Let the logged-in user change their own password."""
     current = getpass.getpass("  Current password: ")
@@ -703,6 +849,7 @@ MENU = [
     ("14", "Change My Password", "view"),
     ("15", "Billing", "view_bills"),
     ("16", "Reports", "view_reports"),
+    ("17", "Schedule", "view"),   # Step 4: appointments by date
 ]
 
 
@@ -743,7 +890,14 @@ def main():
         elif choice == "5":
             hosp.doctors_menu(role)
         elif choice == "6":
-            hosp.book_appointment(input("Doctor ID: "), int(input("Patient ID: ")), input("Emergency (E) or Normal (N): ").strip().upper() == "E")
+            # Step 4: ask WHEN the appointment is for — date empty means
+            # today, time empty means no fixed time. A bad date/time
+            # just prints the reason (book_appointment handles it).
+            hosp.book_appointment(
+                input("Doctor ID: "), int(input("Patient ID: ")),
+                input("Emergency (E) or Normal (N): ").strip().upper() == "E",
+                input("Date (YYYY-MM-DD, empty = today): ").strip() or None,
+                input("Time (HH:MM, empty = no fixed time): ").strip() or None)
         elif choice == "7":
             hosp.beds_menu()
         elif choice == "8":
@@ -771,6 +925,8 @@ def main():
             billing_menu(hosp, role)
         elif choice == "16":
             reports_menu(hosp)
+        elif choice == "17":
+            schedule_menu(hosp)
 
 
 if __name__ == "__main__":

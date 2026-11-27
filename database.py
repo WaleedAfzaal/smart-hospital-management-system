@@ -32,6 +32,12 @@ Design notes
   columns are migrated on connect (``ALTER TABLE ... ADD COLUMN``) —
   old rows just get NULL, i.e. "date unknown", and are never counted
   for any day.
+* Step 4 (Appointment Date & Time): appointments also carry the
+  SCHEDULED date/time (``appt_date`` / ``appt_time``) — when the
+  patient should come, which is different from the booking ``date``
+  (when the token was issued). Same migration pattern: older files get
+  the columns added, old rows keep NULL ("no date/time set") and keep
+  working — they just never appear in a dated schedule view.
 """
 
 import os
@@ -76,7 +82,9 @@ CREATE TABLE IF NOT EXISTS appointments(
     patient_id INTEGER NOT NULL,
     patient_name TEXT NOT NULL,
     fee INTEGER NOT NULL,
-    date TEXT
+    date TEXT,
+    appt_date TEXT,
+    appt_time TEXT
 );
 CREATE TABLE IF NOT EXISTS beds(
     bed_no INTEGER PRIMARY KEY,
@@ -134,15 +142,19 @@ class Database:
 
     @staticmethod
     def _migrate(conn):
-        """Add Step 3 columns to databases created before Step 3.
+        """Add Step 3 / Step 4 columns to databases created earlier.
 
         ``CREATE TABLE IF NOT EXISTS`` never touches an existing table,
         so an older hospital.db would otherwise miss ``registered`` /
-        ``date`` and the INSERTs below would fail. Old rows keep NULL
-        (date unknown) — the daily report simply never counts them.
+        ``date`` / ``appt_date`` / ``appt_time`` and the INSERTs below
+        would fail. Old rows keep NULL (date unknown) — the daily
+        report simply never counts them, and the schedule view skips
+        appointments with no scheduled date.
         """
         for table, column in (("patients", "registered"),
-                             ("appointments", "date")):
+                             ("appointments", "date"),
+                             ("appointments", "appt_date"),
+                             ("appointments", "appt_time")):
             cols = [row[1] for row in conn.execute(
                 f"PRAGMA table_info({table})")]
             if column not in cols:
@@ -184,14 +196,19 @@ class Database:
                      doc["queue"].count),
                 )
                 for hpos, row in enumerate(doc["queue"].heap):
-                    # heap row: (priority, count, token, pid, name, fee, date)
-                    # Rows built before Step 3 have no 7th field.
+                    # heap row: (priority, count, token, pid, name, fee,
+                    #            booked date, appt_date, appt_time)
+                    # Rows built before Step 3 have no 7th field, and
+                    # rows built before Step 4 have no 8th/9th field.
                     conn.execute(
                         "INSERT INTO appointments(doctor_id, heap_pos, priority,"
-                        " seq, token, patient_id, patient_name, fee, date)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        " seq, token, patient_id, patient_name, fee, date,"
+                        " appt_date, appt_time)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (doc["id"], hpos, row[0], row[1], row[2], row[3],
-                         row[4], row[5], row[6] if len(row) > 6 else None),
+                         row[4], row[5], row[6] if len(row) > 6 else None,
+                         row[7] if len(row) > 7 else None,
+                         row[8] if len(row) > 8 else None),
                     )
 
             for i, pid in enumerate(hospital.beds):
@@ -267,9 +284,11 @@ class Database:
                 queue = PriorityQueue()
                 queue.count = count
                 queue.heap = [
-                    (priority, seq, token, pat_id, pat_name, fee_, date_)
-                    for priority, seq, token, pat_id, pat_name, fee_, date_ in conn.execute(
-                        "SELECT priority, seq, token, patient_id, patient_name, fee, date"
+                    (priority, seq, token, pat_id, pat_name, fee_, date_,
+                     appt_date, appt_time)
+                    for priority, seq, token, pat_id, pat_name, fee_, date_, appt_date, appt_time in conn.execute(
+                        "SELECT priority, seq, token, patient_id, patient_name, fee, date,"
+                        " appt_date, appt_time"
                         " FROM appointments WHERE doctor_id = ? ORDER BY heap_pos",
                         (doc_id,),
                     )

@@ -125,6 +125,52 @@ They also seed the shift rotation.
   `tests/test_server.py::TestServerBilling` (API flow, 401/403 per
   role, reports, CSV download, dashboard money stats).
 
+## Appointment Date & Time — Step 4 (`hospital.py` + `database.py` + `server.py`)
+
+- **Heap row, now 9 fields:** `(priority, seq, token, pid, name, fee,
+  booked_date, appt_date, appt_time)`. Field 7 is still the booking
+  date (when the token was issued — the daily report counts by it);
+  fields 8 and 9 are the SCHEDULED date/time (when the patient should
+  come). The heap orders by `(priority, seq)` only, so date/time never
+  changes who is served first.
+- **Validation** (`validate_appt_datetime` in `hospital.py`): date must
+  be `YYYY-MM-DD` (empty = today), time must be `HH:MM` 24-hour
+  (empty = no fixed time). Anything else raises `ValueError` with a
+  plain message. `PriorityQueue.enqueue` validates; `Hospital.book_appointment`
+  catches it, prints the reason and books nothing (returns `None`).
+- **Views** (`Hospital.appointments_for_date(date, doctor_id)`, today by
+  default; `Hospital.doctor_schedule(doctor_id, date)`): dicts with
+  token, doctor, patient, fee, emergency, booking date and scheduled
+  date/time, sorted by time (no fixed time last), then Emergency-first,
+  then token order. Appointments booked before Step 4 have
+  `appt_date=None` and never appear in a dated view — they still show
+  in the doctor's queue and still work for billing.
+- **Database:** `appointments` gains `appt_date` / `appt_time` columns
+  (added to `SCHEMA` and to `_migrate`, same `ALTER TABLE` pattern as
+  Step 3). Save/load carry all 9 fields, with length guards for rows
+  built before Step 3/4.
+- **API:** `POST /api/appointments` takes optional `date` / `time`
+  (400 on bad values, token + date/time in the answer);
+  `GET /api/appointments?date=...&doctor_id=...` lists that day's
+  appointments. A Doctor user linked to one doctor only sees that
+  doctor's day, whatever they ask for. Queue items in `/api/doctors`
+  and `/api/state` also carry `booked_date`, `appt_date`, `appt_time`.
+- **CLI:** booking (menu **6**) asks for date and time; menu
+  **17. Schedule** shows one day's appointments (today by default)
+  for one doctor or all. **Web:** the booking form has Date (defaults
+  to today) and Time fields; the **Schedule** tile has a date picker
+  and doctor filter; doctor queues show each token's scheduled
+  date/time.
+- **Permissions:** booking uses the existing `book_appointment` rule
+  (Admin/Receptionist); the schedule view is `view` (every role).
+- Tests: `tests/test_appointments.py` (validation, defaults, bad
+  date/time books nothing, queue order unchanged, date/doctor
+  filters, time-then-emergency sorting, billing from a dated token,
+  restart persistence, old 7-field rows still load) and
+  `tests/test_server.py::TestServerAppointments` (API booking,
+  defaults, 400s, schedule filters, Doctor-only-own-day, billing
+  from a dated token).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -132,9 +178,10 @@ They also seed the shift rotation.
   `docs/api.md`.
 - One global `Hospital` instance, guarded by a `threading.Lock` so two
   browser tabs can't race on the same structures.
-- `hospital.py` methods print instead of returning, so the server
-  determines success from state before/after each call and computes the
-  booking token from the doctor's queue count after enqueue.
+- `hospital.py` methods mostly print instead of returning, so the server
+  usually determines success from state before/after each call.
+  `book_appointment` is the exception — it RETURNS its token (or
+  `None` on failure), which the booking endpoint uses directly.
 - State is saved to `hospital.db` on every change (see Database above),
   so restarting the server keeps all data. This is a university
   project, not for production.

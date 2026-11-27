@@ -10,6 +10,7 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Patient Notes**: Visit notes kept in a linked list per patient; each note counts as a visit.
 - **Doctor Directory**: 5 starter doctors with specialty and token fee. View doctors or add a new one.
 - **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…).
+- **Appointment Date & Time**: Every appointment is scheduled for a date (`YYYY-MM-DD`, empty = today) and a time (`HH:MM`, 24-hour, empty = no fixed time). The **Schedule** view lists a day's appointments — for one doctor or all — sorted by time, then Emergency-first. The queue order itself never changes: date/time is for scheduling and display only.
 - **Beds**: 10 beds — assign a patient to a free bed or free an occupied one.
 - **Undo**: One-click undo for the last action (add patient, add note, book appointment, bed assign/free), powered by an undo stack.
 - **Pharmacy Queue**: FIFO token queue — add a token, serve the next one, or view the line.
@@ -83,6 +84,30 @@ doctor, bed occupancy, and unpaid bills (count + total owed, all
 time). Only Admin and Receptionist can create or change bills —
 Doctors can view bills and reports (read-only).
 
+## Appointment Date & Time
+
+When you book an appointment you pick **when** the patient should
+come: a date (`YYYY-MM-DD` — leave it empty for today) and a time
+(`HH:MM` in 24-hour format, e.g. `10:30` — leave it empty for no fixed
+time). A wrong date or time is rejected with a plain message and
+nothing is booked. This scheduled date/time is different from the
+booking date (the day the token was issued) — the daily report still
+counts appointments by booking date, and the Emergency-first queue
+order never changes.
+
+- **CLI:** booking (menu option **6. Book Appt**) asks for date and
+  time after the Emergency/Normal choice; menu option **17. Schedule**
+  shows one day's appointments (today by default, or any date you
+  type) for one doctor or all of them, sorted by time.
+- **Dashboard:** the **Book Appointment** form has Date and Time
+  fields (date defaults to today); the **Schedule** tile has a date
+  picker and a doctor filter and lists that day's appointments. Doctor
+  queues also show each token's scheduled date/time.
+
+Appointments booked before this feature have no scheduled date — they
+still work everywhere (queue, billing, reports) but never appear in a
+dated schedule view.
+
 ## Quick Start
 
 1. Clone the repository:
@@ -139,6 +164,7 @@ python hospital.py
 │   ├── test_server.py       # End-to-end API tests for the web server
 │   ├── test_auth.py         # Login, password hashing, and role permission tests
 │   ├── test_billing.py      # Billing, reports, CSV export, and persistence tests
+│   ├── test_appointments.py # Appointment date/time, schedule views, migration tests
 │   └── test_database.py     # Persistence round-trip tests (save → restart → reload)
 ├── CONTRIBUTING.md
 └── LICENSE

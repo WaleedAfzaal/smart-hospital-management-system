@@ -7,6 +7,7 @@ cookie. Tests for the auth rules themselves live in test_auth.py and
 in TestServerAuth below.
 """
 
+import datetime
 import json
 import os
 import sys
@@ -452,6 +453,140 @@ class TestServerBilling(TestServerAPI):
         self.assertEqual(payload["stats"]["billed_today"], 2500)
         self.assertEqual(payload["stats"]["collected_today"], 0)
         self.assertEqual(payload["stats"]["unpaid_total"], 2500)
+
+
+class TestServerAppointments(TestServerAPI):
+    """Step 4: booking with date/time + the schedule endpoint."""
+
+    def _book(self, doctor_id="D1", pid=101, emergency=False,
+              date=None, time=None):
+        body = {"doctor_id": doctor_id, "patient_id": pid,
+                "emergency": emergency}
+        if date is not None:
+            body["date"] = date
+        if time is not None:
+            body["time"] = time
+        return self._request("POST", "/api/appointments", body)
+
+    def test_book_with_date_and_time(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        status, payload = self._book(date="2026-11-28", time="10:30")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["token"], "N-1")
+        self.assertEqual(payload["date"], "2026-11-28")
+        self.assertEqual(payload["time"], "10:30")
+
+        # The queue shows the scheduled date/time too.
+        status, payload = self._request("GET", "/api/doctors")
+        queue = payload["doctors"][0]["queue"]
+        self.assertEqual(queue[0]["appt_date"], "2026-11-28")
+        self.assertEqual(queue[0]["appt_time"], "10:30")
+
+    def test_book_without_date_defaults_to_today(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        status, payload = self._book()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["date"],
+                         datetime.date.today().isoformat())
+        self.assertIsNone(payload["time"])
+
+    def test_book_with_bad_date_or_time_rejected(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        for body in ({"date": "2026-13-01", "time": "10:30"},
+                     {"date": "2026-11-28", "time": "25:00"},
+                     {"date": "28-11-2026"},
+                     {"date": "2026-02-30", "time": "10:30"}):
+            status, payload = self._book(**body)
+            self.assertEqual(status, 400, body)
+            self.assertFalse(payload["ok"])
+        # Nothing was booked by the rejected attempts.
+        status, payload = self._request("GET", "/api/doctors")
+        self.assertEqual(payload["doctors"][0]["waiting"], 0)
+
+    def test_schedule_endpoint_filters_by_date(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        self._book(date="2026-11-28", time="10:30")
+        self._book(date="2026-11-29", time="09:00")
+
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2026-11-28")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["date"], "2026-11-28")
+        self.assertEqual(len(payload["appointments"]), 1)
+        self.assertEqual(payload["appointments"][0]["token"], "N-1")
+        self.assertEqual(payload["appointments"][0]["appt_time"], "10:30")
+
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2026-11-29")
+        self.assertEqual(len(payload["appointments"]), 1)
+        self.assertEqual(payload["appointments"][0]["token"], "N-2")
+
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2020-01-01")
+        self.assertEqual(payload["appointments"], [])
+
+        # Bad date on the schedule endpoint is a 400.
+        status, payload = self._request(
+            "GET", "/api/appointments?date=not-a-date")
+        self.assertEqual(status, 400)
+
+    def test_schedule_endpoint_filters_by_doctor(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        self._book(doctor_id="D1", date="2026-11-28", time="10:30")
+        self._book(doctor_id="D2", date="2026-11-28", time="09:00")
+
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2026-11-28&doctor_id=D2")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["appointments"]), 1)
+        self.assertEqual(payload["appointments"][0]["doctor_id"], "D2")
+
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2026-11-28&doctor_id=D9")
+        self.assertEqual(status, 404)
+
+    def test_schedule_endpoint_needs_login(self) -> None:
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2026-11-28", cookie="")
+        self.assertEqual(status, 401)
+
+    def test_doctor_sees_only_own_schedule(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        self._book(doctor_id="D1", date="2026-11-28", time="10:30")
+        self._book(doctor_id="D2", date="2026-11-28", time="09:00")
+        server.auth_store.create_user("doc2", "pw123", "Doctor", "D2")
+        cookie = self._login("doc2", "pw123")
+        self.assertTrue(cookie)
+        # Asking for D1 still only shows D2's appointments.
+        status, payload = self._request(
+            "GET", "/api/appointments?date=2026-11-28&doctor_id=D1",
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["appointments"]), 1)
+        self.assertEqual(payload["appointments"][0]["doctor_id"], "D2")
+
+    def test_billing_still_works_from_dated_token(self) -> None:
+        self._request(
+            "POST", "/api/patients",
+            {"id": 101, "name": "Ali Khan", "age": 32, "problem": "Fever"})
+        self._book(date="2026-11-28", time="10:30")
+        status, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["bill"]["total"], 2500)
 
 
 if __name__ == "__main__":

@@ -68,7 +68,10 @@ queue and shifts. The 5 starter doctors are `STARTER_DOCTORS` in
 
 | Method | Path | Body | Description |
 | ------ | ---- | ---- | ----------- |
-| POST | `/api/appointments` | `{doctor_id, patient_id, emergency}` | Book a token. Emergency → `E-n`, Normal → `N-n` (n = that doctor's queue count). PriorityQueue (binary heap) serves Emergency first. Returns the token + fee |
+| POST | `/api/appointments` | `{doctor_id, patient_id, emergency, date?, time?}` | Book a token. Emergency → `E-n`, Normal → `N-n` (n = that doctor's queue count). PriorityQueue (binary heap) serves Emergency first. `date` is `YYYY-MM-DD` (empty = today), `time` is `HH:MM` 24-hour (empty = no fixed time); bad values get a 400 with a plain message. Returns the token + fee + scheduled date/time |
+| GET | `/api/appointments?date=YYYY-MM-DD&doctor_id=D1` | — | Appointments scheduled for that date (today by default), sorted by time then Emergency-first. `doctor_id` is optional; a Doctor user linked to one doctor only ever sees that doctor's appointments |
+
+Each queue item in `GET /api/doctors` and `/api/state` now also carries `booked_date` (when the token was issued), `appt_date` and `appt_time` (when the patient should come — `null` for appointments booked before Step 4).
 
 ## Beds (op 7)
 
