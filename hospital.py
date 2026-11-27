@@ -864,6 +864,166 @@ class Hospital:
             "per_doctor": per_doctor,
         }
 
+    def dashboard_data(self, today=None):
+        """Everything the Step 7 dashboard needs — from LIVE data only.
+
+        No number here is a sample: the counts, the money, the monthly
+        series, the department split, today's list and the activity
+        feed all come from the patients, doctors, appointments, bills
+        and status history actually stored. An empty hospital reports
+        honest zeros. A monthly chart counts an appointment in the
+        month it is scheduled for (or the month it was booked, when it
+        has no scheduled date); rows with no date at all are left out
+        of the chart but still count everywhere else.
+        """
+        if today is None:
+            today = datetime.date.today().isoformat()
+        year, month = int(today[:4]), int(today[5:7])
+
+        rows = []  # (doctor dict, heap row) for every appointment
+        for doc in self.doctors_map.values():
+            for row in doc["queue"].heap:
+                rows.append((doc, row))
+
+        def _appt_month(row):
+            d = (row[7] if len(row) > 7 else None) or \
+                (row[6] if len(row) > 6 else None)
+            return d[:7] if d else None  # "YYYY-MM"
+
+        # ---- Monthly series: this year (Jan–Dec) + rolling last 12
+        months_year = [f"{year}-{m:02d}" for m in range(1, 13)]
+        counts_year = {m: 0 for m in months_year}
+        rolling = []
+        y, m = year, month
+        for _ in range(12):
+            rolling.append(f"{y}-{m:02d}")
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+        rolling.reverse()
+        counts_roll = {m: 0 for m in rolling}
+        for _, row in rows:
+            key = _appt_month(row)
+            if key in counts_year:
+                counts_year[key] += 1
+            if key in counts_roll:
+                counts_roll[key] += 1
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        monthly_year = [
+            {"label": month_names[int(k[5:7]) - 1],
+             "count": counts_year[k]} for k in months_year]
+        monthly_last12 = [
+            {"label": f"{month_names[int(k[5:7]) - 1]} '{k[2:4]}",
+             "count": counts_roll[k]} for k in rolling]
+
+        # ---- Departments: appointments per doctor specialization
+        dept_counts = {}
+        for doc, _row in rows:
+            dept_counts[doc["spec"]] = dept_counts.get(doc["spec"], 0) + 1
+        departments = [
+            {"name": name, "count": c,
+             "percent": round(100 * c / len(rows)) if rows else 0}
+            for name, c in sorted(dept_counts.items(),
+                                  key=lambda kv: -kv[1])]
+
+        # ---- Today's appointments (time, then Emergency-first)
+        todays = self.appointments_for_date(today)
+        for a in todays:
+            a["department"] = self.doctors_map[a["doctor_id"]]["spec"]
+
+        # ---- Money + pending items (the bell badge counts these)
+        bills = self.billing.list_bills()
+        total_revenue = sum(b["total"] for b in bills
+                            if b["status"] == "Paid")
+        pending_bills = [b for b in bills if b["status"] == "Unpaid"]
+        pending_appts = []
+        for doc, row in rows:
+            a = _public_appointment(doc, row)
+            if a["status"] == "Pending":
+                pending_appts.append(a)
+
+        # ---- Recent activities: status changes, registrations, bills,
+        # bookings — newest first, latest 8. Items with only a date
+        # sort as the START of that day, so a status change stamped
+        # this morning still comes before a registration dated today
+        # (whose exact time was never recorded), while anything from
+        # yesterday still comes after anything dated today.
+        activities = []
+        for h in self.status_history.recent(10):
+            appt = self.get_appointment(h["doctor_id"], h["token"])
+            who = appt["patient_name"] if appt else h["token"]
+            activities.append({
+                "kind": "status",
+                "text": f"Status changed: {h['token']} ({who}) — "
+                        f"{h['old_status'] or '—'} → {h['new_status']} "
+                        f"by {h['changed_by']}",
+                "when": h["changed_at"], "sort": h["changed_at"],
+            })
+        for pat in sorted(self.patients_list, key=lambda p: p["id"],
+                          reverse=True)[:5]:
+            reg = pat.get("registered") or today
+            activities.append({
+                "kind": "patient",
+                "text": f"Patient registered: {pat['name']} (#{pat['id']})",
+                "when": reg, "sort": reg + "T00:00:00",
+            })
+        for b in sorted(bills, key=lambda b: b["id"], reverse=True)[:5]:
+            activities.append({
+                "kind": "bill",
+                "text": f"Bill #{b['id']} — {b['patient_name']}: "
+                        f"Rs {b['total']} ({b['status']})",
+                "when": b["date"], "sort": b["date"] + "T00:00:00",
+            })
+        for doc, row in sorted(
+                rows, key=lambda dr: ((dr[1][6] or ""), dr[1][2]),
+                reverse=True)[:5]:
+            a = _public_appointment(doc, row)
+            booked = a["booked_date"] or today
+            activities.append({
+                "kind": "appointment",
+                "text": f"Appointment booked: {a['patient_name']} with "
+                        f"{a['doctor_name']} ({a['token']})",
+                "when": booked, "sort": booked + "T00:00:00",
+            })
+        activities.sort(key=lambda x: x["sort"], reverse=True)
+        activities = activities[:8]
+        for a in activities:
+            del a["sort"]
+
+        return {
+            "date": today,
+            "total_patients": len(self.patients_map),
+            "total_doctors": len(self.doctors_map),
+            "todays_appointments": len(todays),
+            "available_beds": sum(1 for b in self.beds if b == 0),
+            "total_beds": self.NUM_BEDS,
+            "total_revenue": total_revenue,
+            "pending_bills": len(pending_bills),
+            "pending_bills_total": sum(b["total"]
+                                       for b in pending_bills),
+            "pending_appointments": len(pending_appts),
+            "notification_count": len(pending_appts) + len(pending_bills),
+            "monthly_year": monthly_year,
+            "monthly_last12": monthly_last12,
+            "departments": departments,
+            "todays_list": todays,
+            "activities": activities,
+            "pending_items": {
+                "appointments": [{
+                    "token": a["token"], "doctor_id": a["doctor_id"],
+                    "doctor_name": a["doctor_name"],
+                    "patient_name": a["patient_name"],
+                    "appt_date": a["appt_date"],
+                    "appt_time": a["appt_time"],
+                } for a in pending_appts[:10]],
+                "bills": [{
+                    "id": b["id"], "patient_name": b["patient_name"],
+                    "total": b["total"],
+                } for b in pending_bills[:10]],
+            },
+        }
+
 
 def login_prompt(auth):
     """Ask for username/password until they are right.

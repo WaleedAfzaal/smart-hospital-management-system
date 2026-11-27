@@ -4,6 +4,9 @@
 
 let state = null;
 let currentOp = "dashboard";
+let currentView = "dashboard"; /* "dashboard" = Step 7 view, "module" = workspace view */
+let dashData = null; /* latest GET /api/dashboard payload */
+let chartMode = "year"; /* "year" (Jan–Dec) or "last12" (rolling 12 months) */
 let sortField = "id";
 let bookEmergency = false;
 let currentUser = null;
@@ -57,16 +60,23 @@ function statusTagClass(status) {
 }
 
 function applyRoleVisibility() {
-  /* Hide tiles the logged-in role cannot use. */
-  document.querySelectorAll(".tile[data-op]").forEach((t) => {
-    t.classList.toggle("hidden", !canUse(t.dataset.op));
+  /* Hide nav entries the logged-in role cannot use (a group hides
+     when none of its children are usable). The server enforces the
+     same rules — this only hides what you cannot click. */
+  document.querySelectorAll("#side-nav [data-op]").forEach((el) => {
+    el.classList.toggle("hidden", !canUse(el.dataset.op));
   });
-  const chip = document.getElementById("user-chip");
+  document.querySelectorAll("#side-nav .nav-group").forEach((g) => {
+    const kids = [...g.querySelectorAll("[data-op]")];
+    g.classList.toggle("hidden", kids.length > 0 && kids.every((k) => k.classList.contains("hidden")));
+  });
+  const nameEl = document.getElementById("profile-name");
+  const roleEl = document.getElementById("profile-role");
+  const avEl = document.getElementById("profile-avatar");
   if (currentUser) {
-    chip.textContent = `${currentUser.username} (${currentUser.role})`;
-    chip.classList.remove("hidden");
-    document.getElementById("top-logout").classList.remove("hidden");
-    document.getElementById("top-change-pw").classList.remove("hidden");
+    if (nameEl) nameEl.textContent = currentUser.username;
+    if (roleEl) roleEl.textContent = currentUser.role === "Admin" ? "Administrator" : currentUser.role;
+    if (avEl) avEl.textContent = (currentUser.username || "A")[0].toUpperCase();
   }
 }
 
@@ -168,15 +178,11 @@ function setOnlineStatus(online) {
 }
 
 function refreshStats() {
-  if (!state) return;
-  /* ?? 0: a missing number must show 0, never blank and never
-     the word "undefined". */
-  const s = state.stats || {};
-  document.getElementById("stat-patients").textContent = s.patients ?? 0;
-  document.getElementById("stat-doctors").textContent = s.doctors ?? 0;
-  document.getElementById("stat-waiting").textContent = s.waiting ?? 0;
-  document.getElementById("stat-beds").textContent = s.free_beds ?? 0;
-  document.getElementById("last-update").textContent =
+  /* The dashboard numbers live in dashData (GET /api/dashboard) and
+     are rendered by renderDashboardView; this only stamps the footer
+     time. A missing number must never show "undefined" anywhere. */
+  const lu = document.getElementById("last-update");
+  if (lu) lu.textContent =
     new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
@@ -195,6 +201,9 @@ async function loadState() {
     state = res.state;
     setOnlineStatus(true);
     refreshStats();
+    /* The dashboard shows live numbers — re-render it when its data
+       changed underneath (a booking, a bill, a status change). */
+    if (currentView === "dashboard") showDashboard();
   } else {
     state = null;
     setOnlineStatus(false);
@@ -223,13 +232,50 @@ const OPS = {
   "schedule": ["Schedule", "Appointments by date — today or any day"],
 };
 
+/* ---------------- Step 7: views + sidebar navigation ---------------- */
+
+function showModuleView() {
+  document.getElementById("dashboard-view").classList.add("hidden");
+  document.getElementById("module-view").classList.remove("hidden");
+}
+function showDashboardSection() {
+  document.getElementById("module-view").classList.add("hidden");
+  document.getElementById("dashboard-view").classList.remove("hidden");
+}
+function setModuleHead(title, sub) {
+  titleEl.textContent = title;
+  if (subEl) subEl.textContent = sub || "";
+}
+
+/* Which sidebar section an op belongs to (for the active highlight). */
+const OP_NAV = {
+  "view-sorted": "patients", "add-patient": "patients",
+  "find-patient": "patients", "add-note": "patients",
+  "doctors": "doctors", "shifts": "doctors",
+  "book-appointment": "appointments", "schedule": "appointments",
+  "beds": "beds", "pharmacy": "pharmacy", "billing": "billing",
+  "reports": "reports", "departments": "departments",
+  "settings": "settings", "change-password": "settings",
+  "users": "settings", "dashboard": "dashboard",
+};
+function setActiveNav(key) {
+  document.querySelectorAll("#side-nav .nav-item, #side-nav .nav-sub").forEach((el) => {
+    el.classList.toggle("active", el.dataset.nav === key);
+  });
+  /* Expand the group that holds the active item, collapse the rest. */
+  document.querySelectorAll("#side-nav .nav-group").forEach((g) => {
+    g.classList.toggle("open", g.dataset.nav === key);
+  });
+}
+
 function openOp(op) {
+  if (op === "dashboard") return showDashboard();
   currentOp = op;
+  currentView = "module";
+  showModuleView();
   const meta = OPS[op] || [op, ""];
-  titleEl.textContent = meta[0];
-  if (subEl) subEl.textContent = meta[1];
-  document.querySelectorAll(".tile").forEach((t) =>
-    t.classList.toggle("active", t.dataset.op === op));
+  setModuleHead(meta[0], meta[1]);
+  setActiveNav(OP_NAV[op] || op);
   if (!canUse(op)) {
     body.innerHTML = `<div class="msg msg-err">Not allowed for your role (${currentUser ? currentUser.role : "—"}).</div>`;
     return;
@@ -244,7 +290,6 @@ function openOp(op) {
     "beds": renderBeds,
     "pharmacy": renderPharmacy,
     "shifts": renderShifts,
-    "dashboard": renderDashboard,
     "undo": renderUndo,
     "users": renderUsers,
     "change-password": renderChangePassword,
@@ -252,6 +297,108 @@ function openOp(op) {
     "reports": renderReports,
     "schedule": renderSchedule,
   })[op]();
+}
+
+function showView(view) {
+  if (view === "dashboard") return showDashboard();
+  if (view === "departments") return renderDepartments();
+  if (view === "settings") return renderSettings();
+}
+
+/* Sidebar items. "op" opens an existing module op; "view" opens a
+   Step 7 view; "soon" opens an honest "coming in a later step" note —
+   never a dead link that pretends to work. */
+const NAV = [
+  { key: "dashboard", label: "Dashboard", icon: "home", view: "dashboard" },
+  { key: "patients", label: "Patient Management", icon: "users", children: [
+    { op: "view-sorted", label: "All Patients" },
+    { op: "add-patient", label: "Add Patient" },
+    { op: "find-patient", label: "Find Patient" },
+    { op: "add-note", label: "Add Note" },
+  ] },
+  { key: "doctors", label: "Doctor Management", icon: "steth", children: [
+    { op: "doctors", label: "All Doctors" },
+    { op: "shifts", label: "Shifts" },
+  ] },
+  { key: "appointments", label: "Appointments", icon: "cal", children: [
+    { op: "book-appointment", label: "Book Appointment" },
+    { op: "schedule", label: "Schedule" },
+  ] },
+  { key: "departments", label: "Departments", icon: "building", view: "departments" },
+  { key: "beds", label: "Bed & Ward Management", icon: "bed", op: "beds" },
+  { key: "opd", label: "OPD / IPD Management", icon: "clipboard", soon: true,
+    note: "OPD / IPD Management is part of the plan and comes in a later step. For now, patients are admitted through Bed & Ward Management and appointments through Schedule." },
+  { key: "lab", label: "Laboratory Management", icon: "flask", soon: true,
+    note: "Laboratory Management is part of the plan and comes in a later step. Lab charges can already be added to a bill from Billing & Payments." },
+  { key: "pharmacy", label: "Pharmacy Management", icon: "pill", op: "pharmacy" },
+  { key: "billing", label: "Billing & Payments", icon: "bill", op: "billing" },
+  { key: "staff", label: "Staff Management", icon: "staff", soon: true,
+    note: "Staff Management is part of the plan and comes in a later step. Login accounts are managed under Settings → Users (Admin only)." },
+  { key: "records", label: "Medical Records", icon: "record", soon: true,
+    note: "Medical Records is part of the plan and comes in a later step. A patient's notes already live on their patient card — use Find Patient under Patient Management to read them." },
+  { key: "reports", label: "Reports & Analytics", icon: "chart", op: "reports" },
+  { key: "settings", label: "Settings", icon: "gear", view: "settings" },
+];
+
+const ICONS = {
+  home: '<path d="M3 11.5 12 3l9 8.5M5 10.5V21h14V10.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+  users: '<circle cx="9" cy="8" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M2.5 20c.8-3.2 3.4-5 6.5-5s5.7 1.8 6.5 5M16 8.5a3 3 0 1 0-2-5.2M17.5 15.5c2 .6 3.5 2 4 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  steth: '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v6M9 12h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  cal: '<rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 10h18M8 3v4M16 3v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  building: '<rect x="4" y="3" width="16" height="18" rx="1" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 7h2M14 7h2M8 11h2M14 11h2M8 15h2M14 15h2M10 21v-3h4v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  bed: '<path d="M3 18v-6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6M3 18h18M3 18v2m18-2v2M6 10V6h12v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="7.5" cy="8" r="1" fill="currentColor"/>',
+  clipboard: '<rect x="5" y="4" width="14" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 4.5V3h6v1.5M9 11h6M9 15h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  flask: '<path d="M9 3h6M10 3v5.5L4.5 18a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 8.5V3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M7.5 14h9" stroke="currentColor" stroke-width="2"/>',
+  pill: '<path d="M10.5 20.5 3 13a4.5 4.5 0 0 1 6.4-6.4l7.5 7.5a4.5 4.5 0 0 1-6.4 6.4zM14 7l3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="m8 12 2 2M11 9l2 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  bill: '<path d="M6 2h9l5 5v15H6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 2v6h6M9 12h6M9 16h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  staff: '<circle cx="12" cy="8" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 20c.8-3.2 3.4-5 7-5s6.2 1.8 7 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  record: '<path d="M6 2h9l5 5v15H6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 11v5M9.5 13.5h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  chart: '<path d="M4 20V10M10 20V4M16 20v-8M22 20H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  gear: '<circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+};
+function navIcon(name) {
+  return `<svg viewBox="0 0 24 24" class="nav-ic" aria-hidden="true">${ICONS[name] || ""}</svg>`;
+}
+
+function buildSideNav() {
+  const nav = document.getElementById("side-nav");
+  nav.innerHTML = NAV.map((item) => {
+    const soon = item.soon ? `<span class="soon-badge">Soon</span>` : "";
+    if (item.children) {
+      return `<div class="nav-group" data-nav="${item.key}">
+        <button type="button" class="nav-item" data-nav="${item.key}" data-group="${item.key}">
+          ${navIcon(item.icon)}<span class="nav-label">${item.label}</span>
+          <span class="nav-chev" aria-hidden="true">▾</span>
+        </button>
+        <div class="nav-children">
+          ${item.children.map((c) => `<button type="button" class="nav-sub" data-op="${c.op}" data-nav="${item.key}">${c.label}</button>`).join("")}
+        </div>
+      </div>`;
+    }
+    const attrs = item.op ? `data-op="${item.op}"` : item.view ? `data-view="${item.view}"` : `data-soon="${item.key}"`;
+    return `<button type="button" class="nav-item" data-nav="${item.key}" ${attrs}>
+      ${navIcon(item.icon)}<span class="nav-label">${item.label}</span>${soon}
+    </button>`;
+  }).join("");
+  nav.querySelectorAll("[data-op]").forEach((el) =>
+    el.addEventListener("click", () => openOp(el.dataset.op)));
+  nav.querySelectorAll("[data-view]").forEach((el) =>
+    el.addEventListener("click", () => showView(el.dataset.view)));
+  nav.querySelectorAll("[data-soon]").forEach((el) =>
+    el.addEventListener("click", () => openSoon(NAV.find((n) => n.key === el.dataset.soon))));
+  nav.querySelectorAll("[data-group]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const group = el.closest(".nav-group");
+      const wasOpen = group.classList.contains("open");
+      document.querySelectorAll("#side-nav .nav-group").forEach((g) => g.classList.remove("open"));
+      if (!wasOpen) {
+        group.classList.add("open");
+      } else {
+        /* Clicking the open group again opens its first child. */
+        const first = group.querySelector("[data-op]");
+        if (first) openOp(first.dataset.op);
+      }
+    }));
 }
 
 function msgHtml(text, ok = true) {
@@ -743,26 +890,350 @@ function renderShifts(msg = "", ok = true) {
   });
 }
 
-function renderDashboard() {
-  const s = (state && state.stats) ? state.stats : { patients: 0, doctors: 0, waiting: 0, free_beds: 0, total_beds: 10 };
-  const docs = state ? state.doctors : [];
-  const beds = state ? state.beds : [];
+/* ------------------------------------------------------------------ Step 7 dashboard */
+
+function fmtTime12(hhmm) {
+  if (!hhmm) return "—";
+  const [h, m] = hhmm.split(":").map(Number);
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${String(h12).padStart(2, "0")}:${String(m).padStart(2, "0")} ${ap}`;
+}
+
+function relTime(when) {
+  if (!when) return "";
+  if (when.length > 10) {
+    /* Full timestamp: "x min ago" / "x h ago" / date. */
+    const mins = Math.max(0, Math.round((Date.now() - new Date(when).getTime()) / 60000));
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins} min ago`;
+    if (mins < 60 * 24) return `${Math.round(mins / 60)} h ago`;
+    return when.slice(0, 10);
+  }
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  return when === today ? "Today" : when;
+}
+
+const CHART_COLORS = ["#1769AA", "#16a34a", "#f59e0b", "#7c3aed",
+  "#0ea5e9", "#ec4899", "#14b8a6", "#ef4444"];
+
+/* Monthly appointments as an inline SVG line chart — no external
+   library, so the page works offline on Waleed's laptop. */
+function lineChartSVG(series) {
+  const W = 640, H = 260, PL = 40, PR = 14, PT = 20, PB = 30;
+  const maxV = Math.max(10, ...series.map((s) => s.count));
+  const gridMax = Math.ceil(maxV / 50) * 50;
+  const xs = (i) => PL + (i * (W - PL - PR)) / (series.length - 1 || 1);
+  const ys = (v) => PT + (H - PT - PB) * (1 - v / gridMax);
+  const pts = series.map((s, i) => [xs(i), ys(s.count)]);
+  /* Smooth curve through the points (Catmull-Rom → Bézier). */
+  let d = `M ${pts[0][0]} ${pts[0][1]}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    d += ` C ${p1[0] + (p2[0] - p0[0]) / 6} ${p1[1] + (p2[1] - p0[1]) / 6}, ${p2[0] - (p3[0] - p1[0]) / 6} ${p2[1] - (p3[1] - p1[1]) / 6}, ${p2[0]} ${p2[1]}`;
+  }
+  const area = `${d} L ${pts[pts.length - 1][0]} ${H - PB} L ${pts[0][0]} ${H - PB} Z`;
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => {
+    const v = Math.round(gridMax * f);
+    const y = ys(v);
+    return `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e2e8f0" stroke-width="1"/>
+      <text x="${PL - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="#64748b">${v}</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart-svg" role="img" aria-label="Monthly appointments chart">
+    <defs><linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1769AA" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#1769AA" stop-opacity="0.02"/>
+    </linearGradient></defs>
+    ${grid}
+    <path d="${area}" fill="url(#chartFill)"/>
+    <path d="${d}" fill="none" stroke="#1769AA" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+    ${pts.map(([x, y], i) => `<circle class="chart-dot" data-i="${i}" cx="${x}" cy="${y}" r="4.5" fill="#fff" stroke="#1769AA" stroke-width="2.5"/>`).join("")}
+    ${series.map((s, i) => `<text x="${xs(i)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="#64748b">${esc(s.label)}</text>`).join("")}
+  </svg>`;
+}
+
+/* Department split as an inline SVG donut (stroke-dasharray arcs). */
+function donutSVG(depts) {
+  const total = depts.reduce((s, x) => s + x.count, 0);
+  if (!total) return "";
+  const R = 70, C = 2 * Math.PI * R;
+  let off = 0;
+  const arcs = depts.map((x, i) => {
+    const len = (x.count / total) * C;
+    const el = `<circle cx="90" cy="90" r="${R}" fill="none" stroke="${CHART_COLORS[i % CHART_COLORS.length]}" stroke-width="34" stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-off}" transform="rotate(-90 90 90)"/>`;
+    off += len;
+    return el;
+  }).join("");
+  const top = depts[0];
+  return `<svg viewBox="0 0 180 180" class="donut-svg" role="img" aria-label="Department statistics donut">
+    ${arcs}
+    <text x="90" y="86" text-anchor="middle" font-size="22" font-weight="800" fill="#172033">${top.percent}%</text>
+    <text x="90" y="106" text-anchor="middle" font-size="12" fill="#475569">${esc(top.name)}</text>
+  </svg>`;
+}
+
+function dashStatCard(key, icon, value, label, sub, op) {
+  return `<div class="dash-stat dash-stat-${key}" data-stat="${key}" data-op="${op || ""}" role="button" tabindex="0" title="${esc(label)} kholo">
+    <div class="dash-stat-ic">${icon}</div>
+    <div class="dash-stat-num">${value}</div>
+    <div class="dash-stat-label">${esc(label)}</div>
+    <div class="dash-stat-sub">${esc(sub)}</div>
+  </div>`;
+}
+
+function renderDashboardView() {
+  const view = document.getElementById("dashboard-view");
+  const d = dashData;
+  if (!d) {
+    view.innerHTML = `<p class="hint">Loading…</p>`;
+    return;
+  }
+  const series = chartMode === "last12" ? d.monthly_last12 : d.monthly_year;
+  const todayPending = d.todays_list.filter((a) => a.status === "Pending").length;
+  const deptCount = new Set((state ? state.doctors : []).map((x) => x.spec)).size;
+  const user = currentUser ? currentUser.username : "Admin";
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("en-GB", { weekday: "long", day: "2-digit", month: "short", year: "numeric" });
+  const timeStr = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+  view.innerHTML = `
+    <div class="dash-head">
+      <div>
+        <h1>Dashboard</h1>
+        <p>Welcome back, ${esc(user)}! Here's what's happening at City Care Hospital today.</p>
+      </div>
+      <div class="dash-chips">
+        <span class="chip">${esc(dateStr)}</span>
+        <span class="chip chip-blue"><span id="dash-clock">${esc(timeStr)}</span></span>
+      </div>
+    </div>
+
+    <div class="dash-stats">
+      ${dashStatCard("patients", navIcon("users"), d.total_patients, "Total Patients", "Registered in the hospital", "view-sorted")}
+      ${dashStatCard("doctors", navIcon("steth"), d.total_doctors, "Total Doctors", `${deptCount} department${deptCount === 1 ? "" : "s"}`, "doctors")}
+      ${dashStatCard("appointments", navIcon("cal"), d.todays_appointments, "Today's Appointments", `${todayPending} pending today`, "schedule")}
+      ${dashStatCard("beds", navIcon("bed"), d.available_beds, "Available Beds", `of ${d.total_beds} beds`, "beds")}
+      ${dashStatCard("revenue", navIcon("money"), `Rs. ${d.total_revenue.toLocaleString("en-PK")}`, "Total Revenue", "Paid bills, all time", "billing")}
+      ${dashStatCard("pending", navIcon("bill"), d.pending_bills, "Pending Bills", `Rs. ${d.pending_bills_total.toLocaleString("en-PK")} owed`, "billing")}
+    </div>
+
+    <div class="dash-grid">
+      <div class="dash-card">
+        <div class="dash-card-head">
+          <h3>Monthly Appointments Overview</h3>
+          <select id="chart-mode" aria-label="Chart range">
+            <option value="year" ${chartMode === "year" ? "selected" : ""}>This Year</option>
+            <option value="last12" ${chartMode === "last12" ? "selected" : ""}>Last 12 Months</option>
+          </select>
+        </div>
+        <div class="chart-wrap" id="chart-wrap">
+          ${lineChartSVG(series)}
+          <div id="chart-tip" class="chart-tip hidden"></div>
+        </div>
+      </div>
+
+      <div class="dash-card">
+        <div class="dash-card-head">
+          <h3>Today's Appointments</h3>
+          <button type="button" class="link-btn" id="today-view-all">View All →</button>
+        </div>
+        ${d.todays_list.length ? `<table class="tbl"><thead><tr>
+            <th>Time</th><th>Patient Name</th><th>Doctor</th><th>Department</th><th>Status</th>
+          </tr></thead><tbody>
+          ${d.todays_list.map((a) => `<tr>
+            <td>${a.appt_time ? esc(fmtTime12(a.appt_time)) : "—"}</td>
+            <td>${esc(a.patient_name)}</td>
+            <td>${esc(a.doctor_name)}</td>
+            <td>${esc(a.department || "—")}</td>
+            <td><span class="tag ${statusTagClass(a.status || "Pending")}">${esc(a.status || "Pending")}</span></td>
+          </tr>`).join("")}</tbody></table>`
+          : `<p class="muted">No appointments today yet.</p>`}
+      </div>
+    </div>
+
+    <div class="dash-grid-3">
+      <div class="dash-card">
+        <div class="dash-card-head"><h3>Department Statistics</h3></div>
+        ${d.departments.length ? `<div class="donut-wrap">${donutSVG(d.departments)}
+          <ul class="donut-legend">
+            ${d.departments.map((x, i) => `<li><span class="dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>${esc(x.name)}<b>${x.percent}%</b></li>`).join("")}
+          </ul></div>`
+          : `<p class="muted">No appointments yet — the split appears once appointments are booked.</p>`}
+      </div>
+
+      <div class="dash-card">
+        <div class="dash-card-head">
+          <h3>Recent Activities</h3>
+          <button type="button" class="link-btn" id="activities-view-all">View All →</button>
+        </div>
+        ${d.activities.length ? `<ul class="activity-list">
+          ${d.activities.map((a) => `<li><span class="act-dot act-${a.kind}"></span>
+            <span class="act-text">${esc(a.text)}</span>
+            <span class="act-when">${esc(relTime(a.when))}</span></li>`).join("")}
+        </ul>` : `<p class="muted">No activity yet.</p>`}
+      </div>
+
+      <div class="dash-col">
+        <div class="dash-card">
+          <div class="dash-card-head"><h3>Quick Actions</h3></div>
+          <div class="quick-grid">
+            <button type="button" class="quick-btn" data-op="book-appointment">${navIcon("cal")}<span>Book Appointment</span></button>
+            <button type="button" class="quick-btn" data-op="add-patient">${navIcon("users")}<span>Add Patient</span></button>
+            <button type="button" class="quick-btn" data-op="doctors">${navIcon("steth")}<span>Add Doctor</span></button>
+            <button type="button" class="quick-btn" data-op="billing">${navIcon("bill")}<span>Generate Bill</span></button>
+            <button type="button" class="quick-btn" data-op="reports">${navIcon("chart")}<span>View Reports</span></button>
+            <button type="button" class="quick-btn" data-op="beds">${navIcon("bed")}<span>Manage Beds</span></button>
+          </div>
+        </div>
+        <div class="promo-card">
+          <div class="promo-cross" aria-hidden="true">✚</div>
+          <div class="promo-text"><b>Your Health<br>Our Priority</b></div>
+          <button type="button" class="promo-btn" id="promo-learn">Learn More →</button>
+        </div>
+      </div>
+    </div>`;
+
+  /* Stat cards are shortcuts, not decoration. */
+  view.querySelectorAll(".dash-stat[data-op]").forEach((c) => {
+    const go = () => { const op = c.dataset.op; if (op && canUse(op)) openOp(op); };
+    c.addEventListener("click", go);
+    c.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+    });
+  });
+  document.getElementById("chart-mode").addEventListener("change", (e) => {
+    chartMode = e.target.value;
+    renderDashboardView();
+  });
+  /* Chart dots: hover shows the real count for that month. */
+  const tip = document.getElementById("chart-tip");
+  view.querySelectorAll(".chart-dot").forEach((dot) => {
+    dot.addEventListener("mouseenter", () => {
+      const s = series[Number(dot.dataset.i)];
+      tip.textContent = `${s.count} Appointments — ${s.label}`;
+      tip.style.left = `${(Number(dot.getAttribute("cx")) / 640) * 100}%`;
+      tip.style.top = `${(Number(dot.getAttribute("cy")) / 260) * 100}%`;
+      tip.classList.remove("hidden");
+    });
+    dot.addEventListener("mouseleave", () => tip.classList.add("hidden"));
+  });
+  document.getElementById("today-view-all").addEventListener("click", () => openOp("schedule"));
+  document.getElementById("activities-view-all").addEventListener("click", renderActivitiesView);
+  document.getElementById("promo-learn").addEventListener("click", renderSettings);
+  view.querySelectorAll(".quick-btn[data-op]").forEach((b) => {
+    b.addEventListener("click", () => { if (canUse(b.dataset.op)) openOp(b.dataset.op); });
+  });
+  renderBell();
+}
+
+async function showDashboard() {
+  currentOp = "dashboard";
+  currentView = "dashboard";
+  setActiveNav("dashboard");
+  showDashboardSection();
+  const view = document.getElementById("dashboard-view");
+  const res = await api("/api/dashboard");
+  if (res && res._status === 401) {
+    try { localStorage.removeItem("hms_token"); } catch (e) {}
+    try { document.cookie = "hms_session=; path=/; max-age=0"; } catch (e) {}
+    window.location.replace("/login.html?logout=1");
+    return;
+  }
+  if (res && res.ok) {
+    dashData = res.stats;
+    renderDashboardView();
+  } else {
+    view.innerHTML = `${offlineBanner()}<p class="muted">Dashboard data could not load — ${esc(errOf(res))}</p>`;
+  }
+}
+
+function updateClockChips() {
+  const el = document.getElementById("dash-clock");
+  if (el) el.textContent = new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+}
+
+/* ---------------- Step 7: Departments / Settings / Soon / Activities */
+
+function renderDepartments() {
+  currentOp = "departments";
+  currentView = "module";
+  showModuleView();
+  setModuleHead("Departments", "Departments come from doctor specializations");
+  setActiveNav("departments");
+  const specs = {};
+  (state ? state.doctors : []).forEach((doc) => {
+    const s = specs[doc.spec] || (specs[doc.spec] = { doctors: 0, waiting: 0 });
+    s.doctors += 1;
+    s.waiting += doc.queue.length;
+  });
+  const names = Object.keys(specs).sort();
+  const totalAppts = names.reduce((n, k) => n + specs[k].waiting, 0);
   body.innerHTML = `
     ${state ? "" : offlineBanner()}
-    <div class="stats" style="grid-template-columns: repeat(2, 1fr); margin-bottom: 14px">
-      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Patients</span><span class="stat-num">${s.patients ?? 0}</span></div></div>
-      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Doctors</span><span class="stat-num">${s.doctors ?? 0}</span></div></div>
-      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Waiting</span><span class="stat-num">${s.waiting ?? 0}</span></div></div>
-      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Free Beds</span><span class="stat-num">${s.free_beds ?? 0}/${s.total_beds ?? 10}</span></div></div>
-      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Billed Today</span><span class="stat-num">Rs ${s.billed_today ?? 0}</span></div></div>
-      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Collected Today</span><span class="stat-num">Rs ${s.collected_today ?? 0}</span></div></div>
+    ${names.length ? `<table class="tbl"><thead><tr>
+        <th>Department</th><th>Doctors</th><th>Appointments Waiting</th><th>Share</th>
+      </tr></thead><tbody>
+      ${names.map((k) => `<tr><td>${esc(k)}</td><td>${specs[k].doctors}</td>
+        <td>${specs[k].waiting}</td>
+        <td>${totalAppts ? Math.round((100 * specs[k].waiting) / totalAppts) : 0}%</td></tr>`).join("")}
+    </tbody></table>` : `<p class="muted">No doctors yet — add a doctor first and their specialization becomes a department.</p>`}
+    <p class="muted" style="margin-top:12px">A separate Departments module (with its own list to choose from when booking) is a later step — for now, an appointment's department is its doctor's specialization.</p>`;
+}
+
+function renderSettings() {
+  currentOp = "settings";
+  currentView = "module";
+  showModuleView();
+  setModuleHead("Settings", "Hospital, appearance and account");
+  setActiveNav("settings");
+  const isAdmin = currentUser && currentUser.role === "Admin";
+  body.innerHTML = `
+    <div class="card"><h3>City Care Hospital</h3>
+      <p>Management System — Version 1.0.0</p>
+      <p class="muted">Patients: <b>${state ? state.patients.length : 0}</b> • Doctors: <b>${state ? state.doctors.length : 0}</b> • Data is stored in hospital.db on this computer.</p>
     </div>
-    <h3 style="margin:6px 0 8px">Doctor queues</h3>
-    ${docs.map((d) => `<p><b>${esc(d.name)}</b> <span class="muted">(${esc(d.spec || "—")})</span> — waiting <b>${d.waiting ?? 0}</b></p>`).join("") || `<p class="muted">No doctors.</p>`}
-    <h3 style="margin:14px 0 8px">Beds</h3>
-    <div class="beds-grid">
-      ${beds.map((b) => `<div class="bed ${b.status === "Free" ? "free" : "occ"}">Bed ${b.bed}<small>${b.status === "Free" ? "Free" : "Patient " + b.patient_id}</small></div>`).join("")}
+    <div class="card"><h3>Appearance</h3>
+      <div class="btn-row"><button type="button" id="set-theme" class="btn btn-primary">Switch to Dark Mode</button></div>
+    </div>
+    <div class="card"><h3>Account — ${esc(currentUser ? currentUser.username : "—")} (${esc(currentUser ? currentUser.role : "—")})</h3>
+      <div class="btn-row">
+        <button type="button" id="set-pw" class="btn btn-ghost">Change Password</button>
+        ${isAdmin ? `<button type="button" id="set-users" class="btn btn-ghost">Manage Users</button>` : ""}
+      </div>
     </div>`;
+  document.getElementById("set-theme").addEventListener("click", () =>
+    applyTheme(!document.body.classList.contains("dark")));
+  document.getElementById("set-pw").addEventListener("click", () => openOp("change-password"));
+  const usersBtn = document.getElementById("set-users");
+  if (usersBtn) usersBtn.addEventListener("click", () => openOp("users"));
+}
+
+function openSoon(item) {
+  currentOp = "soon";
+  currentView = "module";
+  showModuleView();
+  setModuleHead(item.label, "Coming in a later step");
+  setActiveNav(item.key);
+  body.innerHTML = `
+    <div class="card"><h3>${esc(item.label)}</h3><p>${esc(item.note || "This module is part of the plan and comes in a later step.")}</p></div>
+    <div class="btn-row"><button type="button" id="soon-back" class="btn btn-primary">Back to Dashboard</button></div>`;
+  document.getElementById("soon-back").addEventListener("click", showDashboard);
+}
+
+function renderActivitiesView() {
+  currentOp = "activities";
+  currentView = "module";
+  showModuleView();
+  setModuleHead("Recent Activities", "Latest status changes, registrations, bills and bookings");
+  setActiveNav("dashboard");
+  const acts = dashData ? dashData.activities : [];
+  body.innerHTML = `
+    ${acts.length ? `<ul class="activity-list">
+      ${acts.map((a) => `<li><span class="act-dot act-${a.kind}"></span>
+        <span class="act-text">${esc(a.text)}</span>
+        <span class="act-when">${esc(a.when && a.when.length > 10 ? a.when : relTime(a.when))}</span></li>`).join("")}
+    </ul>` : `<p class="muted">No activity yet.</p>`}
+    <p class="muted">The feed shows the latest 8 events: appointment status changes (with who and when), patient registrations, bills and bookings — all from the live data.</p>`;
 }
 
 function describeUndo(last) {
@@ -796,7 +1267,108 @@ async function doUndo() {
   await loadState();
   toast(res.ok ? res.message : errOf(res), !res.ok);
   if (currentOp === "undo") renderUndo(res.ok ? res.message : errOf(res), res.ok);
-  else openOp(currentOp);
+  else if (currentView === "dashboard") showDashboard();
+  else if (OPS[currentOp]) openOp(currentOp);
+  else showDashboard();
+}
+
+/* ------------------------------------------------------------------ Step 7: top search, bell, profile */
+
+function showSearchPatient(pid) {
+  const p = (state ? state.patients : []).find((x) => x.id === pid);
+  currentOp = "find-patient";
+  currentView = "module";
+  showModuleView();
+  setModuleHead("Search Result", "Patient found by search");
+  setActiveNav("patients");
+  if (!p) {
+    body.innerHTML = `<div class="msg msg-err">Patient not found.</div>`;
+    return;
+  }
+  body.innerHTML = patientCard(p);
+  wirePatientCard(body, p);
+}
+
+function runSearch(q) {
+  const box = document.getElementById("search-results");
+  const input = document.getElementById("global-search");
+  if (!q) { box.classList.add("hidden"); return; }
+  const ql = q.toLowerCase();
+  const patients = (state ? state.patients : []).filter((p) =>
+    p.name.toLowerCase().includes(ql) || String(p.id) === q).slice(0, 5);
+  const doctors = (state ? state.doctors : []).filter((d) =>
+    d.name.toLowerCase().includes(ql) || d.id.toLowerCase() === ql ||
+    (d.spec || "").toLowerCase().includes(ql)).slice(0, 3);
+  const appts = [];
+  (state ? state.doctors : []).forEach((d) => d.queue.forEach((a) => {
+    if (a.token.toLowerCase() === ql || a.patient_name.toLowerCase().includes(ql)) {
+      appts.push({ ...a, doctor_id: d.id, doctor_name: d.name, department: d.spec });
+    }
+  }));
+  const found = appts.slice(0, 5);
+  if (!patients.length && !doctors.length && !found.length) {
+    box.innerHTML = `<div class="search-empty">No matches for “${esc(q)}”.</div>`;
+  } else {
+    box.innerHTML = `
+      ${patients.length ? `<div class="search-sec">Patients</div>` + patients.map((p) =>
+        `<button type="button" class="search-row" data-kind="patient" data-id="${p.id}">${esc(p.name)} <span class="muted">#${p.id} • ${esc(p.problem)}</span></button>`).join("") : ""}
+      ${doctors.length ? `<div class="search-sec">Doctors</div>` + doctors.map((d) =>
+        `<button type="button" class="search-row" data-kind="doctor" data-id="${esc(d.id)}">${esc(d.name)} <span class="muted">${esc(d.spec || "—")} • Rs ${d.fee ?? "—"}</span></button>`).join("") : ""}
+      ${found.length ? `<div class="search-sec">Appointments</div>` + found.map((a) =>
+        `<button type="button" class="search-row" data-kind="appt" data-doc="${esc(a.doctor_id || "")}" data-token="${esc(a.token)}" data-date="${esc(a.appt_date || "")}">${esc(a.token)} • ${esc(a.patient_name)} <span class="muted">${esc(a.doctor_name)}${a.appt_date ? " • " + esc(a.appt_date) : ""}</span></button>`).join("") : ""}`;
+  }
+  box.classList.remove("hidden");
+  box.querySelectorAll(".search-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      box.classList.add("hidden");
+      input.value = "";
+      if (row.dataset.kind === "patient") showSearchPatient(Number(row.dataset.id));
+      else if (row.dataset.kind === "doctor") openOp("doctors");
+      else {
+        openOp("schedule");
+        if (row.dataset.date) renderSchedule(row.dataset.date, row.dataset.doc || null);
+      }
+    });
+  });
+}
+
+function renderBell() {
+  const badge = document.getElementById("bell-badge");
+  if (!badge) return;
+  const n = dashData ? dashData.notification_count : 0;
+  badge.textContent = n;
+  badge.classList.toggle("hidden", !n);
+}
+
+function toggleBellPanel() {
+  const panel = document.getElementById("bell-panel");
+  const wasHidden = panel.classList.contains("hidden");
+  document.getElementById("profile-menu").classList.add("hidden");
+  if (!wasHidden) { panel.classList.add("hidden"); return; }
+  const items = dashData ? dashData.pending_items : { appointments: [], bills: [] };
+  const n = dashData ? dashData.notification_count : 0;
+  panel.innerHTML = n === 0
+    ? `<div class="pop-head">Notifications</div><p class="muted" style="padding:4px 14px 14px">All caught up — no pending appointments or unpaid bills.</p>`
+    : `<div class="pop-head">Notifications (${n})</div>
+      ${items.appointments.map((a) => `<button type="button" class="pop-row" data-bell-appt="${esc(a.appt_date || "")}" data-bell-doc="${esc(a.doctor_id)}"><b>${esc(a.token)}</b> ${esc(a.patient_name)}<span class="muted">${esc(a.doctor_name)}${a.appt_date ? " • " + esc(a.appt_date) + (a.appt_time ? " " + esc(a.appt_time) : "") : ""}</span></button>`).join("")}
+      ${items.bills.map((b) => `<button type="button" class="pop-row" data-bell-bill="${b.id}"><b>Bill #${b.id}</b> ${esc(b.patient_name)}<span class="muted">Rs ${b.total} unpaid</span></button>`).join("")}`;
+  panel.classList.remove("hidden");
+  panel.querySelectorAll("[data-bell-appt]").forEach((row) => row.addEventListener("click", () => {
+    panel.classList.add("hidden");
+    openOp("schedule");
+    if (row.dataset.bellAppt) renderSchedule(row.dataset.bellAppt, row.dataset.bellDoc || null);
+  }));
+  panel.querySelectorAll("[data-bell-bill]").forEach((row) => row.addEventListener("click", () => {
+    panel.classList.add("hidden");
+    openOp("billing");
+  }));
+}
+
+async function doLogout() {
+  await api("/api/logout", "POST", {});
+  try { localStorage.removeItem("hms_token"); } catch (e) {}
+  try { document.cookie = "hms_session=; path=/; max-age=0"; } catch (e) {}
+  window.location.replace("/login.html?logout=1");
 }
 
 /* ------------------------------------------------------------------ users */
@@ -1094,53 +1666,78 @@ async function renderSchedule(date, doctorId) {
 
 /* ------------------------------------------------------------------ boot */
 
-document.querySelectorAll(".tile").forEach((t) =>
-  t.addEventListener("click", () => openOp(t.dataset.op)));
+buildSideNav();
 
-/* Top stat cards are shortcuts, not decoration: click opens the
-   matching view (Patients -> list, Doctors -> doctors, Waiting ->
-   doctor queues, Free Beds -> beds). */
-const STAT_OPS = {
-  "patients": "view-sorted",
-  "doctors": "doctors",
-  "waiting": "doctors",
-  "beds": "beds",
-};
-document.querySelectorAll(".stat-card[data-stat]").forEach((c) => {
-  const go = () => openOp(STAT_OPS[c.dataset.stat] || "dashboard");
-  c.addEventListener("click", go);
-  c.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
-  });
+document.getElementById("nav-toggle").addEventListener("click", () => {
+  if (window.matchMedia("(max-width: 980px)").matches) {
+    document.body.classList.toggle("sidebar-open");
+    document.getElementById("side-backdrop").classList.toggle(
+      "hidden", !document.body.classList.contains("sidebar-open"));
+  } else {
+    document.body.classList.toggle("sidebar-collapsed");
+  }
+});
+document.getElementById("side-backdrop").addEventListener("click", () => {
+  document.body.classList.remove("sidebar-open");
+  document.getElementById("side-backdrop").classList.add("hidden");
 });
 
-document.getElementById("top-undo").addEventListener("click", doUndo);
-
-document.getElementById("top-logout").addEventListener("click", async () => {
-  await api("/api/logout", "POST", {});
-  try { localStorage.removeItem("hms_token"); } catch(e){}
-  try { document.cookie = "hms_session=; path=/; max-age=0"; } catch(e){}
-  window.location.replace("/login.html?logout=1");
+/* Top search: patients by name/ID, doctors by name/ID/specialty,
+   appointments by token or patient name — all from the live state. */
+const searchInput = document.getElementById("global-search");
+let searchTimer = null;
+searchInput.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => runSearch(searchInput.value.trim()), 200);
+});
+searchInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { clearTimeout(searchTimer); runSearch(searchInput.value.trim()); }
+  if (e.key === "Escape") { document.getElementById("search-results").classList.add("hidden"); searchInput.blur(); }
+});
+searchInput.addEventListener("blur", () => setTimeout(() =>
+  document.getElementById("search-results").classList.add("hidden"), 200));
+searchInput.addEventListener("focus", () => {
+  if (searchInput.value.trim()) runSearch(searchInput.value.trim());
 });
 
-document.getElementById("top-change-pw").addEventListener("click", () =>
-  openOp("change-password"));
+/* Bell + profile panels; a click anywhere else closes them. */
+document.getElementById("bell-btn").addEventListener("click", (e) => { e.stopPropagation(); toggleBellPanel(); });
+document.getElementById("profile-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  document.getElementById("bell-panel").classList.add("hidden");
+  document.getElementById("profile-menu").classList.toggle("hidden");
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".bell-wrap")) document.getElementById("bell-panel").classList.add("hidden");
+  if (!e.target.closest(".profile-wrap")) document.getElementById("profile-menu").classList.add("hidden");
+});
+document.getElementById("menu-change-pw").addEventListener("click", () => {
+  document.getElementById("profile-menu").classList.add("hidden");
+  openOp("change-password");
+});
+document.getElementById("menu-theme").addEventListener("click", () =>
+  applyTheme(!document.body.classList.contains("dark")));
+document.getElementById("menu-undo").addEventListener("click", () => {
+  document.getElementById("profile-menu").classList.add("hidden");
+  doUndo();
+});
+document.getElementById("menu-logout").addEventListener("click", doLogout);
 
-const themeBtn = document.getElementById("theme-toggle");
 function applyTheme(dark) {
   document.body.classList.toggle("dark", dark);
-  document.getElementById("theme-icon-moon").classList.toggle("hidden", dark);
-  document.getElementById("theme-icon-sun").classList.toggle("hidden", !dark);
-  document.getElementById("theme-label").textContent = dark ? "Light Mode" : "Dark Mode";
+  const btn = document.getElementById("menu-theme");
+  if (btn) btn.textContent = dark ? "Light Mode" : "Dark Mode";
+  const setBtn = document.getElementById("set-theme");
+  if (setBtn) setBtn.textContent = dark ? "Switch to Light Mode" : "Switch to Dark Mode";
   try { localStorage.setItem("hms-theme", dark ? "dark" : "light"); } catch (e) { /* ignore */ }
 }
-themeBtn.addEventListener("click", () =>
-  applyTheme(!document.body.classList.contains("dark")));
 try {
   applyTheme(localStorage.getItem("hms-theme") === "dark");
 } catch (e) { applyTheme(false); }
 
+setInterval(updateClockChips, 30000);
+
 loadMe().then((ok) => {
   if (!ok) return; // loadMe already sent us to the login page.
-  loadState().then(() => openOp("dashboard"));
+  loadState().then(() => showDashboard());
 });

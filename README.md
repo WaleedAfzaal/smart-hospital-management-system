@@ -16,7 +16,7 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Undo**: One-click undo for the last action (add patient, add note, book appointment, bed assign/free), powered by an undo stack.
 - **Pharmacy Queue**: FIFO token queue — add a token, serve the next one, or view the line.
 - **Shift Rotation**: Doctors rotate on duty through a circular queue.
-- **Dashboard**: Live counts — patients, doctors, waiting appointments, free beds.
+- **Dashboard**: City Care Hospital dashboard — 6 live stat cards (patients, doctors, today's appointments, free beds, total revenue, pending bills), monthly appointments chart, today's appointments with statuses, department donut, recent activities, working search, notification bell, quick actions. Every number is real data from `hospital.db`.
 - **SQLite Persistence**: All data is saved to `hospital.db` (created automatically) on every change — patients, notes, doctors, appointments, beds, pharmacy queue and shifts all survive a restart. The CLI and the web dashboard share the same database file. Delete `hospital.db` to start fresh.
 - **Login & Roles**: Every user logs in with a username, password and role — Admin, Doctor or Receptionist — and can only do what their role allows (see [Login & Roles](#login--roles) below). Passwords are stored as salted hashes, never as plain text.
 - **Billing**: Create a bill from a booked appointment — the consultation fee is the first line item — then add extra charges (medicine, bed charges, lab...). Mark bills Paid / Unpaid. A token is billed only once, and totals are always the sum of the line items.
@@ -31,7 +31,7 @@ Both the CLI (`python hospital.py`) and the web dashboard ask you to log in firs
 | -------- | -------- |
 | `admin`  | `admin123` |
 
-**Change this password after your first login** — in the CLI choose menu option **14. Change My Password**, or in the dashboard click **Change Password** at the top. An Admin can also reset any user's password from the **Users** tile.
+**Change this password after your first login** — in the CLI choose menu option **14. Change My Password**, or in the dashboard click your profile (top right) → **Change Password**. An Admin can also reset any user's password from **Settings → Manage Users**.
 
 ### Roles — what each role can do
 
@@ -59,7 +59,7 @@ A Doctor account can be **linked to one doctor** (e.g. `D1`) — then the dashbo
 ### Adding users (Admin only)
 
 - **CLI:** log in as Admin → menu option **13. Users (Admin)** → *Add user* — enter a username, password, role, and (for a Doctor) the linked doctor ID.
-- **Dashboard:** log in as Admin → **Users** tile → fill in the *Add User* form.
+- **Dashboard:** log in as Admin → **Settings → Manage Users** → fill in the *Add User* form.
 
 Users are stored in the same `hospital.db` file, so they survive a restart. Sessions last 12 hours; closing the browser tab does not log you out, but restarting the server does (log in again).
 
@@ -76,9 +76,9 @@ the line items — no tax, no discount, nothing hidden.
 - **CLI:** log in → menu option **15. Billing** (create bill, add
   charge, view/list bills, mark paid/unpaid, export `bills.csv`) and
   **16. Reports** (daily report for today or any date you type).
-- **Dashboard:** **Billing** tile (create-bill form, bills table, bill
+- **Dashboard:** **Billing & Payments** in the sidebar (create-bill form, bills table, bill
   detail with items + add-charge + pay/unpay, Download CSV button)
-  and **Reports** tile (date picker, patients / appointments / billed
+  and **Reports & Analytics** in the sidebar (date picker, patients / appointments / billed
   / collected / unpaid / beds cards, appointments per doctor). The
   dashboard itself also shows **Billed Today** and **Collected Today**.
 
@@ -104,7 +104,7 @@ order never changes.
   shows one day's appointments (today by default, or any date you
   type) for one doctor or all of them, sorted by time.
 - **Dashboard:** the **Book Appointment** form has Date and Time
-  fields (date defaults to today); the **Schedule** tile has a date
+  fields (date defaults to today); the **Schedule** view (Appointments in the sidebar) has a date
   picker and a doctor filter and lists that day's appointments. Doctor
   queues also show each token's scheduled date/time.
 
@@ -136,7 +136,7 @@ confirmation dialog.
 - **CLI:** menu option **3. Find Patient** now asks *By ID* or *By
   Name*; menu option **18. Edit Patient** (leave a field blank to keep
   it) and **19. Delete Patient** (Admin only, type `YES` to confirm).
-- **Dashboard:** the **Find Patient** tile has a *Search by Name* form
+- **Dashboard:** the **Find Patient** view (Patient Management in the sidebar) has a *Search by Name* form
   (results as a list of patient cards), and every patient card has
   **Edit** (Admin/Receptionist) and **Delete** (Admin only) buttons.
 

@@ -70,10 +70,11 @@ doctor also joins the shift rotation.
   role may use, and every choice is permission-checked again.
 - **Web:** `web/login.html` is the login page (served instead of the
   dashboard when there is no session); `app.js` calls `/api/me` on
-  boot, hides tiles the role cannot use, and redirects to the login
-  page on any 401. Admin gets a **Users** tile (list users, add user,
-  reset password) and every role gets **Change Password** in the
-  header. The "Add Doctor" form is hidden for non-Admins.
+  boot, hides sidebar entries the role cannot use, and redirects to
+  the login page on any 401. Admin gets **Settings → Manage Users**
+  (list users, add user, reset password) and every role gets
+  **Change Password** in the profile menu. The "Add Doctor" form is
+  hidden for non-Admins.
 - Tests: `tests/test_auth.py` (hashing, permissions table, default
   admin, restart persistence, password change/reset) and
   `tests/test_server.py::TestServerAuth` (401 without login, 403 per
@@ -113,10 +114,10 @@ doctor also joins the shift rotation.
 - **CLI:** menu **15. Billing** (create bill, add charge, view/list
   bills, mark paid/unpaid, export `bills.csv`) and **16. Reports**
   (daily report for today or any date you type).
-- **Web:** **Billing** tile (create-bill form, bills table, bill
+- **Web:** **Billing & Payments** in the sidebar (create-bill form, bills table, bill
   detail with items + add-charge + pay/unpay, Download CSV link) and
-  **Reports** tile (date picker + stat cards + per-doctor table). The
-  dashboard also shows Billed Today / Collected Today cards.
+  **Reports & Analytics** in the sidebar (date picker + stat cards + per-doctor table). The
+  dashboard shows Total Revenue (Paid bills) and Pending Bills cards.
 - Tests: `tests/test_billing.py` (bill creation, duplicate-token guard,
   charges, totals, paid/unpaid, report numbers, CSV contents,
   restart persistence, old-database migration) and
@@ -156,7 +157,7 @@ doctor also joins the shift rotation.
 - **CLI:** booking (menu **6**) asks for date and time; menu
   **17. Schedule** shows one day's appointments (today by default)
   for one doctor or all. **Web:** the booking form has Date (defaults
-  to today) and Time fields; the **Schedule** tile has a date picker
+  to today) and Time fields; the **Schedule** view has a date picker
   and doctor filter; doctor queues show each token's scheduled
   date/time.
 - **Permissions:** booking uses the existing `book_appointment` rule
@@ -202,7 +203,7 @@ doctor also joins the shift rotation.
 - **CLI:** menu **3. Find Patient** now asks *By ID* or *By Name*; menu
   **18. Edit Patient** (blank keeps the current value) and **19. Delete
   Patient** (shows what will go away and only deletes on a typed `YES`).
-  **Web:** the Find Patient tile has a *Search by Name* form (results as
+  **Web:** the Find Patient view has a *Search by Name* form (results as
   patient cards), and each card has Edit (Admin/Receptionist) and Delete
   (Admin only) buttons — Delete asks with a `confirm()` dialog first.
 - Tests: `tests/test_patients.py` (search partial/case-insensitive/no
@@ -294,6 +295,49 @@ doctor also joins the shift rotation.
   instead of D1, because the guard now refuses it on D1 (the test's
   point — same time, Emergency first — is unchanged).
 
+## New Dashboard — Step 7 (`hospital.py` + `status_history.py` + `server.py` + `web/`)
+
+- **Layout (from Waleed's design image):** dark navy left sidebar
+  (City Care Hospital, menu with submenus, promo box, Version 1.0.0),
+  white top bar (search, notification bell with badge, Admin profile
+  menu), 6 stat cards, Monthly Appointments Overview line chart,
+  Today's Appointments table, Department Statistics donut, Recent
+  Activities timeline, Quick Actions, "Your Health Our Priority"
+  promo card. Colours: Primary Blue #1769AA, background #F1F5F9,
+  text Dark Navy #172033. Responsive (sidebar collapses / becomes an
+  overlay on small screens). Dark mode kept.
+- **Real data only:** `Hospital.dashboard_data()` aggregates everything
+  from live data — counts, money (Total Revenue = Paid bills only),
+  the monthly series (this year + rolling last 12 months, counted by
+  scheduled month, falling back to booking month), the department
+  split (appointments per doctor specialization), today's list with
+  real Step 6 statuses, the activity feed (latest status changes with
+  timestamps, registrations, bills, bookings) and the notification
+  count (pending appointments + unpaid bills). An empty hospital shows
+  honest zeros. No number from the design image is hardcoded.
+- **Search:** the top bar searches patients (name/ID), doctors
+  (name/ID/specialty) and appointments (token/patient name) from the
+  live state; a click opens the patient card, the doctors view, or
+  the schedule for that appointment's date.
+- **Bell:** badge = pending appointments + unpaid bills; the panel
+  lists them (click opens the schedule day or the billing view).
+- **Sidebar:** every existing module stays reachable (patients,
+  doctors + shifts, appointments, beds, pharmacy, billing, reports,
+  users under Settings). Departments is a real view (specializations
+  with doctor/appointment counts — departments come from doctor
+  specializations, there is no separate Departments module yet).
+  OPD/IPD, Laboratory, Staff Management and Medical Records are
+  marked "Soon" and open an honest note instead of a dead page.
+  Settings is real (hospital info, theme, change password, users for
+  Admin). Charts are inline SVG drawn in vanilla JS — no CDN, the
+  page works offline.
+- **API:** `GET /api/dashboard` returns the full payload (see
+  `docs/api.md`); the old stats keys are still returned.
+- Tests: `tests/test_dashboard.py` (`dashboard_data` counts/money/
+  monthly series/department split/today's list/activities/notifications
+  on a seeded hospital, empty-hospital zeros, `StatusHistory.recent`,
+  `/api/dashboard` payload + 401 without login).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -312,15 +356,16 @@ doctor also joins the shift rotation.
 
 ## Frontend (`web/`)
 
-- `index.html` — single page: header (logo + Undo + dark-mode toggle),
-  live stat strip (Patients / Doctors / Waiting / Free Beds), all 14
-  operations as tiles grouped in sections (Patients / Doctors &
-  Appointments / Hospital), and a central workspace panel where the
-  clicked operation opens its form. No separate pages.
-- `styles.css` — light theme white / blue / dark blue (patient tiles
-  teal, doctor tiles blue); dark mode uses dark-green accents and a
-  green glowing logo. Buttons are rounded with borders darker than the
-  button body; hover/press lightens them.
+- `index.html` — single page: dark-navy sidebar (City Care Hospital,
+  menu with submenus, promo box, Version 1.0.0), white top bar (search,
+  notification bell, profile menu), the Step 7 dashboard view, and a
+  central workspace panel where the clicked module opens its form.
+  No separate pages.
+- `styles.css` — Step 7 dashboard theme (Primary Blue #1769AA, light
+  gray #F1F5F9 background, dark navy #172033 text; pastel stat cards);
+  dark mode uses dark-green accents and a green glowing logo. Buttons
+  are rounded with borders darker than the button body; hover/press
+  lightens them.
 - `app.js` — vanilla JS, `fetch` against `/api/*`. No build step, no
   dependencies, no images — icons are inline SVG (doctor cap, ♂/♀
   symbols, clock, bed) and the logo is a blue rounded square with a

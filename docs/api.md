@@ -44,7 +44,7 @@ their own with the Add Doctor form (CLI menu or web dashboard).
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET | `/api/state` | Everything the UI needs: patients (with notes), doctors (with queues), beds, pharmacy queue, shifts, on-duty doctor, last undo action, stats |
-| GET | `/api/dashboard` | Stats only: patients, doctors, waiting (total tokens), free_beds / total_beds |
+| GET | `/api/dashboard` | Step 7: the full dashboard payload — counts (patients, doctors, today's appointments, free beds, total revenue from Paid bills, pending bills), monthly appointment series (this year + rolling last 12 months), department split (appointments per doctor specialization), today's appointments with real statuses, recent-activity feed (status changes, registrations, bills, bookings), notification count (pending appointments + unpaid bills) and the pending items for the bell. Every number is live data from `hospital.db` — nothing is hardcoded. The old stats keys (patients, doctors, waiting, free_beds, billed_today, collected_today, unpaid_total) are still returned for compatibility |
 
 ## Patients (ops 1–4)
 

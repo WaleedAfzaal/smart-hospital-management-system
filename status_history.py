@@ -117,3 +117,21 @@ class StatusHistory:
         return [{"id": r[0], "doctor_id": r[1], "token": r[2],
                  "old_status": r[3], "new_status": r[4],
                  "changed_by": r[5], "changed_at": r[6]} for r in rows]
+
+    def recent(self, limit=10):
+        """The latest recorded changes across ALL appointments, newest
+        first — the feed for the Step 7 dashboard's Recent Activities.
+        ``limit`` caps the list (default 10)."""
+        with self._lock:
+            if self._conn is None:
+                return [dict(r) for r in self._rows[-limit:]][::-1]
+            rows = self._conn.execute(
+                "SELECT id, doctor_id, token, old_status, new_status,"
+                " changed_by, changed_at"
+                " FROM appointment_status_history"
+                " ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [{"id": r[0], "doctor_id": r[1], "token": r[2],
+                 "old_status": r[3], "new_status": r[4],
+                 "changed_by": r[5], "changed_at": r[6]} for r in rows]

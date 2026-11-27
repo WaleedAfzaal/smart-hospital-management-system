@@ -46,6 +46,16 @@ changes (old -> new, who, when). Booking refuses a double booking —
 the same doctor, same date, same time, while the existing appointment
 is still active — with a 400 that says so plainly. Queue items and
 schedule rows now include each appointment's status.
+
+Step 7 (New Dashboard): ``GET /api/dashboard`` now returns the full
+dashboard payload — counts (patients, doctors, today's appointments,
+free beds, total revenue from Paid bills, pending bills), the monthly
+appointment series (this year + rolling last 12 months), the
+department split (appointments per doctor specialization), today's
+appointments with real statuses, the recent-activity feed (status
+changes, registrations, bills, bookings) and the notification count
+(pending appointments + unpaid bills). Every number is live data from
+hospital.db — nothing is hardcoded.
 """
 
 import argparse
@@ -218,12 +228,18 @@ def _shifts() -> List[str]:
 
 
 def _dashboard() -> Dict[str, Any]:
+    """Live stats for the dashboard. The small counts are the same
+    keys the old stats strip used (kept so /api/dashboard stays
+    compatible); the Step 7 payload — monthly chart series,
+    department split, today's list, activity feed, notification
+    count — comes from Hospital.dashboard_data() and is all real
+    data, never sample numbers."""
     free_beds = sum(1 for b in hospital.beds if b == 0)
     waiting = sum(len(doc["queue"].heap) for doc in hospital.doctors_map.values())
     # Step 3: today's money at a glance (bills dated today).
     today = datetime.date.today().isoformat()
     money = hospital.billing.summary_for_date(today)
-    return {
+    out = {
         "patients": len(hospital.patients_map),
         "doctors": len(hospital.doctors_map),
         "waiting": waiting,
@@ -233,6 +249,9 @@ def _dashboard() -> Dict[str, Any]:
         "collected_today": money["collected"],
         "unpaid_total": hospital.billing.unpaid_total(),
     }
+    # Step 7: full dashboard payload (see Hospital.dashboard_data).
+    out.update(hospital.dashboard_data(today))
+    return out
 
 
 def _undo_last() -> Optional[List[Any]]:
