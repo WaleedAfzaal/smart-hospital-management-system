@@ -29,6 +29,13 @@ empty = today) and a time (HH:MM 24-hour, empty = no fixed time) —
 both validated, bad values get a 400 with a plain message. Queues show
 the scheduled date/time, and ``GET /api/appointments?date=...`` lists
 that day's appointments (a Doctor sees only their own doctor's).
+
+Step 5 (Patient Search / Edit / Delete): ``GET /api/patients?name=...``
+finds patients by part of their name (case-insensitive, empty list
+when nothing matches); ``POST /api/patients/<id>`` edits name/age/
+problem (Admin + Receptionist); ``DELETE /api/patients/<id>`` deletes
+a patient — Admin only — removing their record, notes and queued
+appointments and freeing their bed, while their bills are kept.
 """
 
 import argparse
@@ -350,6 +357,18 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
             if path == "/api/patients":
                 field = query.get("sort", ["id"])[0]
                 field = "age" if field == "age" else "id"
+                # Step 5: ?name= finds patients by part of their name
+                # (case-insensitive) — an empty result is a plain empty
+                # list, not an error.
+                name = query.get("name", [None])[0]
+                if name is not None:
+                    matches = hospital.search_patients(name)
+                    return self._send_json({
+                        "ok": True, "name": name,
+                        "patients": [_serialize_patient(
+                            hospital.patients_map[p["id"]])
+                            for p in matches],
+                    })
                 ordered = bubble_sort(hospital.patients_list, field)
                 return self._send_json({
                     "ok": True, "sort": field,
@@ -644,6 +663,59 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "patient": _serialize_patient(patient),
                 })
 
+            # ---- Edit Patient (Step 5): POST /api/patients/<id> with
+            # any of {name, age, problem} — only the given fields
+            # change, the ID never changes. Admin + Receptionist only.
+            if path.startswith("/api/patients/"):
+                if not can(role, "edit_patient"):
+                    return self._forbidden(role)
+                raw = path.removeprefix("/api/patients/").strip("/")
+                if "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                try:
+                    pid = int(raw)
+                except ValueError:
+                    return self._send_json(
+                        {"ok": False, "error": "Patient ID must be a number."}, 400)
+                if pid not in hospital.patients_map:
+                    return self._send_json(
+                        {"ok": False, "error": "Patient not found."}, 404)
+                name = data.get("name")
+                problem = data.get("problem")
+                age = data.get("age")
+                if age is not None:
+                    age = _parse_int(age)
+                    if age is None:
+                        return self._send_json(
+                            {"ok": False, "error": "Age must be a number."}, 400)
+                if name is not None:
+                    name = str(name).strip()
+                    if not name:
+                        return self._send_json(
+                            {"ok": False, "error": "Name cannot be empty."}, 400)
+                if problem is not None:
+                    problem = str(problem).strip()
+                    if not problem:
+                        return self._send_json(
+                            {"ok": False, "error": "Problem cannot be empty."}, 400)
+                try:
+                    updated = hospital.edit_patient(
+                        pid, name=name, age=age, problem=problem)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "message": "Patient updated.",
+                    "patient": {
+                        "id": updated["id"], "name": updated["name"],
+                        "age": updated["age"],
+                        "problem": updated["problem"],
+                        "visits": updated["visits"],
+                        "notes": updated["notes"],
+                    },
+                })
+
             # ---- Add Doctor
             if path == "/api/doctors":
                 if not can(role, "add_doctor"):
@@ -888,6 +960,51 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "bill": bill,
                 })
 
+        return self._send_json(
+            {"ok": False, "error": "Unknown endpoint."}, 404)
+
+
+    # --------------------------------------------------------- DELETE
+    def do_DELETE(self) -> None:  # noqa: N802
+        """DELETE /api/patients/<id> (Step 5, Admin only).
+
+        The dashboard asks for confirmation before calling this — the
+        server itself just deletes: patient record + notes + queued
+        appointments go away, their bed is freed, their bills are KEPT.
+        """
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if not path.startswith("/api/"):
+            return self._send_json(
+                {"ok": False, "error": "Unknown endpoint."}, 404)
+        user = _session_user(self)
+        if user is None:
+            return self._send_json(
+                {"ok": False, "error": "Please log in first."}, 401)
+        self._user = user
+        with state_lock:
+            if path.startswith("/api/patients/"):
+                if not can(user["role"], "delete_patient"):
+                    return self._forbidden(user["role"])
+                raw = path.removeprefix("/api/patients/").strip("/")
+                if "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                try:
+                    pid = int(raw)
+                except ValueError:
+                    return self._send_json(
+                        {"ok": False, "error": "Patient ID must be a number."}, 400)
+                try:
+                    removed = hospital.delete_patient(pid)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 404)
+                return self._send_json({
+                    "ok": True,
+                    "message": f"Patient {removed['name']} (#{pid}) deleted.",
+                    "deleted": removed,
+                })
         return self._send_json(
             {"ok": False, "error": "Unknown endpoint."}, 404)
 

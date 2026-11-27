@@ -6,7 +6,7 @@ It is built around classic data structures — a **singly linked list** for pati
 
 ## Features
 
-- **Patient Registration & Lookup**: Patients stored in a dict + list with input validation and duplicate-ID prevention; sorted view by ID or age (bubble sort); lookup by ID (binary search).
+- **Patient Registration & Lookup**: Patients stored in a dict + list with input validation and duplicate-ID prevention; sorted view by ID or age (bubble sort); lookup by ID (binary search) or by name — type part of a name ("ahm" finds "Ahmed Khan") and matching is case-insensitive. A patient's name, age or problem can be edited (the ID never changes); deleting a patient (Admin only, with confirmation) removes their record, notes and queued appointments and frees their bed, while their bills are kept as financial records.
 - **Patient Notes**: Visit notes kept in a linked list per patient; each note counts as a visit.
 - **Doctor Directory**: 5 starter doctors with specialty and token fee. View doctors or add a new one.
 - **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…).
@@ -38,6 +38,9 @@ Both the CLI (`python hospital.py`) and the web dashboard ask you to log in firs
 | ------ | :---: | :----: | :----------: |
 | View patients, doctors, dashboard | ✅ | ✅ | ✅ |
 | Register patients | ✅ | ❌ | ✅ |
+| Search patients by name | ✅ | ✅ | ✅ |
+| Edit patient (name, age, problem) | ✅ | ❌ | ✅ |
+| Delete patient (with confirmation) | ✅ | ❌ | ❌ |
 | Add patient notes | ✅ | ✅ | ❌ |
 | Book appointments | ✅ | ❌ | ✅ |
 | Manage beds & pharmacy queue | ✅ | ❌ | ✅ |
@@ -108,6 +111,34 @@ Appointments booked before this feature have no scheduled date — they
 still work everywhere (queue, billing, reports) but never appear in a
 dated schedule view.
 
+## Patient Search, Edit & Delete
+
+**Search by name:** type all or part of a name — "ahm" finds "Ahmed
+Khan" and "Ali Ahmed", and "AHMED" finds them too (matching ignores
+case). Nothing matching gives a plain "no patient found" message, not
+an error. Every role can search.
+
+**Edit:** change a patient's name, age and/or problem — the ID never
+changes, and fields you leave alone stay as they are. A renamed
+patient's queued appointments show the new name too; bills keep the
+name they were made with. Admin and Receptionist can edit; Doctors are
+read-only here.
+
+**Delete (Admin only):** deleting a patient removes their record, their
+notes and their queued appointments (their tokens leave every doctor's
+queue) and frees any bed they occupy. Their **bills are kept** — they
+are financial records and keep the patient name they were made with.
+Deletion always asks first: the CLI shows exactly what will go away
+and only deletes when you type `YES`; the dashboard asks with a
+confirmation dialog.
+
+- **CLI:** menu option **3. Find Patient** now asks *By ID* or *By
+  Name*; menu option **18. Edit Patient** (leave a field blank to keep
+  it) and **19. Delete Patient** (Admin only, type `YES` to confirm).
+- **Dashboard:** the **Find Patient** tile has a *Search by Name* form
+  (results as a list of patient cards), and every patient card has
+  **Edit** (Admin/Receptionist) and **Delete** (Admin only) buttons.
+
 ## Quick Start
 
 1. Clone the repository:
@@ -165,6 +196,7 @@ python hospital.py
 │   ├── test_auth.py         # Login, password hashing, and role permission tests
 │   ├── test_billing.py      # Billing, reports, CSV export, and persistence tests
 │   ├── test_appointments.py # Appointment date/time, schedule views, migration tests
+│   ├── test_patients.py     # Patient search by name, edit, delete, delete rule
 │   └── test_database.py     # Persistence round-trip tests (save → restart → reload)
 ├── CONTRIBUTING.md
 └── LICENSE

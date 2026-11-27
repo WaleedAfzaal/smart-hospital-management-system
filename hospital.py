@@ -19,6 +19,13 @@ appointment date/time is when the patient should come. The queue order
 is unchanged — Emergency still comes first; date/time is for
 scheduling and display only. ``appointments_for_date`` / ``doctor_schedule``
 list appointments for a given day, sorted by time, then priority.
+
+Step 5 (Patient Search / Edit / Delete): ``search_patients`` finds
+patients by part of their name (case-insensitive); ``edit_patient``
+changes name/age/problem (the ID never changes, and a renamed
+patient's queued appointments show the new name); ``delete_patient``
+removes the record + notes + queued appointments and frees their bed,
+while their bills are KEPT as financial records.
 """
 
 import datetime
@@ -77,6 +84,20 @@ def _appt_when(row):
     if not appt_date:
         return ""
     return f"{appt_date} {appt_time}" if appt_time else appt_date
+
+
+def _public_patient(pat):
+    """A plain dict copy of a patient (notes as a list) — safe to hand
+    out to callers and the API without exposing the internal LinkedList.
+    """
+    notes = []
+    node = pat["notes"].head
+    while node is not None:
+        notes.append(node.val)
+        node = node.next
+    return {"id": pat["id"], "name": pat["name"], "age": pat["age"],
+            "problem": pat["problem"], "visits": pat["visits"],
+            "notes": notes, "registered": pat.get("registered")}
 
 
 class Node:
@@ -332,6 +353,96 @@ class Hospital:
         found = binary_search(bubble_sort(self.patients_list, "id"), pid)
         print(f"  ID {p['id']} | {p['name']} | Age {p['age']} | {p['problem']} | Visits: {p['visits']} | Found: {bool(found)}")
         p["notes"].show()
+
+    # ------------------------------------------------ Step 5: search / edit / delete
+    def search_patients(self, name):
+        """Patients whose name contains ``name`` (partial, case-insensitive).
+
+        Returns public copies sorted by ID. An empty query matches
+        nothing — it is not "show everyone" — so the caller gets an
+        empty list and can say so plainly instead of dumping the whole
+        register.
+        """
+        query = (name or "").strip().lower()
+        if not query:
+            return []
+        return [_public_patient(p) for p in
+                sorted(self.patients_list, key=lambda p: p["id"])
+                if query in p["name"].lower()]
+
+    def edit_patient(self, pid, name=None, age=None, problem=None):
+        """Change a patient's name, age and/or problem. The ID never changes.
+
+        Only the fields you pass are changed. Raises ValueError if the
+        patient does not exist or a new value is invalid (empty name /
+        problem, age outside 0–150). A renamed patient's queued
+        appointments show the new name too; bills keep the name they
+        were made with (they are financial records). Returns the
+        updated patient.
+        """
+        pat = self.patients_map.get(pid)
+        if pat is None:
+            raise ValueError("Patient not found.")
+        if name is not None:
+            name = str(name).strip()
+            if not name:
+                raise ValueError("Name cannot be empty.")
+        if problem is not None:
+            problem = str(problem).strip()
+            if not problem:
+                raise ValueError("Problem cannot be empty.")
+        if age is not None:
+            if isinstance(age, bool) or not isinstance(age, int) \
+                    or not 0 <= age <= 150:
+                raise ValueError(
+                    "Age must be a whole number between 0 and 150.")
+        if name is not None and name != pat["name"]:
+            # The name rides on the queued appointment rows too — keep
+            # them in sync (heap order is untouched: priority/seq never
+            # change, so the heap stays valid).
+            for doc in self.doctors_map.values():
+                for i, row in enumerate(doc["queue"].heap):
+                    if row[3] == pid:
+                        doc["queue"].heap[i] = row[:4] + (name,) + row[5:]
+            pat["name"] = name
+        if age is not None:
+            pat["age"] = age
+        if problem is not None:
+            pat["problem"] = problem
+        self._persist()
+        return _public_patient(pat)
+
+    def delete_patient(self, pid):
+        """Delete a patient (Admin only — enforced by the callers).
+
+        Removes the patient record + their notes + their queued
+        appointments (their tokens leave every doctor's queue) and
+        frees any bed they occupy. Bills for the patient are KEPT —
+        they are financial records and keep the patient name they were
+        made with. Returns a summary of what was removed. Raises
+        ValueError if the patient does not exist.
+        """
+        pat = self.patients_map.get(pid)
+        if pat is None:
+            raise ValueError("Patient not found.")
+        notes_count = len(_public_patient(pat)["notes"])
+        removed_tokens = []
+        for doc in self.doctors_map.values():
+            tokens = [row[2] for row in doc["queue"].heap if row[3] == pid]
+            for token in tokens:
+                doc["queue"].remove_token(token)
+                removed_tokens.append(f"{doc['id']} {token}")
+        freed_beds = [i + 1 for i, b in enumerate(self.beds) if b == pid]
+        for bed_no in freed_beds:
+            self.beds[bed_no - 1] = 0
+        self.patients_map.pop(pid)
+        self.patients_list = [p for p in self.patients_list
+                              if p["id"] != pid]
+        self._persist()
+        return {"id": pid, "name": pat["name"],
+                "notes_removed": notes_count,
+                "appointments_removed": removed_tokens,
+                "beds_freed": freed_beds}
 
     def add_note(self, pid, note_text):
         p = self.patients_map.get(pid)
@@ -816,6 +927,88 @@ def schedule_menu(hosp):
               f"{' [EMERGENCY]' if row['emergency'] else ''}")
 
 
+def find_patient_menu(hosp):
+    """Find a patient — by ID (binary search) or by name (Step 5:
+    partial, case-insensitive)."""
+    opt = input("  1. By ID  2. By Name: ").strip()
+    if opt == "1":
+        try:
+            pid = int(input("  ID: "))
+        except ValueError:
+            return print("  ID must be a number.")
+        hosp.find_patient(pid)
+    elif opt == "2":
+        name = input("  Name (or part of it): ").strip()
+        matches = hosp.search_patients(name)
+        if not matches:
+            return print("  No patient found with that name.")
+        for p in matches:
+            print(f"  ID {p['id']} | {p['name']} | Age {p['age']} | "
+                  f"{p['problem']} | Visits: {p['visits']}")
+    else:
+        print("  Invalid choice.")
+
+
+def edit_patient_menu(hosp):
+    """Edit a patient (Step 5): change name, age and/or problem.
+    The ID never changes; Enter keeps the current value."""
+    try:
+        pid = int(input("  Patient ID to edit: "))
+    except ValueError:
+        return print("  Patient ID must be a number.")
+    pat = hosp.patients_map.get(pid)
+    if pat is None:
+        return print("  Patient not found.")
+    print(f"  Editing {pat['name']} (#{pid}) — press Enter to keep a value.")
+    name = input(f"  New name [{pat['name']}]: ").strip() or None
+    age_raw = input(f"  New age [{pat['age']}]: ").strip()
+    problem = input(f"  New problem [{pat['problem']}]: ").strip() or None
+    age = None
+    if age_raw:
+        try:
+            age = int(age_raw)
+        except ValueError:
+            return print("  Age must be a number.")
+    try:
+        updated = hosp.edit_patient(pid, name=name, age=age, problem=problem)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    print(f"  Updated: ID {updated['id']} | {updated['name']} | "
+          f"Age {updated['age']} | {updated['problem']}")
+
+
+def delete_patient_menu(hosp):
+    """Delete a patient (Step 5, Admin only) — with a confirmation step.
+
+    Shows exactly what will go away (notes, queued appointments, beds)
+    and only deletes when the user types YES. Bills are kept.
+    """
+    try:
+        pid = int(input("  Patient ID to delete: "))
+    except ValueError:
+        return print("  Patient ID must be a number.")
+    pat = hosp.patients_map.get(pid)
+    if pat is None:
+        return print("  Patient not found.")
+    tokens = []
+    for doc in hosp.doctors_map.values():
+        tokens += [f"{doc['id']} {row[2]}" for row in doc["queue"].heap
+                   if row[3] == pid]
+    beds = [i + 1 for i, b in enumerate(hosp.beds) if b == pid]
+    notes = _public_patient(pat)["notes"]
+    print(f"  Delete {pat['name']} (#{pid})? This removes:")
+    print(f"    - the patient record and {len(notes)} note(s)")
+    print(f"    - {len(tokens)} queued appointment(s)"
+          + (f": {', '.join(tokens)}" if tokens else ""))
+    if beds:
+        print(f"    - bed(s) {', '.join(map(str, beds))} will be freed")
+    print("    - bills for this patient are KEPT (financial records).")
+    if input("  Type YES to confirm: ").strip().upper() != "YES":
+        return print("  Cancelled — patient NOT deleted.")
+    removed = hosp.delete_patient(pid)
+    print(f"  Patient {removed['name']} (#{pid}) deleted.")
+
+
 def change_password_prompt(auth, user):
     """Let the logged-in user change their own password."""
     current = getpass.getpass("  Current password: ")
@@ -850,6 +1043,8 @@ MENU = [
     ("15", "Billing", "view_bills"),
     ("16", "Reports", "view_reports"),
     ("17", "Schedule", "view"),   # Step 4: appointments by date
+    ("18", "Edit Patient", "edit_patient"),    # Step 5
+    ("19", "Delete Patient", "delete_patient"),  # Step 5, Admin only
 ]
 
 
@@ -884,7 +1079,7 @@ def main():
         elif choice == "2":
             hosp.show_sorted("age" if input("Sort by (id/age): ").strip() == "age" else "id")
         elif choice == "3":
-            hosp.find_patient(int(input("ID: ")))
+            find_patient_menu(hosp)
         elif choice == "4":
             hosp.add_note(int(input("ID: ")), input("Note: "))
         elif choice == "5":
@@ -927,6 +1122,10 @@ def main():
             reports_menu(hosp)
         elif choice == "17":
             schedule_menu(hosp)
+        elif choice == "18":
+            edit_patient_menu(hosp)
+        elif choice == "19":
+            delete_patient_menu(hosp)
 
 
 if __name__ == "__main__":

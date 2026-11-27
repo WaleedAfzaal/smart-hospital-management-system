@@ -589,5 +589,139 @@ class TestServerAppointments(TestServerAPI):
         self.assertEqual(payload["bill"]["total"], 2500)
 
 
+class TestServerPatients(TestServerAPI):
+    """Step 5: patient search by name, edit, and delete on the HTTP API."""
+
+    def _add(self, pid, name, age=30, problem="Fever"):
+        status, _ = self._request(
+            "POST", "/api/patients",
+            {"id": pid, "name": name, "age": age, "problem": problem})
+        self.assertEqual(status, 200)
+
+    def test_search_by_name_partial_and_case_insensitive(self) -> None:
+        self._add(101, "Ahmed Khan")
+        self._add(102, "Ayesha Malik")
+        self._add(103, "Ali Ahmed")
+        status, payload = self._request("GET", "/api/patients?name=ahm")
+        self.assertEqual(status, 200)
+        self.assertEqual([p["id"] for p in payload["patients"]], [101, 103])
+        status, payload = self._request("GET", "/api/patients?name=AYESHA")
+        self.assertEqual([p["id"] for p in payload["patients"]], [102])
+
+    def test_search_no_match_returns_empty_list(self) -> None:
+        self._add(101, "Ahmed Khan")
+        status, payload = self._request("GET", "/api/patients?name=Zubair")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["patients"], [])
+
+    def test_search_needs_login(self) -> None:
+        status, payload = self._request(
+            "GET", "/api/patients?name=ah", cookie="")
+        self.assertEqual(status, 401)
+
+    def test_edit_patient_partial_update(self) -> None:
+        self._add(101, "Ahmed Khan", 30, "Fever")
+        status, payload = self._request(
+            "POST", "/api/patients/101", {"age": 31})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["patient"]["age"], 31)
+        self.assertEqual(payload["patient"]["name"], "Ahmed Khan")
+        self.assertEqual(payload["patient"]["problem"], "Fever")
+        # And the change shows up on a later read.
+        status, payload = self._request("GET", "/api/patients/101")
+        self.assertEqual(payload["patient"]["age"], 31)
+
+    def test_edit_patient_bad_values_rejected(self) -> None:
+        self._add(101, "Ahmed Khan")
+        for body in ({"name": ""}, {"name": "   "}, {"problem": ""},
+                     {"age": -1}, {"age": 200}, {"age": "old"}):
+            status, payload = self._request(
+                "POST", "/api/patients/101", body)
+            self.assertEqual(status, 400, body)
+        status, payload = self._request(
+            "POST", "/api/patients/999", {"age": 31})
+        self.assertEqual(status, 404)
+
+    def test_edit_patient_role_rules(self) -> None:
+        self._add(101, "Ahmed Khan")
+        server.auth_store.create_user("doc-edit", "pw123", "Doctor", "D1")
+        doc_cookie = self._login("doc-edit", "pw123")
+        self.assertTrue(doc_cookie)
+        status, _ = self._request(
+            "POST", "/api/patients/101", {"age": 31}, cookie=doc_cookie)
+        self.assertEqual(status, 403)
+        server.auth_store.create_user("recep-edit", "pw123", "Receptionist")
+        recep_cookie = self._login("recep-edit", "pw123")
+        self.assertTrue(recep_cookie)
+        status, payload = self._request(
+            "POST", "/api/patients/101", {"age": 31}, cookie=recep_cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["patient"]["age"], 31)
+
+    def test_delete_patient_admin_only(self) -> None:
+        self._add(101, "Ahmed Khan")
+        server.auth_store.create_user("recep-del", "pw123", "Receptionist")
+        recep_cookie = self._login("recep-del", "pw123")
+        status, _ = self._request(
+            "DELETE", "/api/patients/101", cookie=recep_cookie)
+        self.assertEqual(status, 403)
+        server.auth_store.create_user("doc-del", "pw123", "Doctor", "D1")
+        doc_cookie = self._login("doc-del", "pw123")
+        status, _ = self._request(
+            "DELETE", "/api/patients/101", cookie=doc_cookie)
+        self.assertEqual(status, 403)
+        # And without a login at all.
+        status, _ = self._request("DELETE", "/api/patients/101", cookie="")
+        self.assertEqual(status, 401)
+        # The patient is still there after the rejected attempts.
+        status, payload = self._request("GET", "/api/patients/101")
+        self.assertEqual(status, 200)
+
+    def test_delete_patient_removes_record_notes_appointments_keeps_bills(self) -> None:
+        self._add(101, "Ahmed Khan")
+        self._add(102, "Sara")
+        self._request(
+            "POST", "/api/patients/101/notes", {"note": "First visit"})
+        self._request(
+            "POST", "/api/appointments",
+            {"doctor_id": "D1", "patient_id": 101, "emergency": False})
+        self._request(
+            "POST", "/api/appointments",
+            {"doctor_id": "D1", "patient_id": 102, "emergency": False})
+        _, payload = self._request(
+            "POST", "/api/bills",
+            {"patient_id": 101, "doctor_id": "D1", "token": "N-1"})
+        bill_id = payload["bill"]["id"]
+        self._request(
+            "POST", "/api/beds/assign", {"bed": 3, "patient_id": 101})
+
+        status, payload = self._request("DELETE", "/api/patients/101")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["deleted"]["notes_removed"], 1)
+        self.assertEqual(len(payload["deleted"]["appointments_removed"]), 1)
+        self.assertEqual(payload["deleted"]["beds_freed"], [3])
+
+        status, payload = self._request("GET", "/api/patients/101")
+        self.assertEqual(status, 404)
+        # The other patient and their appointment are untouched.
+        status, payload = self._request("GET", "/api/patients/102")
+        self.assertEqual(status, 200)
+        status, payload = self._request("GET", "/api/doctors")
+        self.assertEqual(payload["doctors"][0]["waiting"], 1)
+        # The bed is free again.
+        status, payload = self._request("GET", "/api/beds")
+        self.assertEqual(payload["beds"][2]["status"], "Free")
+        # The bill is kept.
+        status, payload = self._request("GET", f"/api/bills/{bill_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["bill"]["patient_name"], "Ahmed Khan")
+
+    def test_delete_missing_patient_is_404(self) -> None:
+        status, payload = self._request("DELETE", "/api/patients/999")
+        self.assertEqual(status, 404)
+
+
 if __name__ == "__main__":
     unittest.main()

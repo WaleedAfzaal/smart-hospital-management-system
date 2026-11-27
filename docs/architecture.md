@@ -171,6 +171,50 @@ They also seed the shift rotation.
   defaults, 400s, schedule filters, Doctor-only-own-day, billing
   from a dated token).
 
+## Patient Search / Edit / Delete — Step 5 (`hospital.py` + `auth.py` + `server.py` + `web/`)
+
+- **Search** (`Hospital.search_patients(name)`): partial, case-insensitive
+  substring match on the patient name, results sorted by ID, returned as
+  plain dicts (notes as a list — see `_public_patient` in `hospital.py`).
+  An empty query matches nothing, so the caller gets an empty list
+  instead of the whole register. No database change was needed: the
+  patients table already holds everything, and `Database.save()` rewrites
+  it on every change.
+- **Edit** (`Hospital.edit_patient(pid, name, age, problem)`): only the
+  fields you pass change; the ID never changes. Values are validated
+  (non-empty name/problem, age 0–150) and a bad value raises ValueError
+  with the patient unchanged. A renamed patient's queued appointment rows
+  get the new name too (heap order is untouched — priority/seq never
+  change, so the heap stays valid); bills keep the name they were made
+  with. Edits are saved at once and survive a restart.
+- **Delete** (`Hospital.delete_patient(pid)`): removes the patient record
+  + notes + queued appointments (via the existing `PriorityQueue.remove_token`,
+  so the heap stays valid) and frees any bed they occupy. Bills are KEPT
+  — they are financial records. Returns a summary dict
+  (`notes_removed`, `appointments_removed`, `beds_freed`). Stale undo
+  entries that mention the patient are harmless: every undo branch
+  already guards on the patient existing.
+- **Permissions** (`auth.py`): `edit_patient` is Admin + Receptionist,
+  `delete_patient` is Admin only, search is the open `view` rule.
+- **API:** `GET /api/patients?name=...` (empty list on no match);
+  `POST /api/patients/<id>` with any of `{name, age, problem}` (400 on
+  bad values, 404 on a missing patient); `DELETE /api/patients/<id>`
+  (new `do_DELETE` handler in `server.py` — same login + role checks
+  as the other routes; 404 on a missing patient).
+- **CLI:** menu **3. Find Patient** now asks *By ID* or *By Name*; menu
+  **18. Edit Patient** (blank keeps the current value) and **19. Delete
+  Patient** (shows what will go away and only deletes on a typed `YES`).
+  **Web:** the Find Patient tile has a *Search by Name* form (results as
+  patient cards), and each card has Edit (Admin/Receptionist) and Delete
+  (Admin only) buttons — Delete asks with a `confirm()` dialog first.
+- Tests: `tests/test_patients.py` (search partial/case-insensitive/no
+  match/empty, edit all/one field/bad values/rename updates queue/restart
+  persistence, delete record + notes + appointments + bed freed/bills
+  kept/missing patient/restart persistence) and
+  `tests/test_server.py::TestServerPatients` (API search, edit partial
+  update + 400s + 404, role rules for edit and delete, delete removes
+  record/notes/appointments/frees bed/keeps bill, delete 404).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -180,8 +224,9 @@ They also seed the shift rotation.
   browser tabs can't race on the same structures.
 - `hospital.py` methods mostly print instead of returning, so the server
   usually determines success from state before/after each call.
-  `book_appointment` is the exception — it RETURNS its token (or
-  `None` on failure), which the booking endpoint uses directly.
+  `book_appointment` returns its token (or `None` on failure), and the
+  Step 3/5 methods (`create_bill`, `search_patients`, `edit_patient`,
+  `delete_patient`) return their results, which the endpoints use directly.
 - State is saved to `hospital.db` on every change (see Database above),
   so restarting the server keeps all data. This is a university
   project, not for production.
@@ -207,7 +252,10 @@ They also seed the shift rotation.
 `unittest` tests for the `Hospital` class: add / duplicate id, find
 (binary search), sort (bubble sort), notes, booking tokens
 (Emergency before Normal), beds assign/free, undo (add patient /
-note / booking / bed), pharmacy FIFO, shift rotation. Run with:
+note / booking / bed), pharmacy FIFO, shift rotation. Step 5 adds
+`tests/test_patients.py` (name search, edit, delete + delete rule)
+and `tests/test_server.py::TestServerPatients` (the same over HTTP).
+Run with:
 
 ```bash
 python -m unittest discover -s tests -v

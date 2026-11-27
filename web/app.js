@@ -172,7 +172,7 @@ async function loadState() {
 const OPS = {
   "add-patient": ["Add Patient", "Register a new patient"],
   "view-sorted": ["View Sorted", "Browse patients sorted by ID or Age"],
-  "find-patient": ["Find Patient", "Search patient record & visit notes"],
+  "find-patient": ["Find Patient", "Find by ID, or search by name — edit or delete from the card"],
   "add-note": ["Add Note", "Record visit note (increments visits)"],
   "doctors": ["Doctors", "View doctor queues or add a doctor"],
   "book-appointment": ["Book Appointment", "Issue Normal or Emergency token"],
@@ -290,6 +290,10 @@ function renderViewSorted() {
 }
 
 function patientCard(p) {
+  /* Step 5: Edit (Admin/Receptionist) and Delete (Admin only) live on
+     the card — the server enforces the same rules. */
+  const canEdit = currentUser && ["Admin", "Receptionist"].includes(currentUser.role);
+  const canDelete = currentUser && currentUser.role === "Admin";
   return `<div class="card">
     <h3>${esc(p.name)} <span class="muted">#${p.id}</span></h3>
     <p>Age: <b>${p.age}</b> &nbsp;•&nbsp; Problem: <b>${esc(p.problem)}</b> &nbsp;•&nbsp; Visits: <b>${p.visits}</b></p>
@@ -297,7 +301,62 @@ function patientCard(p) {
     ${p.notes.length
       ? `<ul class="q-list">${p.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>`
       : `<p class="muted">No notes yet.</p>`}
+    ${canEdit || canDelete ? `<div class="btn-row" style="margin-top:10px">
+      ${canEdit ? `<button type="button" class="btn btn-primary" data-edit-patient="${p.id}">Edit</button>` : ""}
+      ${canDelete ? `<button type="button" class="btn btn-danger" data-delete-patient="${p.id}">Delete</button>` : ""}
+    </div>` : ""}
+    <div data-edit-slot="${p.id}"></div>
   </div>`;
+}
+
+/* Step 5: wire the Edit / Delete buttons of one patient card. Edit
+   opens an inline form (name/age/problem prefilled); Delete asks for
+   confirmation first, then calls DELETE /api/patients/<id>. */
+function wirePatientCard(container, p) {
+  const editBtn = container.querySelector(`[data-edit-patient="${p.id}"]`);
+  if (editBtn) {
+    editBtn.addEventListener("click", () => {
+      const slot = container.querySelector(`[data-edit-slot="${p.id}"]`);
+      slot.innerHTML = `
+        <form class="form-grid" data-edit-form="${p.id}" style="margin-top:12px">
+          <div class="field"><label>Name</label>
+            <input type="text" name="name" value="${esc(p.name)}" required></div>
+          <div class="field-row">
+            <div class="field"><label>Age</label>
+              <input type="number" name="age" min="0" max="150" value="${p.age}" required></div>
+            <div class="field"><label>Problem</label>
+              <input type="text" name="problem" value="${esc(p.problem)}" required></div>
+          </div>
+          <div class="btn-row">
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+            <button type="button" class="btn btn-ghost" data-cancel-edit="${p.id}">Cancel</button>
+          </div>
+        </form>`;
+      slot.querySelector(`[data-edit-form="${p.id}"]`).addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const f = new FormData(e.target);
+        const res = await api(`/api/patients/${p.id}`, "POST", {
+          name: f.get("name"), age: Number(f.get("age")), problem: f.get("problem"),
+        });
+        await loadState();
+        toast(res.ok ? res.message : errOf(res), !res.ok);
+        renderFindPatient(res.ok ? res.message : errOf(res), res.ok);
+      });
+      slot.querySelector(`[data-cancel-edit="${p.id}"]`).addEventListener("click", () => {
+        slot.innerHTML = "";
+      });
+    });
+  }
+  const delBtn = container.querySelector(`[data-delete-patient="${p.id}"]`);
+  if (delBtn) {
+    delBtn.addEventListener("click", async () => {
+      if (!confirm(`Delete patient ${p.name} (#${p.id})?\n\nThis removes their record, notes and queued appointments. Their bills are KEPT.`)) return;
+      const res = await api(`/api/patients/${p.id}`, "DELETE");
+      await loadState();
+      toast(res.ok ? res.message : errOf(res), !res.ok);
+      renderFindPatient(res.ok ? res.message : errOf(res), res.ok);
+    });
+  }
 }
 
 function renderFindPatient(msg = "", ok = true) {
@@ -307,16 +366,42 @@ function renderFindPatient(msg = "", ok = true) {
     <form id="f-find" class="form-grid">
       <div class="field"><label>Patient ID</label>
         <input type="number" name="id" min="1" placeholder="e.g. 101" required></div>
-      <div class="btn-row"><button type="submit" class="btn btn-primary">Find Patient</button></div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Find by ID</button></div>
+    </form>
+    <form id="f-find-name" class="form-grid" style="margin-top:14px">
+      <div class="field"><label>Search by Name</label>
+        <input type="text" name="name" placeholder="e.g. Ahmed (part of the name is enough)" required></div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Search by Name</button></div>
     </form>
     <div id="find-result" style="margin-top:14px"></div>`;
   document.getElementById("f-find").addEventListener("submit", async (e) => {
     e.preventDefault();
     const id = Number(new FormData(e.target).get("id"));
     const res = await api(`/api/patients/${id}`);
-    document.getElementById("find-result").innerHTML = res.ok
-      ? patientCard(res.patient)
-      : `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+    const slot = document.getElementById("find-result");
+    if (!res.ok) {
+      slot.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+      return;
+    }
+    slot.innerHTML = patientCard(res.patient);
+    wirePatientCard(slot, res.patient);
+  });
+  document.getElementById("f-find-name").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = new FormData(e.target).get("name");
+    const res = await api(`/api/patients?name=${encodeURIComponent(name)}`);
+    const slot = document.getElementById("find-result");
+    if (!res.ok) {
+      slot.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+      return;
+    }
+    if (!res.patients.length) {
+      slot.innerHTML = `<div class="msg">No patient found with that name.</div>`;
+      return;
+    }
+    slot.innerHTML = `<p class="muted">${res.patients.length} patient(s) found:</p>`
+      + res.patients.map(patientCard).join("");
+    res.patients.forEach((p) => wirePatientCard(slot, p));
   });
 }
 

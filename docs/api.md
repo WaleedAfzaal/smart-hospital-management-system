@@ -54,7 +54,10 @@ queue and shifts. The 5 starter doctors are `STARTER_DOCTORS` in
 | ------ | ---- | ---- | ----------- |
 | POST | `/api/patients` | `{id, name, age, problem}` | Add patient. Fails if the ID already exists or fields are invalid |
 | GET | `/api/patients?sort=id\|age` | — | Patients sorted with `bubble_sort` by id or age |
+| GET | `/api/patients?name=ahm` | — | Step 5: patients whose name contains the query (partial, case-insensitive), sorted by id. No match returns an empty list, not an error |
 | GET | `/api/patients/<id>` | — | Find one patient via `binary_search` on the id-sorted list; includes notes |
+| POST | `/api/patients/<id>` | `{name?, age?, problem?}` | Step 5: edit a patient — only the given fields change, the ID never changes. Admin + Receptionist only. Bad values get a 400; missing patient gets a 404 |
+| DELETE | `/api/patients/<id>` | — | Step 5: delete a patient — Admin only. Removes the record, notes and queued appointments and frees their bed; their bills are KEPT. Returns a summary of what was removed. Missing patient gets a 404 |
 | POST | `/api/patients/<id>/notes` | `{note}` | Add a note (LinkedList) — also bumps the visit count |
 
 ## Doctors (op 5)

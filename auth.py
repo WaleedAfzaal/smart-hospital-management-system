@@ -61,6 +61,11 @@ PERMISSIONS = {
     "manage_bills": {"Admin", "Receptionist"},
     "view_bills": {"Admin", "Doctor", "Receptionist"},
     "view_reports": {"Admin", "Doctor", "Receptionist"},
+    # Step 5 (Patient search / edit / delete): searching is "view"
+    # (every role); editing is Admin + Receptionist; deleting is
+    # Admin only (with a confirmation step in the CLI / dashboard).
+    "edit_patient": {"Admin", "Receptionist"},
+    "delete_patient": {"Admin"},
 }
 
 _USERS_SCHEMA = """
