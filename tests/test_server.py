@@ -25,6 +25,16 @@ from hospital import Hospital  # noqa: E402
 import server  # noqa: E402
 
 
+def _add_five_doctors(h):
+    """The doctors the API tests need, added explicitly — a fresh
+    Hospital now starts with zero doctors."""
+    h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+    h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+    h.add_doctor("D3", "Dr. Bilal", "Orthopedic", 1800)
+    h.add_doctor("D4", "Dr. Sana", "Physician", 1200)
+    h.add_doctor("D5", "Dr. Kamran", "Pediatrician", 1500)
+
+
 class TestServerAPI(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -64,6 +74,7 @@ class TestServerAPI(unittest.TestCase):
 
     def setUp(self) -> None:
         server.hospital = Hospital()
+        _add_five_doctors(server.hospital)
 
     def _request(self, method: str, path: str, body: dict | None = None,
                  cookie: str | None = None):
@@ -81,7 +92,7 @@ class TestServerAPI(unittest.TestCase):
         except urllib.error.HTTPError as err:
             return err.code, json.loads(err.read().decode("utf-8"))
 
-    def test_state_and_starter_doctors(self) -> None:
+    def test_state_and_doctors(self) -> None:
         status, payload = self._request("GET", "/api/state")
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])

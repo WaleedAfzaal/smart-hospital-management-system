@@ -36,10 +36,8 @@ other roles see all doctors.
 The server saves all data to `hospital.db` (SQLite, created automatically
 next to `server.py`) on every change, so restarting the server keeps
 everything — patients, notes, doctors, appointments, beds, pharmacy
-queue and shifts. The 5 starter doctors are `STARTER_DOCTORS` in
-`hospital.py`: D1 Dr. Tariq (Neurosurgeon, 2500), D2 Dr. Ayesha
-(Cardiologist, 2000), D3 Dr. Bilal (Orthopedic, 1800), D4 Dr. Sana
-(Physician, 1200), D5 Dr. Kamran (Pediatrician, 1500).
+queue and shifts. A fresh install starts with no doctors — staff add
+their own with the Add Doctor form (CLI menu or web dashboard).
 
 ## State & Dashboard
 

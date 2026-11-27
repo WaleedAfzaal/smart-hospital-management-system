@@ -18,8 +18,8 @@ Design notes
 * Save rewrites all tables inside a single transaction, so the file is
   never left half-written.
 * A ``meta`` row ``initialized=1`` marks a database that already holds
-  real state. A fresh/empty file is seeded with the Hospital's starter
-  state (5 starter doctors, empty everything else) on first load.
+  real state. A fresh/empty file is saved with the Hospital's fresh
+  state (empty everything) on first load.
 * Appointment heap rows are stored in heap order (``heap_pos``) and put
   back in the same order, so the binary heap keeps working unchanged.
   Each doctor's token counter (``queue_count``) is stored too, so token
@@ -244,7 +244,7 @@ class Database:
         """Rebuild a Hospital object's state from the database.
 
         If the file is fresh (no ``initialized`` marker), the Hospital
-        keeps the starter state it was just built with and that state is
+        keeps the empty state it was just built with and that state is
         saved, so the next start loads it back.
         """
         with self._connect() as conn:
@@ -312,9 +312,9 @@ class Database:
             ):
                 hospital.pharmacy_q.enqueue(value)
 
-            # ---- shift rotation (duty order). The fresh Hospital already
-            # seeded this queue with the starter doctors in __init__, so
-            # reset it first or the shifts would appear twice.
+            # ---- shift rotation (duty order). The fresh Hospital's
+            # shift queue starts empty, so reset it first and then
+            # rebuild it from the saved rows.
             hospital.shift_q = CircularQueue(20)
             for (value,) in conn.execute(
                 "SELECT value FROM shifts ORDER BY position"

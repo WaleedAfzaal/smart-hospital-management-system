@@ -22,7 +22,8 @@ TODAY = datetime.date.today().isoformat()
 
 
 def _setup_hospital(h):
-    """One patient + one booked appointment (fee 2500, token N-1)."""
+    """One doctor (D1, fee 2500), one patient + one booked appointment (token N-1)."""
+    h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
     h.add_patient(101, "Ahmed", 30, "Fever")
     h.book_appointment("D1", 101, False)
     return h
@@ -56,6 +57,7 @@ class TestCreateBill(unittest.TestCase):
             self.h.create_bill(101, "D9", "N-1")       # no such doctor
 
     def test_token_of_another_patient_rejected(self):
+        self.h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
         self.h.add_patient(101, "Ahmed", 30, "Fever")
         self.h.add_patient(102, "Sara", 25, "Cold")
         self.h.book_appointment("D1", 101, False)       # N-1 is Ahmed's
@@ -70,6 +72,7 @@ class TestCreateBill(unittest.TestCase):
         self.assertEqual(len(self.h.billing.list_bills()), 1)
 
     def test_emergency_token_bills_with_same_fee(self):
+        self.h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
         self.h.add_patient(101, "Ahmed", 30, "Fever")
         self.h.book_appointment("D1", 101, True)        # E-1
         bill = self.h.create_bill(101, "D1", "E-1")
@@ -116,6 +119,7 @@ class TestChargesAndStatus(unittest.TestCase):
 
     def test_list_bills_filters(self):
         self.h.add_patient(102, "Sara", 25, "Cold")
+        self.h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
         self.h.book_appointment("D2", 102, False)
         bill2 = self.h.create_bill(102, "D2", "N-1")
         self.h.billing.mark_paid(bill2["id"])
@@ -141,6 +145,8 @@ class TestReports(unittest.TestCase):
     def test_daily_report_matches_the_data(self):
         _setup_hospital(self.h)
         self.h.add_patient(102, "Sara", 25, "Cold")
+        self.h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+        self.h.add_doctor("D3", "Dr. Bilal", "Orthopedic", 1800)
         self.h.book_appointment("D2", 102, False)
         self.h.book_appointment("D1", 102, True)        # E-2 for D1
         bill1 = self.h.create_bill(101, "D1", "N-1")   # 2500
@@ -170,6 +176,13 @@ class TestReports(unittest.TestCase):
         self.assertEqual(per_doctor["D3"]["appointments_today"], 0)
 
     def test_empty_day_report_is_all_zeros(self):
+        # A hospital WITH doctors but no activity today: every count
+        # is zero, including one per-doctor row each.
+        self.h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+        self.h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+        self.h.add_doctor("D3", "Dr. Bilal", "Orthopedic", 1800)
+        self.h.add_doctor("D4", "Dr. Sana", "Physician", 1200)
+        self.h.add_doctor("D5", "Dr. Kamran", "Pediatrician", 1500)
         rep = self.h.daily_report()
         self.assertEqual(rep["patients_today"], 0)
         self.assertEqual(rep["appointments_today"], 0)
@@ -259,6 +272,7 @@ class TestBillingPersistence(unittest.TestCase):
         h.billing.close()
         h2 = Hospital(db_path=self.db_path)
         h2.add_patient(102, "Sara", 25, "Cold")
+        h2.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
         h2.book_appointment("D2", 102, False)
         bill2 = h2.create_bill(102, "D2", "N-1")
         self.assertEqual(bill2["id"], 2)

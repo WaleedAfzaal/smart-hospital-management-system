@@ -14,6 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hospital import Hospital  # noqa: E402
 
 
+def _add_doctors(h):
+    """The doctors the edit/delete tests need, added explicitly — a
+    fresh Hospital now starts with zero doctors."""
+    h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+    h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+
+
 class TestSearchPatients(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
@@ -51,6 +58,7 @@ class TestSearchPatients(unittest.TestCase):
 class TestEditPatient(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
+        _add_doctors(self.h)
         self.h.add_patient(101, "Ahmed Khan", 30, "Fever")
         self.h.add_note(101, "First visit")
 
@@ -102,6 +110,7 @@ class TestEditPatient(unittest.TestCase):
         os.remove(path)
         try:
             h = Hospital(db_path=path)
+            h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
             h.add_patient(201, "Sara", 25, "Cold")
             h.edit_patient(201, age=26, problem="Fever")
             h2 = Hospital(db_path=path)
@@ -115,6 +124,7 @@ class TestEditPatient(unittest.TestCase):
 class TestDeletePatient(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
+        _add_doctors(self.h)
         self.h.add_patient(101, "Ahmed Khan", 30, "Fever")
         self.h.add_patient(102, "Sara", 25, "Cold")
         self.h.add_note(101, "First visit")
@@ -168,6 +178,7 @@ class TestDeletePatient(unittest.TestCase):
         os.remove(path)
         try:
             h = Hospital(db_path=path)
+            h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
             h.add_patient(201, "Sara", 25, "Cold")
             h.add_patient(202, "Ali", 40, "Cough")
             h.book_appointment("D1", 201, False)

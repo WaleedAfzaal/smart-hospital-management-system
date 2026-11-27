@@ -26,6 +26,13 @@ def _tomorrow():
     return (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
 
 
+def _add_doctors(h):
+    """The doctors the booking tests need, added explicitly — a fresh
+    Hospital now starts with zero doctors."""
+    h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+    h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+
+
 class TestValidateApptDatetime(unittest.TestCase):
     def test_empty_date_means_today_and_empty_time_means_none(self):
         date, time = validate_appt_datetime(None, None)
@@ -62,6 +69,7 @@ class TestValidateApptDatetime(unittest.TestCase):
 class TestBookingWithDateTime(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
+        _add_doctors(self.h)
         self.h.add_patient(101, "Ahmed", 30, "Fever")
         self.h.add_patient(102, "Sara", 25, "Cold")
 
@@ -107,6 +115,7 @@ class TestBookingWithDateTime(unittest.TestCase):
 class TestScheduleViews(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
+        _add_doctors(self.h)
         self.h.add_patient(101, "Ahmed", 30, "Fever")
         self.h.add_patient(102, "Sara", 25, "Cold")
         self.h.book_appointment("D1", 101, False, _today(), "11:00")
@@ -174,6 +183,7 @@ class TestDateTimePersistence(unittest.TestCase):
 
     def test_date_and_time_survive_restart(self):
         h = Hospital(db_path=self.db_path)
+        h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
         h.add_patient(101, "Ahmed", 30, "Fever")
         h.add_patient(102, "Sara", 25, "Cold")
         h.book_appointment("D1", 101, False, "2026-11-28", "10:30")
@@ -198,6 +208,7 @@ class TestDateTimePersistence(unittest.TestCase):
         the old appointments just never appear in a dated view."""
         h = Hospital(db_path=self.db_path)
         h.add_patient(101, "Ahmed", 30, "Fever")
+        h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
         doc = h.doctors_map["D1"]
         # Simulate a pre-Step-4 heap row: 7 fields, no scheduled date.
         doc["queue"].heap.append(

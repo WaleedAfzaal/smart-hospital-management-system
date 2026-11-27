@@ -8,7 +8,7 @@ It is built around classic data structures — a **singly linked list** for pati
 
 - **Patient Registration & Lookup**: Patients stored in a dict + list with input validation and duplicate-ID prevention; sorted view by ID or age (bubble sort); lookup by ID (binary search) or by name — type part of a name ("ahm" finds "Ahmed Khan") and matching is case-insensitive. A patient's name, age or problem can be edited (the ID never changes); deleting a patient (Admin only, with confirmation) removes their record, notes and queued appointments and frees their bed, while their bills are kept as financial records.
 - **Patient Notes**: Visit notes kept in a linked list per patient; each note counts as a visit.
-- **Doctor Directory**: 5 starter doctors with specialty and token fee. View doctors or add a new one.
+- **Doctor Directory**: Starts empty — add your own doctors with specialty and token fee. View doctors or add a new one.
 - **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…).
 - **Appointment Date & Time**: Every appointment is scheduled for a date (`YYYY-MM-DD`, empty = today) and a time (`HH:MM`, 24-hour, empty = no fixed time). The **Schedule** view lists a day's appointments — for one doctor or all — sorted by time, then Emergency-first. The queue order itself never changes: date/time is for scheduling and display only.
 - **Beds**: 10 beds — assign a patient to a free bed or free an occupied one.

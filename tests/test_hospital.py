@@ -13,6 +13,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hospital import Hospital, binary_search, bubble_sort  # noqa: E402
 
 
+def _add_doctors(h):
+    """The doctors the booking/shift tests need, added explicitly —
+    a fresh Hospital now starts with zero doctors."""
+    h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+    h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+
+
 class TestPatients(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
@@ -60,13 +67,32 @@ class TestPatients(unittest.TestCase):
 class TestDoctorsAndBooking(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
+        _add_doctors(self.h)
         self.h.add_patient(101, "Ahmed", 30, "Fever")
         self.h.add_patient(102, "Sara", 25, "Cold")
 
-    def test_starter_doctors(self):
-        self.assertEqual(len(self.h.doctors_map), 5)
-        self.assertEqual(self.h.doctors_map["D1"]["name"], "Dr. Tariq")
-        self.assertEqual(self.h.doctors_map["D2"]["spec"], "Cardiologist")
+    def test_fresh_hospital_has_no_doctors(self):
+        self.assertEqual(len(Hospital().doctors_map), 0)
+
+    def test_add_doctor_registers_doctor(self):
+        h = Hospital()
+        doc = h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+        self.assertEqual(doc["name"], "Dr. Tariq")
+        self.assertEqual(h.doctors_map["D1"]["spec"], "Neurosurgeon")
+        self.assertEqual(h.doctors_map["D1"]["fee"], 2500)
+        self.assertEqual(len(h.doctors_map), 1)
+        # The doctor joins the shift rotation too.
+        self.assertIn("D1 - Dr. Tariq",
+                      [h.shift_q.items[(h.shift_q.front + i) % h.shift_q.size]
+                       for i in range(h.shift_q.total)])
+        # Duplicate ID and bad values are rejected, nothing changes.
+        with self.assertRaises(ValueError):
+            h.add_doctor("D1", "Dr. Other", "ENT", 100)
+        with self.assertRaises(ValueError):
+            h.add_doctor("D2", "", "ENT", 100)
+        with self.assertRaises(ValueError):
+            h.add_doctor("D2", "Dr. X", "ENT", -50)
+        self.assertEqual(len(h.doctors_map), 1)
 
     def test_booking_tokens(self):
         doc = self.h.doctors_map["D1"]
@@ -94,6 +120,7 @@ class TestDoctorsAndBooking(unittest.TestCase):
 class TestBedsUndoPharmacyShifts(unittest.TestCase):
     def setUp(self):
         self.h = Hospital()
+        _add_doctors(self.h)
         self.h.add_patient(101, "Ahmed", 30, "Fever")
 
     def test_beds_assign_free_and_undo(self):

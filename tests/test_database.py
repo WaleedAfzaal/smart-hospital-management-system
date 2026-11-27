@@ -39,6 +39,16 @@ def _shifts_of(hospital):
     return [q.items[(q.front + i) % q.size] for i in range(q.total)]
 
 
+def _add_five_doctors(h):
+    """The five doctors the persistence tests use, added explicitly —
+    a fresh Hospital now starts with zero doctors."""
+    h.add_doctor("D1", "Dr. Tariq", "Neurosurgeon", 2500)
+    h.add_doctor("D2", "Dr. Ayesha", "Cardiologist", 2000)
+    h.add_doctor("D3", "Dr. Bilal", "Orthopedic", 1800)
+    h.add_doctor("D4", "Dr. Sana", "Physician", 1200)
+    h.add_doctor("D5", "Dr. Kamran", "Pediatrician", 1500)
+
+
 class PersistenceTestCase(unittest.TestCase):
     def setUp(self):
         fd, self.db_path = tempfile.mkstemp(suffix=".db")
@@ -89,6 +99,7 @@ class TestPatientPersistence(PersistenceTestCase):
 class TestAppointmentPersistence(PersistenceTestCase):
     def test_appointments_and_token_numbering_survive_restart(self):
         h = Hospital(db_path=self.db_path)
+        _add_five_doctors(h)
         h.add_patient(101, "Ahmed", 30, "Fever")
         h.add_patient(102, "Sara", 25, "Cold")
         h.book_appointment("D1", 101, False)  # N-1
@@ -142,6 +153,7 @@ class TestBedsPharmacyShiftsPersistence(PersistenceTestCase):
 
     def test_shift_rotation_survives_restart(self):
         h = Hospital(db_path=self.db_path)
+        _add_five_doctors(h)
         h.shift_q.rotate()  # D2 now on duty
         h.shift_q.rotate()  # D3 now on duty
         h.save()
@@ -151,13 +163,13 @@ class TestBedsPharmacyShiftsPersistence(PersistenceTestCase):
         self.assertIn("D3", shifts[0])  # still D3 on duty after restart
         self.assertIn("D4", shifts[1])
 
-    def test_fresh_database_seeds_starter_doctors(self):
+    def test_fresh_database_starts_with_no_doctors(self):
         h = Hospital(db_path=self.db_path)
-        self.assertEqual(len(h.doctors_map), 5)
-        self.assertEqual(h.doctors_map["D1"]["name"], "Dr. Tariq")
+        self.assertEqual(len(h.doctors_map), 0)
+        self.assertEqual(_shifts_of(h), [])
         h2 = self._reopen()
-        self.assertEqual(len(h2.doctors_map), 5)
-        self.assertEqual(_shifts_of(h2)[0], "D1 - Dr. Tariq")
+        self.assertEqual(len(h2.doctors_map), 0)
+        self.assertEqual(_shifts_of(h2), [])
 
     def test_in_memory_hospital_writes_nothing(self):
         h = Hospital()  # no db_path: pure in-memory, as before

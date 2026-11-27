@@ -508,7 +508,7 @@ function renderBook(msg = "", ok = true) {
     body.innerHTML = `
     ${msgHtml(msg, ok)}
     ${offlineBanner()}
-    <p class="muted">Jab server connect ho jayega to yahan 5 starter doctors aa jayenge.</p>`;
+    <p class="muted">Jab server connect ho jayega to yahan tumhare doctors aa jayenge.</p>`;
     return;
   }
   /* Step 4: today's date in local time (toISOString is UTC and can

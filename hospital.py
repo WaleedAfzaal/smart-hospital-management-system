@@ -293,23 +293,16 @@ def binary_search(sorted_items, pid):
 
 class Hospital:
     NUM_BEDS = 10
-    STARTER_DOCTORS = [
-        ("D1", "Dr. Tariq", "Neurosurgeon", 2500),
-        ("D2", "Dr. Ayesha", "Cardiologist", 2000),
-        ("D3", "Dr. Bilal", "Orthopedic", 1800),
-        ("D4", "Dr. Sana", "Physician", 1200),
-        ("D5", "Dr. Kamran", "Pediatrician", 1500),
-    ]
 
     def __init__(self, db_path=None):
+        # A fresh hospital starts with ZERO doctors: the old 5 starter
+        # doctors were removed (Nov 2026) — staff add their own doctors
+        # with add_doctor (CLI menu or web dashboard).
         self.patients_map, self.patients_list, self.doctors_map = {}, [], {}
         self.beds = [0] * self.NUM_BEDS
         self.undo_stack, self.pharmacy_q, self.shift_q = Stack(), Queue(), CircularQueue(20)
-        for doc_id, name, spec, fee in self.STARTER_DOCTORS:
-            self.doctors_map[doc_id] = {"id": doc_id, "name": name, "spec": spec, "fee": fee, "queue": PriorityQueue()}
-            self.shift_q.enqueue(f"{doc_id} - {name}")
-        # Persistence (Step 1): with a db file, load saved state (or seed
-        # the file with this fresh starter state on first run). Without
+        # Persistence (Step 1): with a db file, load saved state (or
+        # save this fresh empty state to the file on first run). Without
         # one, everything stays in memory as before.
         self.db_path = db_path
         self.db = Database(db_path) if db_path else None
@@ -470,6 +463,28 @@ class Hospital:
                   f"{' | ' + when if when else ''}"
                   f"{' [EMERGENCY]' if row[0] == 1 else ''}")
 
+    def add_doctor(self, doc_id, name, spec, fee):
+        """Add one doctor and join them to the shift rotation.
+
+        Raises ValueError on missing ID/name/specialty, a bad fee, or
+        a duplicate doctor ID. Returns the new doctor record.
+        """
+        doc_id = str(doc_id or "").strip().upper()
+        name = str(name or "").strip()
+        spec = str(spec or "").strip()
+        if not doc_id or not name or not spec:
+            raise ValueError("Doctor ID, name and specialty are required.")
+        if isinstance(fee, bool) or not isinstance(fee, int) or fee < 0:
+            raise ValueError("Fee must be a whole number of rupees (0 or more).")
+        if doc_id in self.doctors_map:
+            raise ValueError("Doctor ID already exists.")
+        doc = {"id": doc_id, "name": name, "spec": spec, "fee": fee,
+               "queue": PriorityQueue()}
+        self.doctors_map[doc_id] = doc
+        self.shift_q.enqueue(f"{doc_id} - {name}")
+        self._persist()
+        return doc
+
     def doctors_menu(self, role="Admin"):
         opt = input("  1. View Doctors  2. Add Doctor: ").strip()
         if opt == "1":
@@ -479,13 +494,12 @@ class Hospital:
             if not can(role, "add_doctor"):
                 return print("  Only Admin can add a doctor.")
             doc_id = input("  Doctor ID: ").strip().upper()
-            if doc_id in self.doctors_map:
-                return print("  Doctor ID already exists.")
             name, spec = input("  Name: ").strip(), input("  Specialty: ").strip()
             fee = int(input("  Token Fee: "))
-            self.doctors_map[doc_id] = {"id": doc_id, "name": name, "spec": spec, "fee": fee, "queue": PriorityQueue()}
-            self.shift_q.enqueue(f"{doc_id} - {name}")
-            self._persist()
+            try:
+                self.add_doctor(doc_id, name, spec, fee)
+            except ValueError as exc:
+                return print(f"  {exc}")
             print("  Doctor added.")
 
     def book_appointment(self, doc_id, pid, is_emg, appt_date=None, appt_time=None):

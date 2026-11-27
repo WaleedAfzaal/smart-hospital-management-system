@@ -17,17 +17,15 @@ structures already in the file:
 | `doctors_map` (dict) | Doctors with id, name, specialty, fee, queue |
 | `beds` (list of 10) | Bed slots — `0` = free, otherwise patient id |
 
-Starter doctors (`STARTER_DOCTORS`): D1 Dr. Tariq (Neurosurgeon, 2500),
-D2 Dr. Ayesha (Cardiologist, 2000), D3 Dr. Bilal (Orthopedic, 1800),
-D4 Dr. Sana (Physician, 1200), D5 Dr. Kamran (Pediatrician, 1500).
-They also seed the shift rotation.
+Doctors start empty — staff add their own doctors, and each added
+doctor also joins the shift rotation.
 
 ## Database — Step 1 (SQLite persistence)
 
 - `database.py` — `Database` class (stdlib `sqlite3` only, no new
   dependencies). One file, `hospital.db`, next to `hospital.py`.
-- `Hospital(db_path="hospital.db")` loads saved state on start (or seeds
-  the file with the 5 starter doctors on first run) and saves after
+- `Hospital(db_path="hospital.db")` loads saved state on start (or
+  saves the fresh empty state to the file on first run) and saves after
   every change — add patient/note/doctor, book appointment, bed
   assign/free, undo, pharmacy add/serve, shift rotate. `Hospital()`
   with no path stays fully in-memory (used by the tests).
