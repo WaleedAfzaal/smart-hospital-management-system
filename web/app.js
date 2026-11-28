@@ -34,6 +34,11 @@ const OP_PERMS = {
   /* Step 4 (Schedule): every role may view appointments by date — a
      Doctor linked to one doctor only sees that doctor's day. */
   "schedule": ["Admin", "Doctor", "Receptionist"],
+  /* Step 9 (All Appointments table + details): every role may open
+     it — a Doctor linked to one doctor only sees that doctor's
+     appointments. Editing is Admin/Receptionist only (the server
+     enforces it; the table just hides those buttons for Doctors). */
+  "all-appointments": ["Admin", "Doctor", "Receptionist"],
 };
 
 function canUse(op) {
@@ -229,6 +234,7 @@ const OPS = {
   "billing": ["Billing", "Bills from appointments + extra charges"],
   "reports": ["Reports", "Daily summary — patients, money, beds"],
   "schedule": ["Schedule", "Appointments by date — today or any day"],
+  "all-appointments": ["All Appointments", "Search, filter, sort and export every appointment"],
 };
 
 /* ---------------- Step 7: views + sidebar navigation ---------------- */
@@ -252,6 +258,7 @@ const OP_NAV = {
   "find-patient": "patients", "add-note": "patients",
   "doctors": "doctors", "shifts": "doctors",
   "book-appointment": "appointments", "schedule": "appointments",
+  "all-appointments": "appointments",
   "beds": "beds", "pharmacy": "pharmacy", "billing": "billing",
   "reports": "reports", "departments": "departments",
   "settings": "settings", "change-password": "settings",
@@ -295,6 +302,7 @@ function openOp(op) {
     "billing": renderBilling,
     "reports": renderReports,
     "schedule": renderSchedule,
+    "all-appointments": renderAllAppointments,
   })[op]();
 }
 
@@ -320,6 +328,7 @@ const NAV = [
     { op: "shifts", label: "Shifts" },
   ] },
   { key: "appointments", label: "Appointments", icon: "cal", children: [
+    { op: "all-appointments", label: "All Appointments" },
     { op: "book-appointment", label: "Book Appointment" },
     { op: "schedule", label: "Schedule" },
   ] },
@@ -1345,7 +1354,7 @@ function renderDashboardView() {
     });
     dot.addEventListener("mouseleave", () => tip.classList.add("hidden"));
   });
-  document.getElementById("today-view-all").addEventListener("click", () => openOp("schedule"));
+  document.getElementById("today-view-all").addEventListener("click", () => openOp("all-appointments"));
   document.getElementById("activities-view-all").addEventListener("click", renderActivitiesView);
   document.getElementById("promo-learn").addEventListener("click", renderSettings);
   view.querySelectorAll(".quick-btn[data-op]").forEach((b) => {
@@ -1890,6 +1899,298 @@ async function renderSchedule(date, doctorId) {
     if (!picked) { toast("Pick a date first.", true); return; }
     renderSchedule(picked, document.getElementById("sch-doctor").value || null);
   });
+}
+
+/* ---------------- Step 9: appointments table + details ---------------- */
+
+/* Table state — the filters, sort and page the table is showing.
+   Filtering/sorting/pagination all happen on the server
+   (GET /api/appointments/list); this only remembers what to ask for. */
+let apptFilters = { search: "", date: "", doctor_id: "", department: "",
+                    status: "", sort: "date", order: "asc", page: 1 };
+const APPT_PER_PAGE = 10;
+const APPT_SORTS = ["date", "time", "patient_name", "doctor_name", "status"];
+
+/* The reference the details page opens by — the APT ID, or
+   "D1:N-1" (doctor + token) for appointments booked before Step 8
+   that never got an APT ID. */
+function apptRef(a) {
+  return a.apt_id || `${a.doctor_id}:${a.token}`;
+}
+
+function apptListParams(includePage) {
+  const p = new URLSearchParams();
+  for (const key of ["search", "date", "doctor_id", "department", "status", "sort", "order"]) {
+    if (apptFilters[key]) p.set(key, apptFilters[key]);
+  }
+  if (includePage) {
+    p.set("page", String(apptFilters.page));
+    p.set("per_page", String(APPT_PER_PAGE));
+  }
+  return p;
+}
+
+async function renderAllAppointments() {
+  const docs = state ? state.doctors : [];
+  const departments = [...new Set(docs.map((d) => d.spec).filter(Boolean))].sort();
+  const res = await api(`/api/appointments/list?${apptListParams(true).toString()}`);
+  if (!res.ok) {
+    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+    return;
+  }
+  const rows = res.appointments || [];
+  const total = res.total || 0;
+  const page = res.page || 1;
+  const pages = res.pages || 1;
+  const canEdit = currentUser && ["Admin", "Receptionist"].includes(currentUser.role);
+  const exportQs = apptListParams(false).toString();
+  const sortArrow = (col) => apptFilters.sort === col
+    ? (apptFilters.order === "asc" ? " ▲" : " ▼") : "";
+  const th = (col, label) => `<th data-sort="${col}" style="cursor:pointer;white-space:nowrap">${label}${sortArrow(col)}</th>`;
+  body.innerHTML = `
+    ${state ? "" : offlineBanner()}
+    <div class="form-grid" style="margin-bottom:12px">
+      <div class="field-row">
+        <div class="field"><label>Search (patient, APT ID, token)</label>
+          <input type="text" id="appt-search" placeholder="e.g. Ahmed, APT-0001, N-1" value="${esc(apptFilters.search)}"></div>
+        <div class="field"><label>Date</label>
+          <input type="date" id="appt-date" value="${esc(apptFilters.date)}"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Doctor</label>
+          <select id="appt-doctor">
+            <option value="">All doctors</option>
+            ${docs.map((d) => `<option value="${esc(d.id)}" ${apptFilters.doctor_id === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Department</label>
+          <select id="appt-dept">
+            <option value="">All departments</option>
+            ${departments.map((d) => `<option ${apptFilters.department === d ? "selected" : ""}>${esc(d)}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Status</label>
+          <select id="appt-status">
+            <option value="">All statuses</option>
+            ${APPOINTMENT_STATUSES.map((s) => `<option ${apptFilters.status === s ? "selected" : ""}>${s}</option>`).join("")}
+          </select></div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="appt-apply">Apply Filters</button>
+        <button type="button" class="btn btn-ghost" id="appt-clear">Clear</button>
+        <span style="flex:1"></span>
+        <a class="btn btn-ghost" href="/api/appointments/export.csv?${exportQs}" style="text-decoration:none">Export CSV ↓</a>
+        <a class="btn btn-ghost" href="/api/appointments/export.pdf?${exportQs}" style="text-decoration:none">Export PDF ↓</a>
+      </div>
+    </div>
+    <h3 style="margin:6px 0 8px">Appointments — ${total} found</h3>
+    ${rows.length ? `<table class="tbl"><thead><tr>
+        <th>Appt ID</th>
+        ${th("patient_name", "Patient")}${th("doctor_name", "Doctor")}<th>Department</th>
+        ${th("date", "Date")}${th("time", "Time")}<th>Type</th>
+        ${th("status", "Status")}<th>Actions</th>
+      </tr></thead><tbody>
+      ${rows.map((a) => `<tr>
+        <td>${esc(a.apt_id || "—")}</td>
+        <td>${esc(a.patient_name)} (#${a.patient_id})</td>
+        <td>${esc(a.doctor_name)}</td>
+        <td>${esc(a.department)}</td>
+        <td>${esc(a.appt_date || "—")}</td>
+        <td>${esc(a.appt_time || "—")}</td>
+        <td>${esc(a.appt_type || "General")}${a.emergency ? ' <span class="tag tag-emg">EMERGENCY</span>' : ""}</td>
+        <td><span class="tag ${statusTagClass(a.status || "Pending")}">${esc(a.status || "Pending")}</span></td>
+        <td style="white-space:nowrap">
+          <button type="button" class="btn btn-ghost" data-act="view" data-ref="${esc(apptRef(a))}">View</button>
+          ${canEdit ? `<button type="button" class="btn btn-ghost" data-act="edit" data-ref="${esc(apptRef(a))}">Edit</button>
+          <button type="button" class="btn btn-danger" data-act="cancel" data-ref="${esc(apptRef(a))}" data-doc="${esc(a.doctor_id)}" data-token="${esc(a.token)}">Cancel</button>` : ""}
+        </td></tr>`).join("")}
+    </tbody></table>`
+      : `<p class="muted">No appointments match these filters.</p>`}
+    <div class="btn-row" style="margin-top:12px;align-items:center">
+      <button type="button" class="btn btn-ghost" id="appt-prev" ${page <= 1 ? "disabled" : ""}>← Previous</button>
+      <span class="muted">Page ${page} of ${pages} — ${total} appointment${total === 1 ? "" : "s"}</span>
+      <button type="button" class="btn btn-ghost" id="appt-next" ${page >= pages ? "disabled" : ""}>Next →</button>
+    </div>`;
+  document.getElementById("appt-apply").addEventListener("click", () => {
+    apptFilters.search = document.getElementById("appt-search").value.trim();
+    apptFilters.date = document.getElementById("appt-date").value;
+    apptFilters.doctor_id = document.getElementById("appt-doctor").value;
+    apptFilters.department = document.getElementById("appt-dept").value;
+    apptFilters.status = document.getElementById("appt-status").value;
+    apptFilters.page = 1;
+    renderAllAppointments();
+  });
+  document.getElementById("appt-clear").addEventListener("click", () => {
+    apptFilters = { search: "", date: "", doctor_id: "", department: "",
+                    status: "", sort: "date", order: "asc", page: 1 };
+    renderAllAppointments();
+  });
+  document.getElementById("appt-prev").addEventListener("click", () => {
+    if (apptFilters.page > 1) { apptFilters.page -= 1; renderAllAppointments(); }
+  });
+  document.getElementById("appt-next").addEventListener("click", () => {
+    if (apptFilters.page < pages) { apptFilters.page += 1; renderAllAppointments(); }
+  });
+  document.querySelectorAll("th[data-sort]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const col = el.dataset.sort;
+      if (apptFilters.sort === col) {
+        apptFilters.order = apptFilters.order === "asc" ? "desc" : "asc";
+      } else {
+        apptFilters.sort = col;
+        apptFilters.order = "asc";
+      }
+      apptFilters.page = 1;
+      renderAllAppointments();
+    });
+  });
+  document.querySelectorAll('[data-act="view"]').forEach((btn) =>
+    btn.addEventListener("click", () => renderAppointmentDetail(btn.dataset.ref, false)));
+  document.querySelectorAll('[data-act="edit"]').forEach((btn) =>
+    btn.addEventListener("click", () => renderAppointmentDetail(btn.dataset.ref, true)));
+  document.querySelectorAll('[data-act="cancel"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      if (!confirm(`Cancel appointment ${btn.dataset.ref}?\n\nIts status becomes Cancelled (the slot frees up again).`)) return;
+      const res = await api(`/api/appointments/${btn.dataset.doc}/${btn.dataset.token}/status`, "POST", { status: "Cancelled" });
+      await loadState();
+      toast(res.ok ? res.message : errOf(res), !res.ok);
+      renderAllAppointments();
+    }));
+}
+
+/* Step 9 (details page): everything about one appointment — patient,
+   doctor, date/time, type, reason, notes, fee, payment status,
+   booking date, status + its history — with Edit / Reschedule,
+   Cancel and Print. */
+async function renderAppointmentDetail(ref, editMode) {
+  const res = await api(`/api/appointments/by-id/${encodeURIComponent(ref)}`);
+  if (!res.ok) {
+    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>
+      <div class="btn-row"><button type="button" class="btn btn-ghost" onclick="openOp('all-appointments')">← Back to All Appointments</button></div>`;
+    return;
+  }
+  const a = res.appointment;
+  const p = res.patient || {};
+  const d = res.doctor || {};
+  const pay = res.payment || {};
+  const history = res.history || [];
+  const canEdit = currentUser && ["Admin", "Receptionist"].includes(currentUser.role);
+  const when = [a.appt_date, a.appt_time].filter(Boolean).join(" ") || "No date set";
+  body.innerHTML = `
+    <div class="btn-row no-print" style="margin-bottom:10px">
+      <button type="button" class="btn btn-ghost" onclick="openOp('all-appointments')">← All Appointments</button>
+    </div>
+    <div class="card">
+      <h3>Appointment ${esc(a.apt_id || a.token)} <span class="tag ${statusTagClass(a.status || "Pending")}">${esc(a.status || "Pending")}</span></h3>
+      <div class="kv">
+        <div><b>Patient</b></div><div>${esc(p.name || a.patient_name)} (#${a.patient_id}) — Age ${p.age ?? "—"} — ${esc(p.problem || "")}</div>
+        <div><b>Father Name</b></div><div>${esc(p.father_name || "—")}</div>
+        <div><b>Phone</b></div><div>${esc(p.phone || "—")}</div>
+        <div><b>Gender</b></div><div>${esc(p.gender || "—")}</div>
+        <div><b>Doctor</b></div><div>${esc(d.name || a.doctor_name)} (${esc(d.spec || a.department)}) — Fee Rs ${d.fee ?? a.fee}</div>
+        <div><b>When</b></div><div>${esc(when)}</div>
+        <div><b>Type</b></div><div>${esc(a.appt_type || "General")}${a.emergency ? ' <span class="tag tag-emg">EMERGENCY</span>' : ""}</div>
+        <div><b>Reason</b></div><div>${esc(a.reason || "—")}</div>
+        <div><b>Notes</b></div><div>${esc(a.notes || "—")}</div>
+        <div><b>Booked</b></div><div>${esc(a.booked_date || "—")} — Token ${esc(a.token)}</div>
+        <div><b>Payment</b></div><div>${pay.billed
+          ? `Bill #${pay.bill_id} — Rs ${pay.total} (${esc(pay.status)})`
+          : "Not billed yet."}</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Status History</h3>
+      ${history.length
+        ? `<div class="timeline">${history.map((h) => `<p>${esc(h.changed_at)} | ${esc(h.old_status || "—")} → ${esc(h.new_status)} by ${esc(h.changed_by)}</p>`).join("")}</div>`
+        : `<p class="muted">No status changes yet.</p>`}
+      <div class="field-row no-print" style="margin-top:10px">
+        <div class="field"><label>Change status</label>
+          <select id="det-status">${statusOptions().map((s) => `<option ${s === a.status ? "selected" : ""}>${s}</option>`).join("")}</select></div>
+        <div class="btn-row" style="align-items:flex-end">
+          <button type="button" class="btn btn-primary" id="det-set-status">Update Status</button>
+        </div>
+      </div>
+    </div>
+    <div class="btn-row no-print">
+      ${canEdit ? `<button type="button" class="btn btn-primary" id="det-edit">Edit</button>
+      <button type="button" class="btn btn-primary" id="det-reschedule">Reschedule</button>
+      <button type="button" class="btn btn-danger" id="det-cancel">Cancel Appointment</button>` : ""}
+      ${(!pay.billed && canEdit) ? `<button type="button" class="btn btn-ghost" id="det-bill">Generate Bill</button>` : ""}
+      <button type="button" class="btn btn-ghost" id="det-print">Print</button>
+    </div>
+    <div id="det-edit-slot"></div>`;
+  document.getElementById("det-set-status").addEventListener("click", async () => {
+    const status = document.getElementById("det-status").value;
+    const r = await api(`/api/appointments/${a.doctor_id}/${a.token}/status`, "POST", { status });
+    await loadState();
+    toast(r.ok ? r.message : errOf(r), !r.ok);
+    renderAppointmentDetail(ref, false);
+  });
+  const billBtn = document.getElementById("det-bill");
+  if (billBtn) {
+    billBtn.addEventListener("click", async () => {
+      const r = await api("/api/bills", "POST", { patient_id: a.patient_id, doctor_id: a.doctor_id, token: a.token });
+      await loadState();
+      toast(r.ok ? r.message : errOf(r), !r.ok);
+      renderAppointmentDetail(ref, false);
+    });
+  }
+  document.getElementById("det-print").addEventListener("click", () => window.print());
+  const cancelBtn = document.getElementById("det-cancel");
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", async () => {
+      if (!confirm(`Cancel appointment ${a.apt_id || a.token}?\n\nIts status becomes Cancelled (the slot frees up again).`)) return;
+      const r = await api(`/api/appointments/${a.doctor_id}/${a.token}/status`, "POST", { status: "Cancelled" });
+      await loadState();
+      toast(r.ok ? r.message : errOf(r), !r.ok);
+      renderAppointmentDetail(ref, false);
+    });
+  }
+  const openEdit = () => {
+    const slot = document.getElementById("det-edit-slot");
+    slot.innerHTML = `
+      <form id="f-det-edit" class="form-grid card">
+        <h3>Edit Appointment</h3>
+        <div class="field-row">
+          <div class="field"><label>Date</label>
+            <input type="date" name="date" value="${esc(a.appt_date || "")}" required></div>
+          <div class="field"><label>Time (empty = no fixed time)</label>
+            <input type="time" name="time" value="${esc(a.appt_time || "")}"></div>
+        </div>
+        <div class="field"><label>Type</label>
+          <select name="type">
+            ${["General", "Follow-up", "Emergency"].map((t) => `<option ${t === a.appt_type ? "selected" : ""}>${t}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Reason for Visit</label>
+          <input type="text" name="reason" value="${esc(a.reason || "")}"></div>
+        <div class="field"><label>Additional Notes</label>
+          <input type="text" name="notes" value="${esc(a.notes || "")}"></div>
+        <p class="muted">Changing the type between Emergency and General / Follow-up moves the token (E- ↔ N-) but keeps the Appointment ID, booked date and status. A reschedule onto a taken slot is refused.</p>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+          <button type="button" class="btn btn-ghost" id="det-edit-cancel">Cancel</button>
+        </div>
+      </form>`;
+    document.getElementById("det-edit-cancel").addEventListener("click", () => renderAppointmentDetail(ref, false));
+    document.getElementById("f-det-edit").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const r = await api(`/api/appointments/by-id/${encodeURIComponent(ref)}/edit`, "POST", {
+        date: f.get("date"), time: f.get("time") || "",
+        type: f.get("type"), reason: f.get("reason"), notes: f.get("notes"),
+      });
+      await loadState();
+      if (r.ok) {
+        toast(r.message);
+        renderAppointmentDetail(r.appointment.apt_id || ref, false);
+      } else {
+        toast(errOf(r), true);
+      }
+    });
+  };
+  const editBtn = document.getElementById("det-edit");
+  if (editBtn) editBtn.addEventListener("click", openEdit);
+  const reschedBtn = document.getElementById("det-reschedule");
+  if (reschedBtn) reschedBtn.addEventListener("click", openEdit);
+  if (editMode) openEdit();
 }
 
 /* ------------------------------------------------------------------ boot */

@@ -663,3 +663,26 @@ body.dark .quick-btn { background: #0d2f2a; border-color: #166534; color: #d1fae
 body.dark .quick-btn:hover { background: #14532d; border-color: #34d399; }
 body.dark .quick-btn svg { color: #4ade80; }
 body.dark #dashboard-view .muted { color: #7fb89a; }
+
+/* ---------------- Step 9: appointment details + print ---------------- */
+
+/* Label/value grid on the details page. */
+.kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; }
+.kv > div:nth-child(odd) { color: var(--ink-soft); font-size: 13.5px; }
+.kv > div:nth-child(even) { font-size: 14.5px; }
+.timeline p { margin: 5px 0; font-size: 14px; }
+.timeline p::before { content: "•  "; color: var(--accent); font-weight: 700; }
+
+/* Print (details page): only the appointment itself prints — no
+   sidebar, top bar, footer, toast or buttons. */
+@media print {
+  .sidebar, .app-topbar, .foot, #toast, .no-print, .workspace-head {
+    display: none !important;
+  }
+  body { background: #fff; }
+  .app-main { margin-left: 0 !important; }
+  .app-content { padding: 0; }
+  .workspace, .card { border: none !important; box-shadow: none !important; }
+  .tbl th { background: #fff !important; color: #000 !important; }
+  .tag { border: 1px solid #000 !important; background: #fff !important; color: #000 !important; }
+}

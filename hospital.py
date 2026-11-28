@@ -51,10 +51,27 @@ grew to 14 fields: (priority, seq, token, pid, name, fee,
 booked_date, appt_date, appt_time, status, apt_id, appt_type,
 reason, notes). Old rows load with the new fields empty — their
 APT ID is None and their type reads as General.
+
+Step 9 (Appointments table + details page): ``list_appointments``
+lists every appointment with server-side search (patient name, APT
+ID, token), filters (date, doctor, department, status), sorting and
+pagination; ``get_appointment_by_id`` / ``appointment_detail`` find
+one appointment by its APT ID (rows booked before Step 8 have none —
+"D1:N-1", doctor + token, works for those) with the patient, the
+doctor, the payment status from billing and the status history;
+``edit_appointment`` changes date/time/type/reason/notes — a
+reschedule re-runs the Step 6 double-booking guard, and a type
+change that flips the priority (Emergency <-> the others) changes
+the priority in place and re-orders the queue — the token, the
+APT ID, the booked date, the status and the history all stay put. The table exports as CSV (``appointments_to_csv``)
+and as a PDF (see pdf_export.py) — both respect the active filters.
 """
 
+import csv
 import datetime
 import getpass
+import heapq
+import io
 import os
 import re
 
@@ -966,6 +983,299 @@ class Hospital:
             raise ValueError("Doctor not found.")
         return self.appointments_for_date(date, doctor_id)
 
+    # ------------------------------------------------ Step 9: appointments table + details
+    def all_appointments(self, doctor_id=None):
+        """Every appointment as a public dict (all doctors, or one).
+
+        The table, the exports and the dashboard all read from here,
+        so the numbers are the same everywhere.
+        """
+        out = []
+        for doc in self.doctors_map.values():
+            if doctor_id is not None and doc["id"] != str(doctor_id).upper():
+                continue
+            for row in doc["queue"].heap:
+                out.append(_public_appointment(doc, row))
+        return out
+
+    def get_appointment_by_id(self, apt_id):
+        """(doctor dict, public appointment) for an Appointment ID.
+
+        Returns (None, None) when there is no such appointment. Rows
+        booked before Step 8 have no APT ID — for those, "D1:N-1"
+        (doctor ID, colon, token) also works, so old appointments
+        stay viewable.
+        """
+        ref = str(apt_id or "").strip()
+        if not ref:
+            return None, None
+        for doc in self.doctors_map.values():
+            for row in doc["queue"].heap:
+                if len(row) > 10 and row[10] and row[10] == ref:
+                    return doc, _public_appointment(doc, row)
+        if ":" in ref:
+            doc_id, _, token = ref.partition(":")
+            doc_id = doc_id.strip().upper()
+            doc = self.doctors_map.get(doc_id)
+            if doc is not None:
+                appt = self.get_appointment(doc_id, token.strip())
+                if appt is not None:
+                    return doc, appt
+        return None, None
+
+    def appointment_detail(self, apt_id):
+        """Everything the details page needs for one appointment.
+
+        The appointment, its patient (with Father Name / Phone /
+        Gender), its doctor, the payment status from billing (a bill
+        is found by doctor + token — a token is billed only once) and
+        the recorded status history. None when the ID is unknown.
+        """
+        doc, appt = self.get_appointment_by_id(apt_id)
+        if doc is None:
+            return None
+        pat = self.patients_map.get(appt["patient_id"])
+        if pat is not None:
+            patient = _public_patient(pat)
+        else:
+            # The patient record is gone (a deleted patient's
+            # appointments go with them, so this should not happen)
+            # — show what the appointment row still remembers.
+            patient = {"id": appt["patient_id"],
+                       "name": appt["patient_name"], "age": None,
+                       "problem": "", "visits": 0, "notes": [],
+                       "registered": None, "father_name": "",
+                       "phone": "", "gender": ""}
+        bill = self.billing.find_bill_by_token(doc["id"], appt["token"])
+        if bill is not None:
+            # get_bill adds the computed total (the stored bill only
+            # carries its line items).
+            bill = self.billing.get_bill(bill["id"])
+        payment = {"billed": bill is not None,
+                   "bill_id": bill["id"] if bill else None,
+                   "status": bill["status"] if bill else None,
+                   "total": bill["total"] if bill else None}
+        return {
+            "appointment": appt,
+            "patient": patient,
+            "doctor": {"id": doc["id"], "name": doc["name"],
+                       "spec": doc["spec"], "fee": doc["fee"]},
+            "payment": payment,
+            "history": self.appointment_history(doc["id"], appt["token"]),
+        }
+
+    def filter_appointments(self, search=None, date=None, doctor_id=None,
+                            department=None, status=None, sort="date",
+                            order="asc"):
+        """Every appointment that matches the filters, sorted.
+
+        * ``search`` matches part of the patient name, the APT ID or
+          the token (case-insensitive).
+        * ``date`` is an exact appointment date — rows with no
+          scheduled date never match a date filter.
+        * ``sort`` is date, time, patient_name, doctor_name or
+          status; ``order`` is asc or desc. Rows with no date/time
+          sort last when ascending (first when descending).
+        Raises ValueError on a bad sort/order/date/doctor/status.
+        The list endpoint paginates this; the exports take it whole.
+        """
+        if sort not in ("date", "time", "patient_name", "doctor_name",
+                        "status"):
+            raise ValueError(
+                "Sort must be date, time, patient_name, doctor_name or status.")
+        if order not in ("asc", "desc"):
+            raise ValueError("Order must be asc or desc.")
+        if date:
+            date, _ = validate_appt_datetime(date, None)
+        if doctor_id:
+            doctor_id = str(doctor_id).strip().upper()
+            if doctor_id not in self.doctors_map:
+                raise ValueError("Doctor not found.")
+        if department:
+            department = str(department).strip()
+        if status:
+            status = str(status).strip()
+            if status not in APPOINTMENT_STATUSES:
+                raise ValueError(
+                    "Status must be one of: "
+                    + ", ".join(APPOINTMENT_STATUSES) + ".")
+        search = str(search or "").strip().lower()
+        out = []
+        for a in self.all_appointments(doctor_id):
+            if search and not (search in a["patient_name"].lower()
+                               or search in (a["apt_id"] or "").lower()
+                               or search in a["token"].lower()):
+                continue
+            if date and a["appt_date"] != date:
+                continue
+            if department and a["department"] != department:
+                continue
+            if status and a["status"] != status:
+                continue
+            out.append(a)
+
+        def _key(a):
+            if sort == "date":
+                return (a["appt_date"] or "9999-12-31",
+                        a["appt_time"] or "99:99", a["token"])
+            if sort == "time":
+                return (a["appt_time"] or "99:99",
+                        a["appt_date"] or "9999-12-31", a["token"])
+            if sort == "patient_name":
+                return (a["patient_name"].lower(),
+                        a["appt_date"] or "9999-12-31", a["token"])
+            if sort == "doctor_name":
+                return (a["doctor_name"].lower(),
+                        a["appt_date"] or "9999-12-31", a["token"])
+            return (a["status"], a["appt_date"] or "9999-12-31",
+                    a["token"])
+
+        out.sort(key=_key, reverse=(order == "desc"))
+        return out
+
+    def list_appointments(self, search=None, date=None, doctor_id=None,
+                          department=None, status=None, sort="date",
+                          order="asc", page=1, per_page=10):
+        """One page of the filtered, sorted appointments + the counts.
+
+        ``page`` starts at 1 and is clamped to the last page;
+        ``per_page`` is clamped to 1–100 (default 10). Bad page /
+        per_page values raise ValueError; bad filters raise the same
+        ValueError as ``filter_appointments``.
+        """
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            raise ValueError("Page must be a whole number.")
+        try:
+            per_page = int(per_page)
+        except (TypeError, ValueError):
+            raise ValueError("Per page must be a whole number.")
+        page = max(1, page)
+        per_page = min(100, max(1, per_page))
+        rows = self.filter_appointments(
+            search=search, date=date, doctor_id=doctor_id,
+            department=department, status=status, sort=sort, order=order)
+        total = len(rows)
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, pages)
+        start = (page - 1) * per_page
+        return {"appointments": rows[start:start + per_page],
+                "total": total, "page": page,
+                "per_page": per_page, "pages": pages}
+
+    def edit_appointment(self, apt_id, date=None, time=None, appt_type=None,
+                         reason=None, notes=None, role="Admin",
+                         user_doctor_id=None):
+        """Change an appointment's date/time/type/reason/notes.
+
+        Only the fields you pass change — None means "leave it".
+        An empty date also leaves it (an appointment always has a
+        date); an empty time clears it to "no fixed time"; an empty
+        reason/note clears that field. Returns the updated
+        appointment. Raises ValueError for an unknown appointment, a
+        bad value, or a reschedule onto a slot the doctor already
+        has taken (the Step 6 guard, re-run here — the appointment
+        itself never blocks its own slot), and PermissionError when
+        the role may not edit details: only Admin and Receptionist
+        may — a Doctor may only update the consultation status
+        (Step 6) and never edits an appointment's details.
+
+        A type change that flips the queue priority (Emergency <->
+        General/Follow-up) changes the priority field in place and
+        re-orders the queue — the token stays the same, so the bill
+        and the status history (both keyed by doctor + token) stay
+        linked to the appointment. The APT ID, the status and the
+        history are never touched by an edit.
+        """
+        if role not in ("Admin", "Receptionist"):
+            raise PermissionError(
+                "Doctors cannot edit appointment details — they can only "
+                "update the consultation status.")
+        doc, appt = self.get_appointment_by_id(apt_id)
+        if doc is None:
+            raise ValueError("Appointment not found.")
+        row = next((r for r in doc["queue"].heap
+                    if r[2] == appt["token"]), None)
+        if row is None:
+            raise ValueError("Appointment not found.")
+        new_date = appt["appt_date"]
+        if date:
+            new_date, _ = validate_appt_datetime(date, None)
+        new_time = appt["appt_time"]
+        if time is not None:
+            if time == "":
+                new_time = None
+            else:
+                _, new_time = validate_appt_datetime(None, time)
+        new_type = appt["appt_type"]
+        if appt_type:
+            new_type = str(appt_type).strip()
+            if new_type not in APPOINTMENT_TYPES:
+                raise ValueError(
+                    "Type must be General, Follow-up or Emergency.")
+        new_reason = appt["reason"] if reason is None else str(reason).strip()
+        new_notes = appt["notes"] if notes is None else str(notes).strip()
+        # ---- The Step 6 guard, re-run for the new slot — but never
+        # against the appointment itself.
+        if new_date and new_time:
+            for other in doc["queue"].heap:
+                if other[2] == appt["token"]:
+                    continue
+                other_date = other[7] if len(other) > 7 else None
+                other_time = other[8] if len(other) > 8 else None
+                if (other_date == new_date and other_time == new_time
+                        and _row_status(other) not in _INACTIVE_STATUSES):
+                    raise ValueError(
+                        f"{doc['name']} already has an appointment at "
+                        f"{new_date} {new_time} (token {other[2]}, "
+                        f"{_row_status(other)}). Pick another time.")
+        new_is_emg = new_type == "Emergency"
+        # Same priority — rebuild the row in place (heap order only
+        # depends on fields 0/1, so the heap stays valid). A priority
+        # flip (Emergency <-> the others) changes field 0, so the
+        # queue is re-ordered with heapify — the token stays the
+        # same, so the bill and the status history (both keyed by
+        # doctor + token) stay linked. Old rows (shorter than 14
+        # fields) are padded out properly here.
+        new_row = (
+            1 if new_is_emg else 2, row[1], row[2], row[3], row[4],
+            row[5],
+            row[6] if len(row) > 6 else None,
+            new_date, new_time, _row_status(row),
+            row[10] if len(row) > 10 else None,
+            new_type, new_reason, new_notes,
+        )
+        idx = next((i for i, r in enumerate(doc["queue"].heap)
+                    if r[2] == appt["token"]), None)
+        doc["queue"].heap[idx] = new_row
+        if new_is_emg != (row[0] == 1):
+            heapq.heapify(doc["queue"].heap)
+        self._persist()
+        return _public_appointment(doc, new_row)
+
+    def appointments_to_csv(self, rows):
+        """The given appointment dicts as a CSV string — stdlib csv only.
+
+        One row per appointment, all columns. Opens in Excel.
+        """
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["Appointment ID", "Token", "Patient Name",
+                         "Patient ID", "Doctor", "Department", "Date",
+                         "Time", "Type", "Status", "Fee (Rs)", "Reason"])
+        for a in rows:
+            writer.writerow([a.get("apt_id") or "", a.get("token", ""),
+                             a.get("patient_name", ""),
+                             a.get("patient_id", ""),
+                             a.get("doctor_name", ""),
+                             a.get("department", ""),
+                             a.get("appt_date") or "",
+                             a.get("appt_time") or "",
+                             a.get("appt_type", ""), a.get("status", ""),
+                             a.get("fee", ""), a.get("reason", "")])
+        return out.getvalue()
+
     def beds_menu(self):
         for i, bed in enumerate(self.beds, 1):
             print(f"  Bed {i}: {'Free' if bed == 0 else f'Patient {bed}'}")
@@ -1537,6 +1847,157 @@ def appointment_status_menu(hosp, role, user):
     print(f"  Status updated: {token} is now {updated['status']}.")
 
 
+def appointments_table_menu(hosp, role, user):
+    """All Appointments (Step 9, menu 21): the appointments table on
+    the command line — search + filters, paged 10 at a time, then
+    pick one by Appointment ID for the full details, edit/reschedule
+    or cancel. Doctors only ever see their own queue; only
+    Admin/Receptionist may edit or cancel."""
+    doctor_filter = None
+    if role == "Doctor" and user.get("doctor_id"):
+        doctor_filter = user["doctor_id"]
+    print("\n  --- All Appointments ---")
+    search = input("  Search (patient name / APT ID / token, empty = all): ").strip() or None
+    date = input("  Date (YYYY-MM-DD, empty = all dates): ").strip() or None
+    if doctor_filter:
+        doc_id = doctor_filter
+        print(f"  Doctor: {doctor_filter} (your queue)")
+    else:
+        doc_id = input("  Doctor ID (empty = all doctors): ").strip().upper() or None
+    dept = input("  Department (empty = all): ").strip() or None
+    status = input("  Status (empty = all): ").strip() or None
+    sort = input("  Sort by (date/time/patient_name/doctor_name/status, empty = date): ").strip() or "date"
+    page = 1
+    while True:
+        try:
+            result = hosp.list_appointments(
+                search=search, date=date, doctor_id=doc_id,
+                department=dept, status=status, sort=sort,
+                page=page, per_page=10)
+        except ValueError as exc:
+            return print(f"  {exc}")
+        rows = result["appointments"]
+        print(f"\n  --- Appointments — page {result['page']} of {result['pages']} ({result['total']} total) ---")
+        if not rows:
+            print("  No appointments match.")
+        for a in rows:
+            when = (a["appt_date"] or "no date") \
+                + (f" {a['appt_time']}" if a["appt_time"] else "")
+            print(f"  {a['apt_id'] or '—':8} | {a['patient_name']} (#{a['patient_id']}) | "
+                  f"{a['doctor_name']} ({a['department']}) | {when} | "
+                  f"{a['appt_type']} | {a['status']}")
+        choice = input("  [N]ext page / [P]revious / APT ID to open / [Enter] back: ").strip()
+        if not choice:
+            return
+        if choice.upper() == "N":
+            if page < result["pages"]:
+                page += 1
+            else:
+                print("  Already on the last page.")
+            continue
+        if choice.upper() == "P":
+            if page > 1:
+                page -= 1
+            else:
+                print("  Already on the first page.")
+            continue
+        _appointment_detail_menu(hosp, role, user, choice)
+
+
+def _appointment_detail_menu(hosp, role, user, apt_ref):
+    """Full details for one appointment (Step 9) — everything the
+    details page shows, plus edit/reschedule and cancel for
+    Admin/Receptionist. Returns when the user goes back."""
+    detail = hosp.appointment_detail(apt_ref)
+    if detail is None:
+        return print("  Appointment not found.")
+    a, pat, doc, pay = (detail["appointment"], detail["patient"],
+                        detail["doctor"], detail["payment"])
+    if role == "Doctor" and user.get("doctor_id") \
+            and user["doctor_id"].upper() != a["doctor_id"]:
+        return print("  Doctors can only view appointments in their own queue.")
+    print(f"\n  --- Appointment {a['apt_id'] or a['token']} ---")
+    print(f"  Patient: {pat['name']} (#{pat['id']}) | Age {pat.get('age')} | {pat.get('problem') or ''}")
+    if pat.get("father_name") or pat.get("phone") or pat.get("gender"):
+        print(f"  Father: {pat.get('father_name') or '—'} | Phone: {pat.get('phone') or '—'} | Gender: {pat.get('gender') or '—'}")
+    print(f"  Doctor: {doc['name']} ({doc['spec']}) | Fee Rs {doc['fee']}")
+    when = (a["appt_date"] or "no date") \
+        + (f" {a['appt_time']}" if a["appt_time"] else "")
+    print(f"  When: {when} | Type: {a['appt_type']} | Status: {a['status']}")
+    print(f"  Reason: {a['reason'] or '—'} | Notes: {a['notes'] or '—'}")
+    print(f"  Booked: {a['booked_date'] or '—'} | Token: {a['token']}")
+    if pay["billed"]:
+        print(f"  Payment: Bill #{pay['bill_id']} — Rs {pay['total']} ({pay['status']})")
+    else:
+        print("  Payment: Not billed yet.")
+    history = detail["history"]
+    if history:
+        print("  History:")
+        for h in history:
+            print(f"    {h['changed_at']} | {h['old_status'] or '—'} -> {h['new_status']} by {h['changed_by']}")
+    else:
+        print("  No status changes yet.")
+    can_edit = role in ("Admin", "Receptionist")
+    while True:
+        prompt = "  [B]ack" if not can_edit \
+            else "  [E]dit / Reschedule  [C]ancel appointment  [B]ack"
+        choice = input(prompt + ": ").strip().upper()
+        if choice in ("B", ""):
+            return
+        if not can_edit:
+            print("  Only Admin / Receptionist can edit or cancel.")
+            continue
+        if choice == "E":
+            date_raw = input(f"  New date [{a['appt_date']}] (Enter = keep): ").strip()
+            time_raw = input(f"  New time [{a['appt_time'] or 'no fixed time'}] (Enter = keep, 'none' = no fixed time): ").strip()
+            type_raw = input(f"  New type [{a['appt_type']}] (General/Follow-up/Emergency, Enter = keep): ").strip()
+            reason = input(f"  New reason [{a['reason']}] (Enter = keep): ").strip()
+            notes = input(f"  New notes [{a['notes']}] (Enter = keep): ").strip()
+            kwargs = {}
+            if date_raw:
+                kwargs["date"] = date_raw
+            if time_raw:
+                kwargs["time"] = "" if time_raw.lower() == "none" else time_raw
+            if type_raw:
+                kwargs["appt_type"] = type_raw.title()
+            if reason:
+                kwargs["reason"] = reason
+            if notes:
+                kwargs["notes"] = notes
+            if not kwargs:
+                print("  Nothing changed.")
+                continue
+            try:
+                updated = hosp.edit_appointment(
+                    a["apt_id"] or f"{a['doctor_id']}:{a['token']}",
+                    role=role, **kwargs)
+            except (ValueError, PermissionError) as exc:
+                print(f"  {exc}")
+                continue
+            print(f"  Updated: {updated['apt_id']} ({updated['token']}) | "
+                  f"{updated['appt_date']}"
+                  f"{(' ' + updated['appt_time']) if updated['appt_time'] else ''} | "
+                  f"{updated['appt_type']} | {updated['status']}")
+            detail = hosp.appointment_detail(
+                updated["apt_id"] or f"{updated['doctor_id']}:{updated['token']}")
+            a = detail["appointment"]
+            continue
+        if choice == "C":
+            if input("  Cancel this appointment? Type YES to confirm: ").strip().upper() != "YES":
+                print("  Not cancelled.")
+                continue
+            try:
+                updated = hosp.update_status(
+                    a["doctor_id"], a["token"], "Cancelled",
+                    changed_by=user["username"], role=role)
+            except (ValueError, PermissionError) as exc:
+                print(f"  {exc}")
+                continue
+            print(f"  Cancelled: {updated['token']} is now {updated['status']}.")
+            return
+        print("  Pick E, C or B.")
+
+
 def book_appointment_menu(hosp):
     """Book Appointment (Step 8, menu 6): the full booking form on the
     command line — search an existing patient (ID / name / phone) or
@@ -1824,6 +2285,7 @@ MENU = [
     ("18", "Edit Patient", "edit_patient"),    # Step 5
     ("19", "Delete Patient", "delete_patient"),  # Step 5, Admin only
     ("20", "Appointment Status", "update_appointment_status"),  # Step 6
+    ("21", "All Appointments", "view"),  # Step 9: table + details
 ]
 
 
@@ -1902,6 +2364,8 @@ def main():
             delete_patient_menu(hosp)
         elif choice == "20":
             appointment_status_menu(hosp, role, user)
+        elif choice == "21":
+            appointments_table_menu(hosp, role, user)
 
 
 if __name__ == "__main__":

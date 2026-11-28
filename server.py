@@ -67,6 +67,23 @@ object to register inline. Every booking gets a unique Appointment
 ID (APT-0001, ...) returned with the appointment, and
 ``GET /api/appointments/slots?doctor_id=...&date=...`` lists that
 doctor's booked times for the day.
+
+Step 9 (Appointments table + details page): ``GET
+/api/appointments/list`` lists every appointment with server-side
+search (patient name, APT ID, token), filters (date, doctor,
+department, status), sorting and pagination; ``GET
+/api/appointments/by-id/<apt_id>`` returns one appointment with its
+patient, doctor, payment status and status history (rows booked
+before Step 8 have no APT ID — "D1:N-1", doctor + token, works for
+those); ``POST /api/appointments/by-id/<apt_id>/edit`` changes
+date/time/type/reason/notes (Admin/Receptionist only — a reschedule
+re-runs the double-booking guard, and a type change that flips the
+priority changes it in place and re-orders the queue, keeping the
+token, the APT ID and the history); the table
+exports as CSV (``GET /api/appointments/export.csv``) and as a PDF
+(``GET /api/appointments/export.pdf``, pure-Python generator, no
+dependencies) — both respect the active filters. A Doctor user linked
+to one doctor only ever sees that doctor's appointments.
 """
 
 import argparse
@@ -86,6 +103,7 @@ from hospital import (APPOINTMENT_TYPES, BOOKING_STATUSES, DEFAULT_DB_PATH,
                       Hospital, PriorityQueue, binary_search, bubble_sort,
                       validate_appt_datetime, validate_gender,
                       validate_patient_details, validate_phone)
+from pdf_export import appointments_pdf
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOST = "127.0.0.1"
@@ -316,6 +334,29 @@ def _parse_int(value: Any) -> Optional[int]:
         return None
 
 
+def _appt_list_params(query: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Filter/sort/page params shared by the Step 9 list and export
+    routes — only the keys the caller actually sent."""
+    params: Dict[str, Any] = {}
+    for key in ("search", "date", "doctor_id", "department", "status",
+                "sort", "order", "page", "per_page"):
+        value = query.get(key, [None])[0]
+        if value not in (None, ""):
+            params[key] = value
+    return params
+
+
+def _filters_note(params: Dict[str, Any], total: int) -> str:
+    """One line for the PDF subtitle: which filters were applied and
+    how many appointments matched, plus today's date."""
+    bits = [f"{key}={params[key]}" for key in
+            ("search", "date", "doctor_id", "department", "status")
+            if params.get(key)]
+    note = "All appointments" if not bits else "Filters: " + ", ".join(bits)
+    return (f"{note}  •  {total} appointment(s)  •  "
+            f"{datetime.date.today().isoformat()}")
+
+
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
     # On Windows, SO_REUSEADDR allows two processes to bind the same port at once,
     # causing requests to hit a stale background server. Disable it on Windows.
@@ -366,6 +407,19 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 "Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_bytes(self, data: bytes, content_type: str,
+                    filename: Optional[str] = None) -> None:
+        """Binary download response (used for the PDF export)."""
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(data)
 
     def _forbidden(self, role: str) -> None:
         """403 answer when a logged-in role tries something it may not do."""
@@ -549,6 +603,78 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "ok": True, "doctor_id": doctor_id, "date": date,
                     "booked": booked,
                 })
+
+            # ---- Step 9: the appointments table — server-side
+            # search, filters, sorting and pagination. A Doctor user
+            # linked to one doctor only ever sees that doctor's
+            # appointments, whatever they ask for.
+            if path == "/api/appointments/list":
+                params = _appt_list_params(query)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    params["doctor_id"] = doctor_filter
+                try:
+                    result = hospital.list_appointments(**params)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({"ok": True, **result})
+
+            # ---- Step 9: the same filtered table as a download —
+            # CSV (opens in Excel) or PDF (pure-Python generator).
+            # No pagination here: every matching row is exported.
+            if path == "/api/appointments/export.csv":
+                params = _appt_list_params(query)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    params["doctor_id"] = doctor_filter
+                params.pop("page", None)
+                params.pop("per_page", None)
+                try:
+                    rows = hospital.filter_appointments(**params)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_text(
+                    hospital.appointments_to_csv(rows),
+                    "text/csv; charset=utf-8", "appointments.csv")
+
+            if path == "/api/appointments/export.pdf":
+                params = _appt_list_params(query)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    params["doctor_id"] = doctor_filter
+                params.pop("page", None)
+                params.pop("per_page", None)
+                try:
+                    rows = hospital.filter_appointments(**params)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_bytes(
+                    appointments_pdf(
+                        rows, "Appointments — City Care Hospital",
+                        _filters_note(params, len(rows))),
+                    "application/pdf", "appointments.pdf")
+
+            # ---- Step 9: one appointment's full details — patient,
+            # doctor, payment status and status history. A Doctor
+            # linked to one doctor may only open their own queue's.
+            if path.startswith("/api/appointments/by-id/"):
+                raw = path.removeprefix("/api/appointments/by-id/").strip("/")
+                if not raw or "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                apt_id = urllib.parse.unquote(raw)
+                detail = hospital.appointment_detail(apt_id)
+                if detail is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Appointment not found."}, 404)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None \
+                        and doctor_filter != detail["appointment"]["doctor_id"]:
+                    return self._forbidden(self._user["role"])
+                return self._send_json({"ok": True, **detail})
 
             # ---- Step 6: status history for one appointment
             # (doctor + token). Every role may read it; a Doctor
@@ -1112,6 +1238,47 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "message": f"Status updated: {token} is now {updated['status']}.",
                     "appointment": updated,
                     "history": hospital.appointment_history(doc_id, token),
+                })
+
+            # ---- Step 9: edit an appointment's date/time/type/
+            # reason/notes. Admin/Receptionist only (a Doctor gets
+            # 403 — they update the consultation status, never the
+            # details). Only the keys sent change; a reschedule
+            # re-runs the double-booking guard, and a type change
+            # that flips the priority changes it in place and
+            # re-orders the queue (token, APT ID and history kept).
+            if path.startswith("/api/appointments/by-id/") and path.endswith("/edit"):
+                if not can(role, "edit_appointment"):
+                    return self._forbidden(role)
+                raw = path.removeprefix("/api/appointments/by-id/").removesuffix("/edit").strip("/")
+                if not raw or "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                apt_id = urllib.parse.unquote(raw)
+                mapping = {"date": "date", "time": "time",
+                           "type": "appt_type", "reason": "reason",
+                           "notes": "notes"}
+                kwargs = {param: data[key] for key, param in mapping.items()
+                          if key in data}
+                # Unknown APT ID is a 404, not a 400 (the same rule as
+                # the details endpoint).
+                if hospital.get_appointment_by_id(apt_id)[0] is None:
+                    return self._send_json(
+                        {"ok": False, "error": "Appointment not found."}, 404)
+                try:
+                    updated = hospital.edit_appointment(
+                        apt_id, role=role,
+                        user_doctor_id=self._user.get("doctor_id"), **kwargs)
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "message": f"Appointment {updated['apt_id'] or updated['token']} updated.",
+                    "appointment": updated,
                 })
 
             # ---- Beds: assign / free

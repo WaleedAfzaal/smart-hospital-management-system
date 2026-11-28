@@ -432,6 +432,93 @@ doctor also joins the shift rotation.
   / reason / notes / status, slots endpoint, validation 400s,
   Doctor booking 403, search by phone/ID, new fields on add/edit).
 
+## Appointments Table + Details Page — Step 9 (`hospital.py` + `pdf_export.py` + `server.py` + `web/`)
+
+- **List** (`Hospital.list_appointments` / `filter_appointments`):
+  the whole table is built from all doctors' heaps, flattened to
+  plain appointment dicts (patient + doctor names resolved in the
+  same pass) and filtered in memory — the hospital is small, and
+  this keeps the search (patient name / APT ID / token) and the
+  date/doctor/department/status filters in one place. Sorting is by
+  date, time, patient name, doctor name or status, ascending or
+  descending; undated/untimed rows sort last in ascending order.
+  `list_appointments` clamps `per_page` to 1–100 (default 10) and
+  `page` to the last page, and returns `{appointments, total,
+  pages, page, per_page}`. The pre-Step-8 rows with no APT ID ride
+  along with `apt_id` `None` (the table shows "—" for those).
+- **Detail** (`Hospital.get_appointment_by_id` /
+  `appointment_detail`): finds an appointment by its APT ID — or by
+  `"D1:N-1"` (doctor + token) for rows booked before Step 8, which
+  have no APT ID — and returns the appointment plus the patient
+  (with father/phone/gender), the doctor, the payment status from
+  billing (`find_bill_by_token` → `get_bill`, so the total is the
+  computed sum of the line items) and the status history. Returns
+  `None` for an unknown ID.
+- **Edit** (`Hospital.edit_appointment`, `auth.py` permission
+  `"edit_appointment"` = Admin + Receptionist): only the fields sent
+  change — empty `date` keeps the current date, empty `time` clears
+  the time (no fixed time). A date/time change re-runs the Step 6
+  double-booking guard **excluding the appointment itself** (a
+  reschedule onto the appointment's own slot is allowed; a taken
+  slot gets the same 400 naming the token in the way). A type change
+  that flips the queue priority changes field 0 in place and
+  re-orders the queue with `heapq.heapify` — the token stays the
+  same, so the bill and the status history (both keyed by doctor +
+  token) stay linked to the appointment, and the APT ID, the status
+  and the history are never touched. A type change inside the same
+  priority just rebuilds the row in place. Old rows shorter than 14
+  fields are padded out properly here. A Doctor gets a
+  `PermissionError`; an unknown APT ID or a bad value gets a
+  `ValueError`.
+- **Export:** `Hospital.appointments_to_csv(rows)` — 12 columns, one
+  row per appointment. `pdf_export.py` is a small pure-Python PDF
+  generator (stdlib only — no reportlab, no new dependency): it
+  builds a landscape-A4 PDF by hand (catalog, pages, Helvetica +
+  Helvetica-Bold, content streams, a cross-reference table with
+  real byte offsets, `%%EOF`) with a title, the date and the active
+  filters, the table (9 columns, long text truncated) and page
+  numbers, paginated. Latin-1 sanitisation + PDF-string escaping
+  keep any patient/doctor name safe inside the file.
+- **API:** `GET /api/appointments/list` (server-side filters/sort/
+  page), `GET /api/appointments/by-id/<apt_id>` (full detail),
+  `POST /api/appointments/by-id/<apt_id>/edit` (unknown APT ID is
+  a 404, not a 400), `GET /api/appointments/export.csv` and
+  `/export.pdf` (the current filters, no pagination, `Content-
+  Disposition: attachment`). The exports return a binary download
+  via the server's `_send_bytes`. A Doctor user linked to one doctor
+  is forced to their own doctor on every one of these endpoints
+  (list, detail, edit → 403, exports).
+- **CLI:** menu **21. All Appointments** (`appointments_table_menu`
+  + `_appointment_detail_menu`): the same filters + sort, paged 10
+  at a time ([N]ext / [P]revious / APT ID to open / Enter back),
+  then the full details (patient, doctor, fee, payment, history)
+  with [E]dit / Reschedule, [C]ancel (typed `YES` to confirm) and
+  [B]ack. A Doctor sees only their own queue and is read-only.
+- **Web:** the **All Appointments** view (sidebar Appointments, or
+  the dashboard's "View All") is a filter bar (search/date/doctor/
+  department/status + Apply/Clear) over a table with clickable
+  sortable headers (▲/▼), pagination (Prev/Next + counts) and
+  Export CSV / Export PDF links that carry the current filters;
+  each row has View / Edit / Cancel (Edit/Cancel hidden for
+  Doctor). The details view shows the details grid, the payment
+  block (with a Generate Bill button when unbilled), the
+  status-history timeline, a status-change dropdown (Step 6 rules),
+  one edit/reschedule form, Cancel with confirmation and **Print**
+  (`window.print()` + `@media print` rules that hide the sidebar,
+  top bar and buttons). After edit/reschedule/cancel the table
+  refreshes to show the change. No new dependency — the PDF is
+  generated server-side in pure Python.
+- Tests: `tests/test_appointments_table.py` (list filters each
+  alone + combined, search matching, sorting each sortable column
+  in both orders, pagination boundaries + total count, detail by
+  APT ID incl. payment status + history + the `"D1:N-1"` fallback,
+  edit field changes / reschedule / double-booking refusal /
+  type-flip keeping the token + re-ordering the queue / roles /
+  restart persistence, cancel via the status endpoint, CSV + PDF
+  exports incl. filters respected and the PDF's xref offsets, the
+  HTTP endpoints incl. 404/400/403 rules, and the CLI table menu
+  incl. Doctor seeing only their own queue).
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.
@@ -480,6 +567,9 @@ role enforcement, history persistence, plus
 Step 8 adds `tests/test_book_appointment.py` (Appointment IDs,
 patient search by ID/name/phone, new patient fields, type → token,
 booked-times/slots endpoint, inline new-patient booking over HTTP).
+Step 9 adds `tests/test_appointments_table.py` (list filters/search/
+sort/pagination, detail incl. payment + history, edit incl. reschedule
+guard + type flip, CSV + PDF exports, HTTP role rules, CLI table menu).
 Run with:
 
 ```bash

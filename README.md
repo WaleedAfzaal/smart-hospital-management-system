@@ -12,6 +12,7 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Priority Appointments**: Book an appointment as Emergency or Normal — emergency tokens (`E-1`, `E-2`…) are always served before normal ones (`N-1`, `N-2`…). Every booking gets a unique Appointment ID (`APT-0001`, …) and a Type (General / Follow-up / Emergency), a Reason for Visit and Notes.
 - **Appointment Date & Time**: Every appointment is scheduled for a date (`YYYY-MM-DD`, empty = today) and a time (`HH:MM`, 24-hour, empty = no fixed time). The **Schedule** view lists a day's appointments — for one doctor or all — sorted by time, then Emergency-first. The queue order itself never changes: date/time is for scheduling and display only.
 - **Appointment Statuses**: Every appointment has a status — Pending, Confirmed, Checked In, In Progress, Completed, Cancelled or No Show. New appointments start Pending; every change is recorded with who made it and when, and the history survives a restart. Booking refuses a double booking: the same doctor cannot have two active appointments at the same date and time. Admin and Receptionist can set any status; a Doctor can only move their own queue's appointments to Checked In, In Progress or Completed.
+- **Appointments Table & Details**: **All Appointments** lists every appointment with search (name / APT ID / token), filters (date, doctor, department, status), sortable columns and pagination (10 per page, server-side). Click **View** for the full details — patient, doctor, fee, payment status, booking date and the status-history timeline — with Edit, Reschedule (double-booking check re-run), Cancel and Print. Export the filtered table as **CSV** (Excel) or **PDF** (pure-Python generator, no new dependency).
 - **Beds**: 10 beds — assign a patient to a free bed or free an occupied one.
 - **Undo**: One-click undo for the last action (add patient, add note, book appointment, bed assign/free), powered by an undo stack.
 - **Pharmacy Queue**: FIFO token queue — add a token, serve the next one, or view the line.
@@ -150,6 +151,49 @@ registered before this feature simply show those fields as empty).
   sidebar, or the Quick Action on the dashboard) is the same three
   steps, with live patient search and live booked-times.
 
+## Appointments Table & Details Page
+
+**All Appointments** (Appointments in the sidebar, or **View All** on
+the dashboard's Today's Appointments table) lists every appointment
+in one table: Appointment ID, Patient Name, Doctor Name, Department,
+Date, Time, Type, Status and Actions (View / Edit / Cancel).
+
+- **Search** matches patient name, Appointment ID or token ("bilal",
+  "APT-0002", "E-1").
+- **Filters** — date, doctor, department (specialization) and status;
+  **sortable columns** (date, time, patient name, doctor name,
+  status — click a column header); **pagination**, 10 per page, with
+  page controls and the total count. Filtering, sorting and
+  pagination happen on the server, so the browser only ever loads one
+  page.
+- **Export** downloads the *currently filtered* table as a **CSV**
+  (opens in Excel) or a **PDF** (title, date and the active filters
+  noted at the top, paginated, with page numbers).
+- **Details page** — click **View** on any row: patient details
+  (including Father Name, Phone, Gender), doctor details, department,
+  date/time, type, reason, notes, fee, **payment status** (Paid /
+  Unpaid / Not billed yet), booking date and status, plus the full
+  **status-history timeline** (who changed what, when). From there
+  you can **Edit** (date/time/type/reason/notes), **Reschedule**
+  (a date/time change re-runs the double-booking check and refuses a
+  taken slot, exactly like booking), **Cancel** (with confirmation)
+  and **Print** (a print-friendly layout of the details page).
+  After any change the table refreshes to show it.
+- A type change that flips the priority (General ↔ Emergency)
+  changes the priority in place and re-orders the queue — the token,
+  the Appointment ID, the status and the status history all stay put,
+  so the bill and the history stay linked to the appointment.
+- **Roles:** Admin and Receptionist can view, edit, reschedule and
+  cancel; a Doctor sees only their own queue and cannot edit
+  appointment details (they still update the consultation statuses —
+  Checked In / In Progress / Completed — from the status control).
+
+- **CLI:** menu option **21. All Appointments** lists appointments
+  with the same filters (search, date, doctor, department, status,
+  sort, paged 10 at a time); pick one by Appointment ID for the full
+  details, then edit/reschedule or cancel (Admin/Receptionist only;
+  a Doctor sees only their own queue).
+
 ## Patient Search, Edit & Delete
 
 **Search by ID, name or phone:** type all or part of a name — "ahm"
@@ -254,6 +298,8 @@ python hospital.py
 ├── auth.py                   # Login & roles — password hashing, users table, permissions
 ├── billing.py                # Billing & reports data — bills table, totals, CSV export
 ├── database.py               # SQLite persistence — save/load whole state to hospital.db
+├── pdf_export.py             # Pure-Python PDF generator (stdlib only) for the appointments table
+├── status_history.py         # Append-only appointment status history table
 ├── hospital.db               # Local database file (auto-created, gitignored, never committed)
 ├── server.py                 # ThreadingHTTPServer, static file serving, and JSON REST API
 ├── web/
@@ -270,6 +316,10 @@ python hospital.py
 │   ├── test_auth.py         # Login, password hashing, and role permission tests
 │   ├── test_billing.py      # Billing, reports, CSV export, and persistence tests
 │   ├── test_appointments.py # Appointment date/time, schedule views, migration tests
+│   ├── test_appointment_status.py # Appointment statuses, history, double-booking guard
+│   ├── test_dashboard.py    # Step 7 dashboard data + API tests
+│   ├── test_book_appointment.py # Step 8 booking form, APT IDs, slots endpoint
+│   ├── test_appointments_table.py # Step 9 table, details, edit, CSV/PDF export
 │   ├── test_patients.py     # Patient search by name, edit, delete, delete rule
 │   └── test_database.py     # Persistence round-trip tests (save → restart → reload)
 ├── CONTRIBUTING.md

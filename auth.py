@@ -72,6 +72,13 @@ PERMISSIONS = {
     # Checked In, In Progress or Completed; Admin and Receptionist
     # may set any status on any queue.
     "update_appointment_status": {"Admin", "Doctor", "Receptionist"},
+    # Step 9 (Appointments table + details): editing an
+    # appointment's date/time/type/reason/notes is Admin +
+    # Receptionist only — a Doctor may only update the consultation
+    # status (Step 6) and never edits an appointment's details.
+    # Viewing the table is "view" (every role; a Doctor linked to
+    # one doctor only ever sees that doctor's appointments).
+    "edit_appointment": {"Admin", "Receptionist"},
 }
 
 _USERS_SCHEMA = """
