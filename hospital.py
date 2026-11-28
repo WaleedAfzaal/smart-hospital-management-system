@@ -998,6 +998,55 @@ class Hospital:
                 out.append(_public_appointment(doc, row))
         return out
 
+    # ------------------------------------------------ Step 10: calendar
+    def calendar_appointments(self, from_date=None, to_date=None,
+                              doctor_id=None, department=None):
+        """Every appointment scheduled in [from_date, to_date]
+        (both inclusive), time-ordered within each day.
+
+        Defaults: from today to 30 days ahead. ``doctor_id`` limits
+        the list to one doctor; ``department`` (a doctor
+        specialization) limits it to that department. Rows with no
+        scheduled date (booked before Step 4) have no day to sit on
+        and never appear in a dated view — same as Schedule. Rows
+        with a date but no fixed time DO appear (time sorts last).
+        Cancelled / No Show rows are included — the calendar shows
+        the day as it really is. Raises ValueError on a bad date or
+        when from_date is after to_date.
+        """
+        if from_date in (None, ""):
+            from_date = datetime.date.today().isoformat()
+        else:
+            from_date, _ = validate_appt_datetime(from_date, None)
+        if to_date in (None, ""):
+            to_date = (datetime.date.today()
+                       + datetime.timedelta(days=30)).isoformat()
+        else:
+            to_date, _ = validate_appt_datetime(to_date, None)
+        if from_date > to_date:
+            raise ValueError(
+                "The start date must not be after the end date.")
+        if doctor_id:
+            doctor_id = str(doctor_id).strip().upper()
+            if doctor_id not in self.doctors_map:
+                raise ValueError("Doctor not found.")
+        if department:
+            department = str(department).strip()
+        out = []
+        for a in self.all_appointments(doctor_id):
+            if not a["appt_date"]:
+                continue
+            if not (from_date <= a["appt_date"] <= to_date):
+                continue
+            if department and a["department"] != department:
+                continue
+            out.append(a)
+        out.sort(key=lambda a: (a["appt_date"],
+                                a["appt_time"] or "99:99",
+                                0 if a["emergency"] else 1,
+                                a["token"]))
+        return out
+
     def get_appointment_by_id(self, apt_id):
         """(doctor dict, public appointment) for an Appointment ID.
 
@@ -1904,6 +1953,92 @@ def appointments_table_menu(hosp, role, user):
         _appointment_detail_menu(hosp, role, user, choice)
 
 
+def calendar_menu(hosp, role, user):
+    """Appointment Calendar (Step 10, menu 22): a month grid with
+    appointment counts per day, then pick a day to see that day's
+    appointments time-ordered (with status), then pick one by
+    Appointment ID for the full details (Step 9 flow). Doctors only
+    ever see their own queue; the doctor/department filters work
+    the same as the table's."""
+    doctor_filter = None
+    if role == "Doctor" and user.get("doctor_id"):
+        doctor_filter = user["doctor_id"]
+    print("\n  --- Appointment Calendar ---")
+    month_raw = input("  Month (YYYY-MM, empty = this month): ").strip()
+    if month_raw:
+        try:
+            year, month = (int(x) for x in month_raw.split("-", 1))
+            first = datetime.date(year, month, 1)
+        except (ValueError, TypeError):
+            return print("  Month must look like YYYY-MM (e.g. 2026-11).")
+    else:
+        today = datetime.date.today()
+        first = datetime.date(today.year, today.month, 1)
+    if doctor_filter:
+        doc_id = doctor_filter
+        print(f"  Doctor: {doctor_filter} (your queue)")
+    else:
+        doc_id = input("  Doctor ID (empty = all doctors): ").strip().upper() or None
+    dept = input("  Department (empty = all): ").strip() or None
+    if first.month == 12:
+        next_first = datetime.date(first.year + 1, 1, 1)
+    else:
+        next_first = datetime.date(first.year, first.month + 1, 1)
+    last = next_first - datetime.timedelta(days=1)
+    try:
+        rows = hosp.calendar_appointments(
+            first.isoformat(), last.isoformat(),
+            doctor_id=doc_id, department=dept)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    counts = {}
+    for a in rows:
+        counts[a["appt_date"]] = counts.get(a["appt_date"], 0) + 1
+    today = datetime.date.today()
+    print(f"\n  --- {first.strftime('%B %Y')} ({len(rows)} appointment"
+          f"{'s' if len(rows) != 1 else ''}) ---")
+    print("  " + "".join(f"{w:<7}" for w in
+                         ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")))
+    cells = ["       "] * first.weekday()  # Monday-first grid
+    for day in range(1, last.day + 1):
+        d = datetime.date(first.year, first.month, day)
+        n = counts.get(d.isoformat(), 0)
+        mark = "*" if d == today else " "
+        cells.append(f"{day:2}{mark}" + (f"({n}) " if n else "    "))
+    while len(cells) % 7:
+        cells.append("       ")
+    for i in range(0, len(cells), 7):
+        print("  " + "".join(cells[i:i + 7]))
+    print("  * = today. A number in brackets is that day's appointments.")
+    while True:
+        choice = input("  Day number to open (empty = back): ").strip()
+        if not choice:
+            return
+        try:
+            picked = datetime.date(first.year, first.month, int(choice))
+        except ValueError:
+            print("  Pick a day in this month.")
+            continue
+        day_rows = hosp.appointments_for_date(picked.isoformat(), doc_id)
+        if dept:
+            day_rows = [a for a in day_rows if a["department"] == dept]
+        print(f"\n  --- {picked.isoformat()} "
+              f"({len(day_rows)} appointment"
+              f"{'s' if len(day_rows) != 1 else ''}) ---")
+        if not day_rows:
+            print("  No appointments on this date.")
+            continue
+        for a in day_rows:
+            when = a["appt_time"] or "no fixed time"
+            print(f"  {when} | {a['apt_id'] or '—'} ({a['token']}) | "
+                  f"{a['patient_name']} (#{a['patient_id']}) | "
+                  f"{a['doctor_name']} | {a['appt_type']} | {a['status']}")
+        ref = input("  APT ID to open (empty = back to the month): ").strip()
+        if not ref:
+            continue
+        _appointment_detail_menu(hosp, role, user, ref)
+
+
 def _appointment_detail_menu(hosp, role, user, apt_ref):
     """Full details for one appointment (Step 9) — everything the
     details page shows, plus edit/reschedule and cancel for
@@ -2286,6 +2421,7 @@ MENU = [
     ("19", "Delete Patient", "delete_patient"),  # Step 5, Admin only
     ("20", "Appointment Status", "update_appointment_status"),  # Step 6
     ("21", "All Appointments", "view"),  # Step 9: table + details
+    ("22", "Calendar", "view"),  # Step 10: day/week/month calendar
 ]
 
 
@@ -2366,6 +2502,8 @@ def main():
             appointment_status_menu(hosp, role, user)
         elif choice == "21":
             appointments_table_menu(hosp, role, user)
+        elif choice == "22":
+            calendar_menu(hosp, role, user)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,9 @@ const OP_PERMS = {
      appointments. Editing is Admin/Receptionist only (the server
      enforces it; the table just hides those buttons for Doctors). */
   "all-appointments": ["Admin", "Doctor", "Receptionist"],
+  /* Step 10 (Calendar): every role may open it — a Doctor linked
+     to one doctor only sees that doctor's appointments. */
+  "calendar": ["Admin", "Doctor", "Receptionist"],
 };
 
 function canUse(op) {
@@ -258,7 +261,7 @@ const OP_NAV = {
   "find-patient": "patients", "add-note": "patients",
   "doctors": "doctors", "shifts": "doctors",
   "book-appointment": "appointments", "schedule": "appointments",
-  "all-appointments": "appointments",
+  "all-appointments": "appointments", "calendar": "appointments",
   "beds": "beds", "pharmacy": "pharmacy", "billing": "billing",
   "reports": "reports", "departments": "departments",
   "settings": "settings", "change-password": "settings",
@@ -303,6 +306,7 @@ function openOp(op) {
     "reports": renderReports,
     "schedule": renderSchedule,
     "all-appointments": renderAllAppointments,
+    "calendar": renderCalendar,
   })[op]();
 }
 
@@ -331,6 +335,7 @@ const NAV = [
     { op: "all-appointments", label: "All Appointments" },
     { op: "book-appointment", label: "Book Appointment" },
     { op: "schedule", label: "Schedule" },
+    { op: "calendar", label: "Calendar" },
   ] },
   { key: "departments", label: "Departments", icon: "building", view: "departments" },
   { key: "beds", label: "Bed & Ward Management", icon: "bed", op: "beds" },
@@ -754,6 +759,9 @@ function renderDoctors(msg = "", ok = true) {
    new patient being registered), the department/doctor picked, and
    the booked times for the chosen doctor/day. */
 let bookPatient = null;      /* {id, name, ...} or null */
+/* Step 10 (Calendar): a date to prefill the booking form with when
+   an empty calendar day is clicked — consumed by renderBook. */
+let bookPrefillDate = null;
 let bookNewPatient = false;  /* inline registration form open */
 let bookDept = "";
 let bookDoctor = "";
@@ -775,6 +783,11 @@ function renderBook(msg = "", ok = true) {
      be yesterday after midnight in Pakistan). */
   const now = new Date();
   const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  /* Step 10: an empty calendar day opens this form with that date
+     already filled in (consumed here, so a later re-render falls
+     back to today). */
+  const startDate = bookPrefillDate || todayLocal;
+  bookPrefillDate = null;
   const depts = [...new Set(docs.map((d) => d.spec || "—"))].sort();
   body.innerHTML = `
     ${msgHtml(msg, ok)}
@@ -834,7 +847,7 @@ function renderBook(msg = "", ok = true) {
       <h3 style="margin:16px 0 8px">3. Appointment</h3>
       <div class="field-row">
         <div class="field"><label>Date</label>
-          <input type="date" id="bk-date" value="${todayLocal}" required></div>
+          <input type="date" id="bk-date" value="${startDate}" required></div>
         <div class="field"><label>Time (24-hour, optional)</label>
           <input type="time" id="bk-time" placeholder="e.g. 10:30"></div>
       </div>
@@ -1899,6 +1912,225 @@ async function renderSchedule(date, doctorId) {
     if (!picked) { toast("Pick a date first.", true); return; }
     renderSchedule(picked, document.getElementById("sch-doctor").value || null);
   });
+}
+
+/* ---------------- Step 10: appointment calendar ---------------- */
+
+/* Calendar state — which view, which day the view is anchored on
+   (a date inside the shown day / week / month), and the
+   doctor/department filters. The server returns the appointments
+   for the shown range; this only groups and draws them. */
+let calState = { view: "month", anchor: null, doctor_id: "", department: "" };
+
+const CAL_MONTHS = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+const CAL_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+  "Saturday", "Sunday"];
+function calTodayLocal() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+function calParseISO(s) {
+  const [y, m, d] = String(s).split("-").map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+function calISO(dt) {
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+}
+function calAddDays(dt, n) {
+  const d = new Date(dt);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+/* The date range the current view shows, plus its title. Weeks start
+   on Monday (the hospital's week), months run 1st to last day. */
+function calRange() {
+  const anchor = calParseISO(calState.anchor || calTodayLocal());
+  if (calState.view === "day") {
+    return { from: calState.anchor, to: calState.anchor,
+      title: `${CAL_DAYS[(anchor.getDay() + 6) % 7]}, ${anchor.getDate()} ${CAL_MONTHS[anchor.getMonth()]} ${anchor.getFullYear()}` };
+  }
+  if (calState.view === "week") {
+    const from = calAddDays(anchor, -((anchor.getDay() + 6) % 7));
+    const to = calAddDays(from, 6);
+    return { from: calISO(from), to: calISO(to),
+      title: `${from.getDate()} – ${to.getDate()} ${CAL_MONTHS[to.getMonth()]} ${to.getFullYear()}` };
+  }
+  const from = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+  const to = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0);
+  return { from: calISO(from), to: calISO(to),
+    title: `${CAL_MONTHS[anchor.getMonth()]} ${anchor.getFullYear()}` };
+}
+function calShift(dir) {
+  const anchor = calParseISO(calState.anchor || calTodayLocal());
+  let next = anchor;
+  if (calState.view === "day") next = calAddDays(anchor, dir);
+  else if (calState.view === "week") next = calAddDays(anchor, 7 * dir);
+  else next = new Date(anchor.getFullYear(), anchor.getMonth() + dir, 1);
+  calState.anchor = calISO(next);
+  renderCalendar();
+}
+/* An empty calendar day opens the Step 8 booking form with that
+   date already filled in (a Doctor sees the role message instead —
+   booking is Admin/Receptionist only). */
+function calBookOn(dateStr) {
+  bookPrefillDate = dateStr;
+  openOp("book-appointment");
+}
+/* One appointment as a clickable chip — the status pill uses the
+   same colours as the dashboard chips. Cancelled / No Show entries
+   are dimmed so the day's real picture stays visible. */
+function calChip(a) {
+  const dim = ["Cancelled", "No Show"].includes(a.status) ? " cal-dim" : "";
+  return `<button type="button" class="cal-chip${dim}" data-ref="${esc(apptRef(a))}"
+      title="${esc(a.patient_name)} — ${esc(a.doctor_name)} (${esc(a.status)})">
+    <span class="cal-chip-time">${a.appt_time ? esc(a.appt_time) : "No time"}</span>
+    <span class="cal-chip-name">${esc(a.patient_name)}</span>
+    <span class="tag ${statusTagClass(a.status || "Pending")}">${esc(a.status || "Pending")}</span>
+  </button>`;
+}
+function calWireChips(root) {
+  root.querySelectorAll(".cal-chip").forEach((el) =>
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      renderAppointmentDetail(el.dataset.ref, false);
+    }));
+}
+
+async function renderCalendar() {
+  if (!calState.anchor) calState.anchor = calTodayLocal();
+  const docs = state ? state.doctors : [];
+  const departments = [...new Set(docs.map((d) => d.spec).filter(Boolean))].sort();
+  const range = calRange();
+  const params = new URLSearchParams({ from: range.from, to: range.to });
+  if (calState.doctor_id) params.set("doctor_id", calState.doctor_id);
+  if (calState.department) params.set("department", calState.department);
+  const res = await api(`/api/appointments/calendar?${params.toString()}`);
+  if (!res.ok) {
+    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+    return;
+  }
+  const rows = res.appointments || [];
+  const byDate = {};
+  for (const a of rows) {
+    (byDate[a.appt_date] = byDate[a.appt_date] || []).push(a);
+  }
+  const today = calTodayLocal();
+  const viewBtn = (v, label) => `<button type="button" class="btn ${calState.view === v ? "btn-primary" : "btn-ghost"}" data-cal-view="${v}">${label}</button>`;
+  let gridHtml = "";
+  if (calState.view === "day") {
+    const dayRows = byDate[range.from] || [];
+    const timed = dayRows.filter((a) => a.appt_time);
+    const untimed = dayRows.filter((a) => !a.appt_time);
+    const rowHtml = (a) => `<div class="cal-day-row">
+        <span class="cal-day-time">${a.appt_time ? esc(a.appt_time) : "No fixed time"}</span>
+        <span>${esc(a.patient_name)} (#${a.patient_id}) — ${esc(a.doctor_name)} (${esc(a.department)})</span>
+        <span>${esc(a.appt_type || "General")}${a.emergency ? ' <span class="tag tag-emg">EMERGENCY</span>' : ""}</span>
+        <span class="tag ${statusTagClass(a.status || "Pending")}">${esc(a.status || "Pending")}</span>
+        <button type="button" class="btn btn-ghost" data-ref="${esc(apptRef(a))}" data-cal-open="1">View</button>
+      </div>`;
+    gridHtml = `
+      ${timed.length ? timed.map(rowHtml).join("") : `<p class="muted">No timed appointments on this day.</p>`}
+      ${untimed.length ? `<h4 style="margin:14px 0 6px">No fixed time</h4>${untimed.map(rowHtml).join("")}` : ""}
+      <div class="btn-row" style="margin-top:14px">
+        <button type="button" class="btn btn-primary" id="cal-book-day">+ Book Appointment on ${esc(range.from)}</button>
+      </div>`;
+  } else if (calState.view === "week") {
+    const from = calParseISO(range.from);
+    let cols = "";
+    for (let i = 0; i < 7; i++) {
+      const d = calAddDays(from, i);
+      const key = calISO(d);
+      const dayRows = byDate[key] || [];
+      cols += `<div class="cal-col ${key === today ? "cal-today" : ""}">
+        <div class="cal-col-head"><b>${CAL_DAYS[i].slice(0, 3)}</b> ${d.getDate()} ${CAL_MONTHS[d.getMonth()].slice(0, 3)}</div>
+        ${dayRows.map(calChip).join("") || `<p class="muted">—</p>`}
+        <button type="button" class="btn btn-ghost cal-book-col" data-date="${key}">+ Book</button>
+      </div>`;
+    }
+    gridHtml = `<div class="cal-week">${cols}</div>`;
+  } else {
+    const anchor = calParseISO(calState.anchor);
+    const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+    const lastDay = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0).getDate();
+    const lead = (first.getDay() + 6) % 7; /* Monday-first grid */
+    let cells = "";
+    for (let i = 0; i < lead; i++) cells += `<div class="cal-cell cal-blank"></div>`;
+    for (let day = 1; day <= lastDay; day++) {
+      const key = `${anchor.getFullYear()}-${String(anchor.getMonth() + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      const dayRows = byDate[key] || [];
+      const shown = dayRows.slice(0, 3);
+      const more = dayRows.length - shown.length;
+      cells += `<div class="cal-cell ${key === today ? "cal-today" : ""}" data-date="${key}" title="Book on ${key}">
+        <div class="cal-daynum">${day}</div>
+        ${shown.map(calChip).join("")}
+        ${more > 0 ? `<button type="button" class="cal-more" data-day="${key}">+${more} more</button>` : ""}
+      </div>`;
+    }
+    gridHtml = `<div class="cal-grid">
+      ${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => `<div class="cal-head">${d}</div>`).join("")}
+      ${cells}
+    </div>`;
+  }
+  body.innerHTML = `
+    ${state ? "" : offlineBanner()}
+    <div class="cal-toolbar">
+      <div class="btn-row" style="gap:6px">
+        ${viewBtn("day", "Day")}${viewBtn("week", "Week")}${viewBtn("month", "Month")}
+      </div>
+      <div class="btn-row" style="gap:6px">
+        <button type="button" class="btn btn-ghost" id="cal-prev">← Prev</button>
+        <button type="button" class="btn btn-ghost" id="cal-today">Today</button>
+        <button type="button" class="btn btn-ghost" id="cal-next">Next →</button>
+      </div>
+      <div class="field-row" style="flex:1;min-width:220px">
+        <div class="field"><label>Jump to date</label>
+          <input type="date" id="cal-jump" value="${esc(calState.anchor)}"></div>
+        <div class="field"><label>Doctor</label>
+          <select id="cal-doctor">
+            <option value="">All doctors</option>
+            ${docs.map((d) => `<option value="${esc(d.id)}" ${calState.doctor_id === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Department</label>
+          <select id="cal-dept">
+            <option value="">All departments</option>
+            ${departments.map((d) => `<option ${calState.department === d ? "selected" : ""}>${esc(d)}</option>`).join("")}
+          </select></div>
+      </div>
+    </div>
+    <h3 style="margin:10px 0 4px">${esc(range.title)} — ${rows.length} appointment${rows.length === 1 ? "" : "s"}</h3>
+    <div class="cal-legend">${APPOINTMENT_STATUSES.map((s) => `<span class="tag ${statusTagClass(s)}">${s}</span>`).join("")}
+      <span class="muted">Click an appointment to open its details. Click an empty day to book on that date.</span></div>
+    <div style="margin-top:10px">${gridHtml}</div>`;
+  document.querySelectorAll("[data-cal-view]").forEach((btn) =>
+    btn.addEventListener("click", () => { calState.view = btn.dataset.calView; renderCalendar(); }));
+  document.getElementById("cal-prev").addEventListener("click", () => calShift(-1));
+  document.getElementById("cal-next").addEventListener("click", () => calShift(1));
+  document.getElementById("cal-today").addEventListener("click", () => { calState.anchor = calTodayLocal(); renderCalendar(); });
+  document.getElementById("cal-jump").addEventListener("change", (e) => {
+    if (e.target.value) { calState.anchor = e.target.value; renderCalendar(); }
+  });
+  document.getElementById("cal-doctor").addEventListener("change", (e) => { calState.doctor_id = e.target.value; renderCalendar(); });
+  document.getElementById("cal-dept").addEventListener("change", (e) => { calState.department = e.target.value; renderCalendar(); });
+  calWireChips(body);
+  body.querySelectorAll("[data-cal-open]").forEach((btn) =>
+    btn.addEventListener("click", () => renderAppointmentDetail(btn.dataset.ref, false)));
+  body.querySelectorAll(".cal-book-col").forEach((btn) =>
+    btn.addEventListener("click", () => calBookOn(btn.dataset.date)));
+  body.querySelectorAll(".cal-more").forEach((btn) =>
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      calState.view = "day";
+      calState.anchor = btn.dataset.day;
+      renderCalendar();
+    }));
+  body.querySelectorAll(".cal-cell[data-date]").forEach((cell) =>
+    cell.addEventListener("click", (e) => {
+      if (e.target.closest(".cal-chip") || e.target.closest(".cal-more")) return;
+      calBookOn(cell.dataset.date);
+    }));
+  const bookDay = document.getElementById("cal-book-day");
+  if (bookDay) bookDay.addEventListener("click", () => calBookOn(range.from));
 }
 
 /* ---------------- Step 9: appointments table + details ---------------- */

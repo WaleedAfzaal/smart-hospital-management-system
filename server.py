@@ -604,6 +604,43 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "booked": booked,
                 })
 
+            # ---- Step 10: the appointment calendar — every
+            # appointment in a date range (both ends inclusive).
+            # Defaults: this month. A Doctor user linked to one
+            # doctor only ever sees that doctor's appointments,
+            # whatever they ask for.
+            if path == "/api/appointments/calendar":
+                start = query.get("from", [None])[0]
+                end = query.get("to", [None])[0]
+                if start in (None, ""):
+                    start = datetime.date.today().replace(day=1).isoformat()
+                if end in (None, ""):
+                    today = datetime.date.today()
+                    if today.month == 12:
+                        next_first = datetime.date(today.year + 1, 1, 1)
+                    else:
+                        next_first = datetime.date(
+                            today.year, today.month + 1, 1)
+                    end = (next_first
+                           - datetime.timedelta(days=1)).isoformat()
+                doctor_id = self._doctor_filter()
+                if doctor_id is None:
+                    doctor_id = query.get("doctor_id", [None])[0]
+                department = query.get("department", [None])[0]
+                try:
+                    start, _ = validate_appt_datetime(start, None)
+                    end, _ = validate_appt_datetime(end, None)
+                    rows = hospital.calendar_appointments(
+                        start, end, doctor_id=doctor_id,
+                        department=department)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "from": start, "to": end,
+                    "appointments": rows,
+                })
+
             # ---- Step 9: the appointments table — server-side
             # search, filters, sorting and pagination. A Doctor user
             # linked to one doctor only ever sees that doctor's
