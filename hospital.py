@@ -2177,15 +2177,28 @@ class Hospital:
             {"label": f"{month_names[int(k[5:7]) - 1]} '{k[2:4]}",
              "count": counts_roll[k]} for k in rolling]
 
-        # ---- Departments: appointments per doctor specialization
+        # ---- Departments: appointments per doctor specialization.
+        # Percents use largest-remainder rounding so they always
+        # add to exactly 100 (plain round() gave 35+35+29 = 99).
         dept_counts = {}
         for doc, _row in rows:
             dept_counts[doc["spec"]] = dept_counts.get(doc["spec"], 0) + 1
-        departments = [
-            {"name": name, "count": c,
-             "percent": round(100 * c / len(rows)) if rows else 0}
-            for name, c in sorted(dept_counts.items(),
-                                  key=lambda kv: -kv[1])]
+        departments = []
+        if rows:
+            raw = [(name, 100 * c / len(rows))
+                   for name, c in dept_counts.items()]
+            floors = {name: int(v) for name, v in raw}
+            rest = 100 - sum(floors.values())
+            by_remainder = sorted(
+                raw, key=lambda kv: (-(kv[1] - int(kv[1])),
+                                     -dept_counts[kv[0]]))
+            for name, _v in by_remainder[:rest]:
+                floors[name] += 1
+            departments = [
+                {"name": name, "count": dept_counts[name],
+                 "percent": floors[name]}
+                for name in sorted(dept_counts,
+                                   key=lambda n: -dept_counts[n])]
 
         # ---- Today's appointments (time, then Emergency-first)
         todays = self.appointments_for_date(today)

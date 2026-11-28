@@ -9,8 +9,13 @@ endpoint serves the same payload (plus the old stats keys, kept for
 compatibility) behind the login.
 """
 
+import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -117,6 +122,40 @@ class TestDashboardData(unittest.TestCase):
         # Biggest department first.
         self.assertEqual(d["departments"][0]["name"], "Cardiology")
 
+    def test_department_percents_sum_to_100(self):
+        """6/6/5 appointments used to round to 35+35+29 = 99; the
+        largest-remainder rounding must always add to exactly 100."""
+        h = Hospital()
+        h.add_doctor("D1", "Dr. Tariq", "Cardiology", 2000)
+        h.add_doctor("D2", "Dr. Ayesha", "General Medicine", 1500)
+        h.add_doctor("D3", "Dr. Bilal", "Orthopedics", 1800)
+        for pid in (1, 2, 3):
+            h.add_patient(pid, f"Patient {pid}", 30, "Checkup")
+        bookings = ([("D1", 1)] * 6 + [("D2", 2)] * 6
+                    + [("D3", 3)] * 5)
+        for i, (doc, pid) in enumerate(bookings):
+            h.book_appointment(doc, pid, False,
+                               f"2026-11-{i + 1:02d}", "09:00")
+        d = h.dashboard_data("2026-11-28")
+        by_name = {x["name"]: x for x in d["departments"]}
+        self.assertEqual(by_name["Cardiology"]["count"], 6)
+        self.assertEqual(by_name["General Medicine"]["count"], 6)
+        self.assertEqual(by_name["Orthopedics"]["count"], 5)
+        self.assertEqual(sum(x["percent"] for x in d["departments"]), 100)
+        self.assertEqual(by_name["Orthopedics"]["percent"], 30)
+
+    def test_chart_data_updates_after_new_booking(self):
+        """The dashboard re-reads live data: booking one more
+        appointment must raise that month's chart count at once."""
+        h = _seeded_hospital()
+        before = {m["label"]: m["count"]
+                  for m in h.dashboard_data("2026-11-27")["monthly_year"]}
+        h.book_appointment("D2", 102, False, "2026-11-29", "12:00")
+        after = {m["label"]: m["count"]
+                 for m in h.dashboard_data("2026-11-27")["monthly_year"]}
+        self.assertEqual(after["Nov"], before["Nov"] + 1)
+        self.assertEqual(after["Oct"], before["Oct"])
+
     def test_todays_list_has_real_statuses_and_departments(self):
         d = _seeded_hospital().dashboard_data("2026-11-27")
         rows = d["todays_list"]
@@ -188,6 +227,90 @@ class TestServerDashboard(TestServerAPI):
     def test_dashboard_needs_login(self):
         status, _ = self._request("GET", "/api/dashboard", cookie="")
         self.assertEqual(status, 401)
+
+
+def _render_line_chart(series):
+    """Run the real lineChartSVG() from web/app.js in Node against a
+    monthly series and return the dot heights + axis labels it drew.
+    Returns None when node is not available (caller skips then)."""
+    app_js = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "web", "app.js")
+    src = open(app_js).read()
+
+    def extract_fn(name):
+        m = re.search(r"function %s\(" % re.escape(name), src)
+        assert m, name
+        i = src.index("{", m.start())
+        depth = 0
+        for j in range(i, len(src)):
+            if src[j] == "{":
+                depth += 1
+            elif src[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[m.start():j + 1]
+        raise AssertionError("unbalanced " + name)
+
+    m = re.search(r"const CHART_COLORS = (\[[^\]]*\]);", src)
+    js = ("const CHART_COLORS = %s;\n%s\n%s\n" % (
+        m.group(1), extract_fn("esc"), extract_fn("lineChartSVG")))
+    js += ("const fs = require('fs');\n"
+           "const series = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));\n"
+           "const svg = lineChartSVG(series);\n"
+           "const dots = [...svg.matchAll(/<circle[^>]*cy=\"([\\d.]+)\"/g)]"
+           ".map(x => Number(x[1]));\n"
+           "const labels = [...svg.matchAll(/<text[^>]*>(\\d+)<\\/text>/g)]"
+           ".map(x => Number(x[1]));\n"
+           "console.log(JSON.stringify({dots, labels, length: svg.length}));\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        js_path = os.path.join(tmp, "chart.js")
+        data_path = os.path.join(tmp, "series.json")
+        open(js_path, "w").write(js)
+        open(data_path, "w").write(json.dumps(series))
+        out = subprocess.run(["node", js_path, data_path],
+                             capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed to run the chart JS")
+class TestDashboardChartRendering(unittest.TestCase):
+    """The monthly line chart must actually show the analysis: with
+    only a few appointments a month the old fixed 0–50 scale
+    squashed the line flat along the bottom (21px of spread on a
+    260px chart) and Waleed rightly read it as 'graph work nahi
+    karta'. The adaptive scale must fill the chart."""
+
+    def test_line_chart_fills_the_chart_with_small_counts(self):
+        d = _seeded_hospital().dashboard_data("2026-11-27")
+        out = _render_line_chart(d["monthly_year"])
+        dots = out["dots"]
+        self.assertEqual(len(dots), 12)
+        spread = max(dots) - min(dots)
+        # Biggest month is 3 → 0–4 scale: Nov sits at ~73px, zero
+        # months at 230px, so the line spans ~157px (60% of height).
+        self.assertGreaterEqual(spread, 65,
+                                f"chart looks flat: spread {spread}px, "
+                                f"dots {dots}")
+        self.assertEqual(out["labels"], [0, 1, 2, 3, 4])
+
+    def test_line_chart_renders_with_zero_data(self):
+        d = Hospital().dashboard_data("2026-11-27")
+        out = _render_line_chart(d["monthly_year"])
+        self.assertEqual(len(out["dots"]), 12)  # renders, never crashes
+        self.assertEqual(out["labels"], [0, 1, 2, 3, 4])
+
+    def test_line_chart_scale_grows_with_big_counts(self):
+        series = [{"label": m, "count": c} for m, c in
+                  zip(["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+                      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 0])]
+        out = _render_line_chart(series)
+        # Max 120 → 0–200 scale, top label covers the peak.
+        self.assertEqual(out["labels"], [0, 50, 100, 150, 200])
+        spread = max(out["dots"]) - min(out["dots"])
+        self.assertGreaterEqual(spread, 65)
 
 
 if __name__ == "__main__":

@@ -1462,8 +1462,18 @@ const CHART_COLORS = ["#1769AA", "#16a34a", "#f59e0b", "#7c3aed",
    library, so the page works offline on Waleed's laptop. */
 function lineChartSVG(series) {
   const W = 640, H = 260, PL = 40, PR = 14, PT = 20, PB = 30;
-  const maxV = Math.max(10, ...series.map((s) => s.count));
-  const gridMax = Math.ceil(maxV / 50) * 50;
+  if (!series.length) {
+    return `<svg viewBox="0 0 ${W} ${H}" class="chart-svg" role="img" aria-label="Monthly appointments chart"><text x="${W / 2}" y="${H / 2}" text-anchor="middle" font-size="14" fill="#64748b">No data yet</text></svg>`;
+  }
+  const maxV = Math.max(0, ...series.map((s) => s.count));
+  /* Y-axis scale that fits the data. A fixed 0–50 scale squashed the
+     line flat along the bottom whenever a month had only a few
+     appointments, so the chart looked dead. Pick the smallest
+     "nice" step whose 4 grid intervals cover the biggest month, so
+     the line always fills the chart (max 5 → 0–8, max 17 → 0–20). */
+  const step = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000]
+    .find((s) => maxV / s <= 4) || 1000;
+  const gridMax = step * 4;
   const xs = (i) => PL + (i * (W - PL - PR)) / (series.length - 1 || 1);
   const ys = (v) => PT + (H - PT - PB) * (1 - v / gridMax);
   const pts = series.map((s, i) => [xs(i), ys(s.count)]);
@@ -1474,8 +1484,8 @@ function lineChartSVG(series) {
     d += ` C ${p1[0] + (p2[0] - p0[0]) / 6} ${p1[1] + (p2[1] - p0[1]) / 6}, ${p2[0] - (p3[0] - p1[0]) / 6} ${p2[1] - (p3[1] - p1[1]) / 6}, ${p2[0]} ${p2[1]}`;
   }
   const area = `${d} L ${pts[pts.length - 1][0]} ${H - PB} L ${pts[0][0]} ${H - PB} Z`;
-  const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => {
-    const v = Math.round(gridMax * f);
+  const grid = [0, 1, 2, 3, 4].map((f) => {
+    const v = step * f;
     const y = ys(v);
     return `<line x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}" stroke="#e2e8f0" stroke-width="1"/>
       <text x="${PL - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="#64748b">${v}</text>`;
@@ -1530,6 +1540,7 @@ function renderDashboardView() {
     return;
   }
   const series = chartMode === "last12" ? d.monthly_last12 : d.monthly_year;
+  const seriesTotal = series.reduce((n, s) => n + s.count, 0);
   const todayPending = d.todays_list.filter((a) => a.status === "Pending").length;
   const deptCount = new Set((state ? state.doctors : []).map((x) => x.spec)).size;
   const user = currentUser ? currentUser.username : "Admin";
@@ -1567,6 +1578,7 @@ function renderDashboardView() {
           </select>
         </div>
         <div class="chart-wrap" id="chart-wrap">
+          ${seriesTotal === 0 ? `<p class="chart-empty">No appointments yet — book an appointment and the analysis will appear here.</p>` : ""}
           ${lineChartSVG(series)}
           <div id="chart-tip" class="chart-tip hidden"></div>
         </div>
@@ -1598,7 +1610,7 @@ function renderDashboardView() {
           <ul class="donut-legend">
             ${d.departments.map((x, i) => `<li><span class="dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>${esc(x.name)}<b>${x.percent}%</b></li>`).join("")}
           </ul></div>`
-          : `<p class="muted">No appointments yet — the split appears once appointments are booked.</p>`}
+          : `<p class="muted">No appointments yet — book an appointment to see the department split here.</p>`}
       </div>
 
       <div class="dash-card">

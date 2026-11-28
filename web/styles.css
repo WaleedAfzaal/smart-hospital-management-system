@@ -554,6 +554,11 @@ body.sidebar-collapsed .sidebar { margin-left: -252px; }
 .link-btn { background: transparent; border: 0; color: #1769AA; font-size: 13.5px; font-weight: 700; padding: 4px 2px; }
 .link-btn:hover { text-decoration: underline; }
 .chart-wrap { position: relative; }
+.chart-empty {
+  background: #eff6ff; border: 1.5px solid #bfdbfe; color: #1769AA;
+  font-size: 13.5px; font-weight: 600; padding: 9px 12px; border-radius: 9px;
+  margin: 0 0 10px;
+}
 .chart-svg { width: 100%; height: auto; display: block; }
 .chart-dot { cursor: pointer; }
 .chart-dot:hover { r: 6; }
@@ -673,6 +678,7 @@ body.dark .link-btn { color: #4ade80; }
 body.dark .donut-legend li { color: #a7f3d0; }
 body.dark .donut-legend b { color: #d1fae5; }
 body.dark .donut-svg text { fill: #d1fae5; }
+body.dark .chart-empty { background: #0f2a43; border-color: #1e40af; color: #93c5fd; }
 body.dark .activity-list li { border-color: #14532d; }
 body.dark .act-text { color: #d1fae5; }
 body.dark .quick-btn { background: #0d2f2a; border-color: #166534; color: #d1fae5; }
