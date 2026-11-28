@@ -79,6 +79,15 @@ PERMISSIONS = {
     # Viewing the table is "view" (every role; a Doctor linked to
     # one doctor only ever sees that doctor's appointments).
     "edit_appointment": {"Admin", "Receptionist"},
+    # Step 11 (Doctor availability & scheduling): only Admin sets a
+    # doctor's working pattern or the hospital holidays; leave is
+    # Admin for any doctor, or a Doctor for themself (the fine rule
+    # lives in Hospital.add_doctor_leave / delete_doctor_leave).
+    # Viewing availability, leave and holidays is every role.
+    "manage_availability": {"Admin"},
+    "manage_leave": {"Admin", "Doctor"},
+    "manage_holidays": {"Admin"},
+    "view_availability": {"Admin", "Doctor", "Receptionist"},
 }
 
 _USERS_SCHEMA = """

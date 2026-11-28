@@ -84,6 +84,26 @@ exports as CSV (``GET /api/appointments/export.csv``) and as a PDF
 (``GET /api/appointments/export.pdf``, pure-Python generator, no
 dependencies) — both respect the active filters. A Doctor user linked
 to one doctor only ever sees that doctor's appointments.
+
+Step 10 (Appointment Calendar): ``GET /api/appointments/calendar``
+lists every appointment in an inclusive date range (defaults: this
+month), with doctor/department filters; a Doctor user linked to one
+doctor only ever sees that doctor's appointments.
+
+Step 11 (Doctor Availability & Scheduling): ``GET /api/availability``
+reads a doctor's working pattern + leave; ``POST /api/availability``
+saves it (Admin only) and ``POST /api/availability/clear`` removes
+it; ``POST /api/leaves`` adds leave (Admin any doctor, Doctor only
+themself) and ``POST /api/leaves/<id>/delete`` removes it; ``GET
+/api/holidays`` lists hospital holidays and ``POST /api/holidays``
+adds one (Admin only) with ``POST /api/holidays/<id>/delete`` to
+remove it. ``GET /api/appointments/slots`` now also returns the
+doctor's ``availability`` and the day's ``slots`` (each marked
+available or booked) plus an ``unavailable_reason`` when there are no
+slots (holiday, leave, not a working day). Booking refuses a slot
+outside the doctor's availability with a 400 that says why — checked
+before a new patient is registered, so a refused booking never
+leaves a stray patient behind.
 """
 
 import argparse
@@ -578,6 +598,11 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
             # the availability the booking form shows, so taken slots
             # are visible before a time is picked. A Doctor user
             # linked to one doctor only ever sees their own day.
+            # Step 11: the reply also carries the doctor's working
+            # pattern ("availability", None when not set yet) and the
+            # day's bookable "slots" (each marked available or
+            # booked), plus an "unavailable_reason" when there are no
+            # slots (holiday, leave, not a working day).
             if path == "/api/appointments/slots":
                 doctor_id = query.get("doctor_id", [None])[0]
                 date = query.get("date", [None])[0] or \
@@ -594,14 +619,47 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     return self._send_json(
                         {"ok": False, "error": "Doctor not found."}, 404)
                 try:
-                    booked = hospital.doctor_booked_times(doctor_id, date)
+                    slots = hospital.availability_slots(doctor_id, date)
                     date, _ = validate_appt_datetime(date, None)
                 except ValueError as exc:
                     return self._send_json(
                         {"ok": False, "error": str(exc)}, 400)
                 return self._send_json({
                     "ok": True, "doctor_id": doctor_id, "date": date,
-                    "booked": booked,
+                    "booked": slots["booked"],
+                    "availability": slots["availability"],
+                    "slots": slots["slots"],
+                    "unavailable_reason": slots["unavailable_reason"],
+                })
+
+            # ---- Step 11: a doctor's availability + leave. A Doctor
+            # user linked to one doctor only ever sees their own.
+            if path == "/api/availability":
+                doctor_id = self._doctor_filter()
+                if doctor_id is None:
+                    doctor_id = query.get("doctor_id", [None])[0]
+                if not doctor_id:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "doctor_id is required."}, 400)
+                doctor_id = doctor_id.strip().upper()
+                try:
+                    avail = hospital.get_doctor_availability(doctor_id)
+                    leaves = hospital.list_doctor_leaves(
+                        doctor_id, role=self._user["role"],
+                        user_doctor_id=self._user.get("doctor_id"))
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "doctor_id": doctor_id,
+                    "availability": avail, "leaves": leaves,
+                })
+
+            # ---- Step 11: hospital holidays (every role may view).
+            if path == "/api/holidays":
+                return self._send_json({
+                    "ok": True, "holidays": hospital.list_holidays(),
                 })
 
             # ---- Step 10: the appointment calendar — every
@@ -1109,6 +1167,140 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "doctor": _serialize_doctor(hospital.doctors_map[doc_id]),
                 })
 
+            # ---- Step 11: save a doctor's availability (Admin only).
+            # working_days is e.g. ["Mon","Tue","Wed","Thu","Fri"];
+            # breaks is e.g. ["13:00-14:00"].
+            if path == "/api/availability":
+                if not can(role, "manage_availability"):
+                    return self._forbidden(role)
+                doc_id = str(data.get("doctor_id", "")).strip().upper()
+                duration = _parse_int(data.get("duration_minutes"))
+                if duration is None:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "Consultation duration must be a number of minutes."}, 400)
+                try:
+                    record = hospital.set_doctor_availability(
+                        doc_id, data.get("working_days"),
+                        data.get("start_time"), data.get("end_time"),
+                        duration, data.get("breaks"), role=role)
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "message": "Availability saved.",
+                    "availability": record,
+                })
+
+            # ---- Step 11: clear a doctor's availability (Admin only)
+            # — back to "not set", so any time is allowed again.
+            if path == "/api/availability/clear":
+                if not can(role, "manage_availability"):
+                    return self._forbidden(role)
+                doc_id = str(data.get("doctor_id", "")).strip().upper()
+                try:
+                    cleared = hospital.clear_doctor_availability(
+                        doc_id, role=role)
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True,
+                    "message": "Availability cleared."
+                    if cleared else "No availability was set.",
+                    "cleared": cleared,
+                })
+
+            # ---- Step 11: add leave for a doctor — Admin for any
+            # doctor, a Doctor only for themself (Hospital enforces
+            # the fine rule — 403 otherwise).
+            if path == "/api/leaves":
+                if not can(role, "manage_leave"):
+                    return self._forbidden(role)
+                doc_id = str(data.get("doctor_id", "")).strip().upper()
+                try:
+                    row = hospital.add_doctor_leave(
+                        doc_id, data.get("start_date"),
+                        data.get("end_date"), data.get("reason", ""),
+                        role=role,
+                        user_doctor_id=self._user.get("doctor_id"))
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "message": "Leave added.", "leave": row,
+                })
+
+            # ---- Step 11: delete one leave row (Admin any, Doctor
+            # only their own).
+            if path.startswith("/api/leaves/") and path.endswith("/delete"):
+                if not can(role, "manage_leave"):
+                    return self._forbidden(role)
+                raw = path.removeprefix("/api/leaves/").removesuffix("/delete").strip("/")
+                if not raw or "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                try:
+                    hospital.delete_doctor_leave(
+                        raw, role=role,
+                        user_doctor_id=self._user.get("doctor_id"))
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "message": "Leave deleted.",
+                })
+
+            # ---- Step 11: add a hospital holiday (Admin only).
+            if path == "/api/holidays":
+                if not can(role, "manage_holidays"):
+                    return self._forbidden(role)
+                try:
+                    row = hospital.add_holiday(
+                        data.get("date"), data.get("name"), role=role)
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "message": "Holiday added.",
+                    "holiday": row,
+                })
+
+            # ---- Step 11: delete one holiday (Admin only).
+            if path.startswith("/api/holidays/") and path.endswith("/delete"):
+                if not can(role, "manage_holidays"):
+                    return self._forbidden(role)
+                raw = path.removeprefix("/api/holidays/").removesuffix("/delete").strip("/")
+                if not raw or "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                try:
+                    hospital.delete_holiday(raw, role=role)
+                except PermissionError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 403)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "message": "Holiday deleted.",
+                })
+
             # ---- Book Appointment (Step 4: date/time — date empty =
             # today, time empty = no fixed time; bad values get a 400)
             # Step 8: a Type (General / Follow-up / Emergency —
@@ -1197,6 +1389,18 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                 # Everything is checked BEFORE the new patient is
                 # registered, so a failed booking never leaves a stray
                 # patient behind.
+                # ---- Step 11: availability — holiday, leave, working
+                # day/hours, break, and the (now duration-aware)
+                # double-booking guard. The 400 says exactly why.
+                try:
+                    block_reason = hospital.check_availability(
+                        doc_id, appt_date, appt_time)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                if block_reason is not None:
+                    return self._send_json(
+                        {"ok": False, "error": block_reason}, 400)
                 if isinstance(new_patient, dict):
                     if pid not in hospital.patients_map:
                         hospital.add_patient(
@@ -1209,17 +1413,10 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     if not pat:
                         return self._send_json(
                             {"ok": False, "error": "Invalid patient ID."}, 400)
-                # ---- Step 6: no double booking — the same doctor,
-                # same date, same time, while the existing appointment
-                # is still active. The 400 says exactly what is taken.
-                conflict = hospital.find_conflicting_appointment(
-                    doc_id, appt_date, appt_time)
-                if conflict is not None:
-                    return self._send_json(
-                        {"ok": False,
-                         "error": f"Doctor {doc['name']} already has an appointment at "
-                                  f"{appt_date} {appt_time} (token {conflict['token']}, "
-                                  f"{conflict['status']}). Pick another time."}, 400)
+                # ---- Step 11: the availability was already checked
+                # above (before the new patient was registered), and
+                # book_appointment checks it again — a refused booking
+                # never leaves a stray patient behind.
                 token = hospital.book_appointment(
                     doc_id, pid, is_emg, appt_date, appt_time,
                     appt_type=appt_type, reason=reason, notes=notes,

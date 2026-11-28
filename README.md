@@ -257,6 +257,40 @@ Appointments with no fixed time never collide with anything.
   column too. Doctors only get the three statuses they are allowed to
   set in the dropdown.
 
+## Doctor Availability & Scheduling
+
+Each doctor can have their own working pattern: working days
+(Mon–Sun), daily working hours (e.g. 09:00–17:00), breaks (e.g. lunch
+13:00–14:00) and a consultation duration in minutes (15/20/30). From
+that pattern the system generates the bookable slots for any date —
+working hours minus breaks, in duration steps. The booking form shows
+only the free slots for the chosen doctor and day (booked ones greyed
+out); a doctor with no availability set yet shows a plain
+"availability not set yet" note and still books by free time entry,
+exactly as before.
+
+**Booking is refused, with a plain reason, when:** the date is not
+one of the doctor's working days, the time is outside working hours,
+the time falls inside a break, the doctor is on leave that day, the
+day is a hospital holiday, or the slot overlaps an active appointment
+(a 30-minute appointment at 09:00 blocks a 09:15 booking too).
+Rescheduling re-runs all of these checks. Leave (per doctor, single
+date or range + optional reason) and hospital-wide holidays (date +
+name) are managed from the dashboard and the CLI; on a leave or
+holiday day the doctor has no slots and bookings are refused.
+
+**Who can do what:** Admin manages availability, leave and holidays.
+A Doctor views their own availability and adds/removes their OWN
+leave only. A Receptionist views availability and slots only.
+
+- **CLI:** menu **23. Availability** (pick a doctor, see their
+  pattern and slots for a date; Admin sets or clears it) and menu
+  **24. Leave & Holidays** (doctor leave + hospital holidays).
+- **Dashboard:** Doctor Management → per-doctor **Availability**
+  (set working days/hours/breaks/duration, view slots for a date,
+  add/remove leave) and Appointments → **Holidays** (list/add/delete).
+  The booking form's slot chips come live from the same slots API.
+
 ## Quick Start
 
 1. Clone the repository:

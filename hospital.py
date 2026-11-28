@@ -65,6 +65,26 @@ change that flips the priority (Emergency <-> the others) changes
 the priority in place and re-orders the queue — the token, the
 APT ID, the booked date, the status and the history all stay put. The table exports as CSV (``appointments_to_csv``)
 and as a PDF (see pdf_export.py) — both respect the active filters.
+
+Step 10 (Appointment Calendar): ``calendar_appointments`` lists every
+appointment in an inclusive date range (doctor/department filters,
+untimed rows included, undated rows excluded); the CLI month grid and
+the web Day/Week/Month views read from it.
+
+Step 11 (Doctor Availability & Scheduling): each doctor has a working
+pattern — working days, daily hours, breaks, consultation duration
+(see availability.py) — plus per-doctor leave and hospital-wide
+holidays. ``check_availability`` refuses a booking outside them
+(holiday, leave, non-working day, outside hours, inside a break, or
+an overlapping appointment — the Step 6 guard is now duration-aware,
+so a 30-minute appointment at 09:00 also blocks 09:15) and is
+enforced by ``book_appointment`` and by reschedules in
+``edit_appointment``. A doctor with no pattern set has no hours to
+enforce — any time is allowed, and the booking form says so plainly.
+``availability_slots`` lists the bookable start times for a doctor on
+a date (working hours minus breaks, in duration steps, booked ones
+marked). Admin manages patterns and holidays; a Doctor may add or
+delete only their OWN leave.
 """
 
 import csv
@@ -76,6 +96,8 @@ import os
 import re
 
 from auth import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME, AuthStore, can
+from availability import (Availability, WEEKDAY_NAMES, minutes_to_time,
+                          time_to_minutes, weekday_name)
 from billing import Billing
 from database import Database
 from status_history import StatusHistory
@@ -483,6 +505,11 @@ class Hospital:
         # status_history.py). It is an audit trail: only appended to,
         # never rewritten by Database.save().
         self.status_history = StatusHistory(db_path)
+        # Step 11: doctor availability, leave and holidays live in
+        # their own store (same file when a db is given, pure
+        # in-memory otherwise — see availability.py). Database.save()
+        # never touches them.
+        self.availability = Availability(db_path)
         if self.db is not None:
             self.db.load(self)
 
@@ -797,6 +824,13 @@ class Hospital:
         Step 6: a double booking is refused — the same doctor cannot
         have two ACTIVE appointments at the same date and time. The
         new appointment starts with status Pending.
+        Step 11: the booking is also refused outside the doctor's
+        availability — on a hospital holiday, on a leave day, on a
+        non-working day, outside working hours, inside a break, or
+        overlapping an ACTIVE appointment (the guard is now
+        duration-aware: a 30-minute appointment at 09:00 also blocks
+        09:15). A doctor with no availability set has no hours to
+        enforce, so any time is allowed.
         Step 8: ``appt_type`` is General, Follow-up or Emergency. The
         type decides the queue priority — Emergency books an E- token,
         the others an N- token (when no type is given, the old
@@ -830,12 +864,13 @@ class Hospital:
         except ValueError as exc:
             print(f"  {exc}")
             return None
-        conflict = self.find_conflicting_appointment(
+        # Step 11: availability — holiday, leave, working day/hours,
+        # break, and the (now duration-aware) double-booking guard.
+        # A refusal prints the plain reason and books nothing.
+        block_reason = self.check_availability(
             doc["id"], appt_date, appt_time)
-        if conflict is not None:
-            print(f"  {doc['name']} already has an appointment at "
-                  f"{appt_date} {appt_time} (token {conflict['token']}, "
-                  f"{conflict['status']}). Pick another time.")
+        if block_reason is not None:
+            print(f"  {block_reason}")
             return None
         apt_id = self.next_apt_id()
         try:
@@ -856,7 +891,8 @@ class Hospital:
         return token
 
     # ------------------------------------------------ Step 6: statuses
-    def find_conflicting_appointment(self, doc_id, appt_date, appt_time):
+    def find_conflicting_appointment(self, doc_id, appt_date, appt_time,
+                                     duration=None, exclude_token=None):
         """The ACTIVE appointment that already occupies ``appt_date`` +
         ``appt_time`` for ``doc_id`` — or None when the slot is free.
 
@@ -864,18 +900,37 @@ class Hospital:
         time never blocks (or is blocked by) anything, and an empty
         date/time simply has no slot to check. Cancelled and No Show
         appointments no longer occupy their slot.
+
+        Step 11: ``duration`` (minutes) turns the check into an
+        interval check — a 30-minute appointment at 09:00 also blocks
+        a 09:15 booking (it runs until 09:30), while a booking at
+        09:30 is fine. Without a duration it is the old exact-minute
+        check. ``exclude_token`` skips one appointment — a reschedule
+        never blocks its own slot.
         """
         if not appt_date or not appt_time:
             return None
         doc = self.doctors_map.get(str(doc_id or "").upper())
         if not doc:
             return None
+        start = time_to_minutes(appt_time)
         for row in doc["queue"].heap:
             row_date = row[7] if len(row) > 7 else None
             row_time = row[8] if len(row) > 8 else None
-            if (row_date == appt_date and row_time == appt_time
-                    and _row_status(row) not in _INACTIVE_STATUSES):
-                return _public_appointment(doc, row)
+            if row_date != appt_date or not row_time:
+                continue
+            if _row_status(row) in _INACTIVE_STATUSES:
+                continue
+            if exclude_token and row[2] == exclude_token:
+                continue
+            if duration is None:
+                if row_time == appt_time:
+                    return _public_appointment(doc, row)
+            else:
+                other_start = time_to_minutes(row_time)
+                if start < other_start + duration \
+                        and other_start < start + duration:
+                    return _public_appointment(doc, row)
         return None
 
     def get_appointment(self, doc_id, token):
@@ -982,6 +1037,248 @@ class Hospital:
         if doctor_id.upper() not in self.doctors_map:
             raise ValueError("Doctor not found.")
         return self.appointments_for_date(date, doctor_id)
+
+    # ------------------------------------------------ Step 11: availability & scheduling
+    def check_availability(self, doc_id, appt_date, appt_time,
+                           exclude_token=None):
+        """Why a booking at ``appt_date`` + ``appt_time`` for ``doc_id``
+        is NOT allowed — or None when it is allowed.
+
+        Step 11, in order: (a) the date is a hospital holiday, (b) the
+        doctor is on leave that day, (c) the date is not one of the
+        doctor's working days, (d) the time is outside the working
+        hours, (e) the time falls inside a break, (f) the slot
+        overlaps an ACTIVE appointment — the Step 6 guard, now
+        duration-aware (with a 30-minute consultation a 09:00
+        appointment also blocks 09:15). When the doctor has no
+        availability set, only the holiday/leave checks apply and any
+        time is allowed — the booking form says so plainly. An untimed
+        booking (no fixed time) only runs the date checks (holiday,
+        leave, working day). ``exclude_token`` skips one appointment
+        (a reschedule never blocks its own slot). Raises ValueError
+        for an unknown doctor or a bad date.
+        """
+        doc = self.doctors_map.get(str(doc_id or "").upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        appt_date, appt_time = validate_appt_datetime(appt_date, appt_time)
+        holiday = self.availability.holiday_on(appt_date)
+        if holiday is not None:
+            return (f"Hospital is closed on {appt_date} ({holiday}) — "
+                    "no appointments that day.")
+        if self.availability.is_on_leave(doc["id"], appt_date):
+            return f"{doc['name']} is on leave on {appt_date}."
+        avail = self.availability.get(doc["id"])
+        duration = None
+        if avail is not None:
+            duration = avail["duration_minutes"]
+            day = weekday_name(appt_date)
+            if day not in avail["working_days"]:
+                return (f"{doc['name']} does not work on "
+                        f"{WEEKDAY_NAMES[day]}s ({appt_date}).")
+            if appt_time:
+                start = time_to_minutes(appt_time)
+                work_start = time_to_minutes(avail["start_time"])
+                work_end = time_to_minutes(avail["end_time"])
+                if start < work_start or start + duration > work_end:
+                    return (f"{doc['name']} works {avail['start_time']}–"
+                            f"{avail['end_time']} — {appt_time} is outside "
+                            "working hours.")
+                for bs, be in avail["breaks"]:
+                    if start < time_to_minutes(be) \
+                            and time_to_minutes(bs) < start + duration:
+                        return (f"{appt_time} falls in {doc['name']}'s break "
+                                f"({bs}–{be}).")
+        if appt_time:
+            conflict = self.find_conflicting_appointment(
+                doc["id"], appt_date, appt_time, duration=duration,
+                exclude_token=exclude_token)
+            if conflict is not None:
+                if duration is not None:
+                    end = minutes_to_time(
+                        time_to_minutes(conflict["appt_time"]) + duration)
+                    return (f"{doc['name']} already has an appointment at "
+                            f"{appt_date} {appt_time} (token "
+                            f"{conflict['token']}, {conflict['status']}) — "
+                            f"it runs until {end}. Pick another time.")
+                return (f"{doc['name']} already has an appointment at "
+                        f"{appt_date} {appt_time} (token {conflict['token']}, "
+                        f"{conflict['status']}). Pick another time.")
+        return None
+
+    def availability_slots(self, doctor_id, date=None):
+        """The bookable slots for one doctor on one date (today by
+        default) — Step 11.
+
+        Returns {"doctor_id", "date", "availability", "slots",
+        "booked", "unavailable_reason"}: "availability" is the
+        doctor's working pattern (None when not set yet — then any
+        time is allowed and "slots" is empty); "slots" is every start
+        time from the working hours minus breaks, in
+        consultation-duration steps, each marked available or booked
+        (with the blocking token); "booked" is the same booked-times
+        list the booking form already shows; "unavailable_reason"
+        says plainly why there are no slots (holiday, leave, not a
+        working day) — None when slots exist or availability is
+        simply not set. Raises ValueError for an unknown doctor or a
+        bad date.
+        """
+        doc = self.doctors_map.get(str(doctor_id or "").upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        date, _ = validate_appt_datetime(date, None)
+        booked = self.doctor_booked_times(doc["id"], date)
+        avail = self.availability.get(doc["id"])
+        # With no time, check_availability runs only the date checks
+        # (holiday / leave / working day) — exactly what decides
+        # whether ANY slot exists that day.
+        reason = self.check_availability(doc["id"], date, None)
+        slots = []
+        if avail is not None and reason is None:
+            start = time_to_minutes(avail["start_time"])
+            end = time_to_minutes(avail["end_time"])
+            duration = avail["duration_minutes"]
+            breaks = [(time_to_minutes(bs), time_to_minutes(be))
+                      for bs, be in avail["breaks"]]
+            t = start
+            while t + duration <= end:
+                in_break = any(t < be and bs < t + duration
+                               for bs, be in breaks)
+                if not in_break:
+                    taken = self.find_conflicting_appointment(
+                        doc["id"], date, minutes_to_time(t),
+                        duration=duration)
+                    slots.append({
+                        "time": minutes_to_time(t),
+                        "available": taken is None,
+                        "token": taken["token"] if taken else None,
+                    })
+                t += duration
+        return {"doctor_id": doc["id"], "date": date,
+                "availability": avail, "slots": slots,
+                "booked": booked, "unavailable_reason": reason}
+
+    def set_doctor_availability(self, doctor_id, working_days, start_time,
+                                end_time, duration_minutes, breaks=None,
+                                role="Admin"):
+        """Save a doctor's working pattern (Admin only).
+
+        ``working_days`` is e.g. ["Mon", "Tue", "Wed", "Thu", "Fri"];
+        ``breaks`` is e.g. ["13:00-14:00"]. Returns the saved record.
+        Raises PermissionError when the role is not Admin, ValueError
+        for an unknown doctor or a bad pattern.
+        """
+        if role != "Admin":
+            raise PermissionError(
+                "Only Admin can set doctor availability.")
+        doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        return self.availability.set(
+            doc["id"], working_days, start_time, end_time,
+            duration_minutes, breaks)
+
+    def get_doctor_availability(self, doctor_id):
+        """One doctor's working pattern, or None when not set yet."""
+        doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        return self.availability.get(doc["id"])
+
+    def clear_doctor_availability(self, doctor_id, role="Admin"):
+        """Remove a doctor's working pattern (Admin only) — back to
+        "not set", so any time is allowed again. Returns True when a
+        pattern was actually removed."""
+        if role != "Admin":
+            raise PermissionError(
+                "Only Admin can clear doctor availability.")
+        doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        return self.availability.clear(doc["id"])
+
+    def add_doctor_leave(self, doctor_id, start_date, end_date, reason="",
+                         role="Admin", user_doctor_id=None):
+        """Record leave for a doctor (Admin: any doctor; Doctor: only
+        themself — the linked doctor_id must match). Returns the saved
+        leave row (with its id). Raises PermissionError or ValueError.
+        """
+        if role == "Doctor":
+            if user_doctor_id is None or user_doctor_id.upper() \
+                    != str(doctor_id or "").strip().upper():
+                raise PermissionError(
+                    "Doctors can only add leave for themselves.")
+        elif role != "Admin":
+            raise PermissionError(
+                "Only Admin can add leave for a doctor.")
+        doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
+        if not doc:
+            raise ValueError("Doctor not found.")
+        return self.availability.add_leave(
+            doc["id"], start_date, end_date, reason)
+
+    def list_doctor_leaves(self, doctor_id=None, role="Admin",
+                           user_doctor_id=None):
+        """Leave rows, oldest first — all doctors, one doctor, or (for
+        a Doctor user) only their own leave. Raises ValueError for an
+        unknown doctor."""
+        if role == "Doctor" and user_doctor_id:
+            doctor_id = user_doctor_id
+        if doctor_id:
+            doc = self.doctors_map.get(str(doctor_id).strip().upper())
+            if not doc:
+                raise ValueError("Doctor not found.")
+            doctor_id = doc["id"]
+        return self.availability.leaves(doctor_id)
+
+    def delete_doctor_leave(self, leave_id, role="Admin",
+                            user_doctor_id=None):
+        """Delete one leave row (Admin: any; Doctor: only their own).
+
+        Raises ValueError when the leave does not exist.
+        """
+        try:
+            leave_id = int(leave_id)
+        except (TypeError, ValueError):
+            raise ValueError("Leave ID must be a number.")
+        row = next((r for r in self.availability.leaves()
+                    if r["id"] == leave_id), None)
+        if row is None:
+            raise ValueError("Leave not found.")
+        if role == "Doctor":
+            if user_doctor_id is None \
+                    or user_doctor_id.upper() != row["doctor_id"]:
+                raise PermissionError(
+                    "Doctors can only delete their own leave.")
+        elif role != "Admin":
+            raise PermissionError(
+                "Only Admin can delete leave.")
+        return self.availability.delete_leave(leave_id)
+
+    def add_holiday(self, date, name, role="Admin"):
+        """Add a hospital holiday (Admin only). Returns the saved row
+        (with its id). Raises PermissionError or ValueError (bad date,
+        empty name, or a date that is already a holiday)."""
+        if role != "Admin":
+            raise PermissionError("Only Admin can add holidays.")
+        return self.availability.add_holiday(date, name)
+
+    def list_holidays(self):
+        """Every hospital holiday, earliest first."""
+        return self.availability.holidays()
+
+    def delete_holiday(self, holiday_id, role="Admin"):
+        """Delete one holiday (Admin only). Raises ValueError when it
+        does not exist."""
+        if role != "Admin":
+            raise PermissionError("Only Admin can delete holidays.")
+        try:
+            holiday_id = int(holiday_id)
+        except (TypeError, ValueError):
+            raise ValueError("Holiday ID must be a number.")
+        if not self.availability.delete_holiday(holiday_id):
+            raise ValueError("Holiday not found.")
+        return True
 
     # ------------------------------------------------ Step 9: appointments table + details
     def all_appointments(self, doctor_id=None):
@@ -1228,7 +1525,11 @@ class Hospital:
         itself never blocks its own slot), and PermissionError when
         the role may not edit details: only Admin and Receptionist
         may — a Doctor may only update the consultation status
-        (Step 6) and never edits an appointment's details.
+        (Step 6) and never edits an appointment's details. Step 11:
+        a reschedule also re-runs ALL the availability checks
+        (holiday, leave, working day/hours, break, duration-aware
+        overlap), so an appointment can never be moved outside the
+        doctor's working hours.
 
         A type change that flips the queue priority (Emergency <->
         General/Follow-up) changes the priority field in place and
@@ -1265,20 +1566,19 @@ class Hospital:
                     "Type must be General, Follow-up or Emergency.")
         new_reason = appt["reason"] if reason is None else str(reason).strip()
         new_notes = appt["notes"] if notes is None else str(notes).strip()
-        # ---- The Step 6 guard, re-run for the new slot — but never
-        # against the appointment itself.
-        if new_date and new_time:
-            for other in doc["queue"].heap:
-                if other[2] == appt["token"]:
-                    continue
-                other_date = other[7] if len(other) > 7 else None
-                other_time = other[8] if len(other) > 8 else None
-                if (other_date == new_date and other_time == new_time
-                        and _row_status(other) not in _INACTIVE_STATUSES):
-                    raise ValueError(
-                        f"{doc['name']} already has an appointment at "
-                        f"{new_date} {new_time} (token {other[2]}, "
-                        f"{_row_status(other)}). Pick another time.")
+        # ---- Step 11: a reschedule re-runs ALL the availability
+        # checks (holiday, leave, working day/hours, break, and the
+        # duration-aware double-booking guard) — but never against
+        # the appointment itself. A reason/notes/type-only edit is
+        # not a reschedule and skips the checks. An appointment with
+        # no scheduled date (booked before Step 4) has no date to
+        # check, so it skips them too.
+        if (date or time is not None) and new_date is not None:
+            block_reason = self.check_availability(
+                doc["id"], new_date, new_time,
+                exclude_token=appt["token"])
+            if block_reason is not None:
+                raise ValueError(block_reason)
         new_is_emg = new_type == "Emergency"
         # Same priority — rebuild the row in place (heap order only
         # depends on fields 0/1, so the heap stays valid). A priority
@@ -2039,6 +2339,196 @@ def calendar_menu(hosp, role, user):
         _appointment_detail_menu(hosp, role, user, ref)
 
 
+def availability_menu(hosp, role, user):
+    """Doctor Availability (Step 11, menu 23): a doctor's working
+    pattern and their slots for a date; Admin sets or clears it. A
+    Doctor only ever sees their own availability."""
+    doctor_filter = None
+    if role == "Doctor" and user.get("doctor_id"):
+        doctor_filter = user["doctor_id"]
+    if doctor_filter:
+        doc_id = doctor_filter
+        print(f"  Doctor: {doctor_filter} (your availability)")
+    else:
+        if not hosp.doctors_map:
+            return print("  No doctors yet — ask Admin to add one first.")
+        for doc in hosp.doctors_map.values():
+            print(f"  {doc['id']} | {doc['name']} | {doc['spec']}")
+        doc_id = input("  Doctor ID: ").strip().upper()
+        if doc_id not in hosp.doctors_map:
+            return print("  Doctor not found.")
+    doc = hosp.doctors_map[doc_id]
+    avail = hosp.get_doctor_availability(doc_id)
+    if avail is None:
+        print(f"  {doc['name']} — no availability set yet "
+              "(any time is allowed).")
+    else:
+        print(f"  {doc['name']} — {', '.join(avail['working_days'])}, "
+              f"{avail['start_time']}–{avail['end_time']}, "
+              f"{avail['duration_minutes']} min per appointment")
+        if avail["breaks"]:
+            print("  Breaks: " + ", ".join(
+                f"{bs}–{be}" for bs, be in avail["breaks"]))
+        else:
+            print("  Breaks: none")
+    date = input("  Show slots for date (YYYY-MM-DD, empty = today): ").strip() or None
+    try:
+        slots = hosp.availability_slots(doc_id, date)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    if slots["availability"] is None:
+        print("  No availability set — slots are not listed; any time is allowed.")
+    elif slots["unavailable_reason"]:
+        print(f"  {slots['unavailable_reason']}")
+    else:
+        print(f"  Slots on {slots['date']}:")
+        if not slots["slots"]:
+            print("    (no slots)")
+        for s in slots["slots"]:
+            tag = "free" if s["available"] else f"booked ({s['token']})"
+            print(f"    {s['time']} — {tag}")
+    if role != "Admin":
+        return print("  Only Admin can change availability.")
+    choice = input("  [S]et availability / [C]lear availability / [Enter] back: ").strip().upper()
+    if choice == "C":
+        if hosp.clear_doctor_availability(doc_id, role=role):
+            print("  Availability cleared — any time is allowed again.")
+        else:
+            print("  No availability was set.")
+        return
+    if choice != "S":
+        return
+    days_raw = input("  Working days (e.g. Mon,Tue,Wed,Thu,Fri): ").strip()
+    working_days = [d.strip() for d in days_raw.split(",") if d.strip()]
+    start = input("  Working hours start (HH:MM, e.g. 09:00): ").strip()
+    end = input("  Working hours end (HH:MM, e.g. 17:00): ").strip()
+    try:
+        duration = int(input("  Consultation duration in minutes (e.g. 30): ").strip())
+    except ValueError:
+        return print("  Duration must be a whole number of minutes.")
+    breaks_raw = input("  Breaks (e.g. 13:00-14:00,16:00-16:15 — empty = none): ").strip()
+    breaks = [b.strip() for b in breaks_raw.split(",") if b.strip()] \
+        if breaks_raw else []
+    try:
+        record = hosp.set_doctor_availability(
+            doc_id, working_days, start, end, duration, breaks, role=role)
+    except (ValueError, PermissionError) as exc:
+        return print(f"  {exc}")
+    print(f"  Availability saved for {doc['name']}: "
+          f"{', '.join(record['working_days'])}, "
+          f"{record['start_time']}–{record['end_time']}, "
+          f"{record['duration_minutes']} min.")
+
+
+def _leave_menu(hosp, role, user):
+    """Doctor leave: list, add, delete. A Doctor only ever touches
+    their OWN leave; everyone may view."""
+    doctor_filter = None
+    if role == "Doctor" and user.get("doctor_id"):
+        doctor_filter = user["doctor_id"]
+    if doctor_filter:
+        doc_id = doctor_filter
+        print(f"  Doctor: {doctor_filter} (your leave)")
+    else:
+        if not hosp.doctors_map:
+            return print("  No doctors yet.")
+        doc_id = input("  Doctor ID: ").strip().upper()
+        if doc_id not in hosp.doctors_map:
+            return print("  Doctor not found.")
+    leaves = hosp.list_doctor_leaves(
+        doc_id, role=role, user_doctor_id=user.get("doctor_id"))
+    if not leaves:
+        print("  No leave recorded for this doctor.")
+    for lv in leaves:
+        print(f"  #{lv['id']} | {lv['start_date']} to {lv['end_date']}"
+              + (f" | {lv['reason']}" if lv["reason"] else ""))
+    choice = input("  [A]dd leave  [D]elete leave  [Enter] back: ").strip().upper()
+    if choice == "A":
+        if role not in ("Admin", "Doctor"):
+            return print("  Only Admin or the doctor themself can add leave.")
+        start = input("  Leave from (YYYY-MM-DD): ").strip()
+        end = input("  Leave to (YYYY-MM-DD): ").strip()
+        reason = input("  Reason (optional): ").strip()
+        try:
+            row = hosp.add_doctor_leave(
+                doc_id, start, end, reason, role=role,
+                user_doctor_id=user.get("doctor_id"))
+        except (ValueError, PermissionError) as exc:
+            return print(f"  {exc}")
+        print(f"  Leave #{row['id']} added: "
+              f"{row['start_date']} to {row['end_date']}.")
+    elif choice == "D":
+        if role not in ("Admin", "Doctor"):
+            return print("  Only Admin or the doctor themself can delete leave.")
+        try:
+            leave_id = int(input("  Leave ID to delete: ").strip())
+        except ValueError:
+            return print("  Leave ID must be a number.")
+        try:
+            hosp.delete_doctor_leave(
+                leave_id, role=role, user_doctor_id=user.get("doctor_id"))
+        except (ValueError, PermissionError) as exc:
+            return print(f"  {exc}")
+        print("  Leave deleted.")
+    elif choice == "":
+        return
+    else:
+        print("  Pick A, D or Enter.")
+
+
+def _holidays_menu(hosp, role):
+    """Hospital holidays: list, add, delete. Holidays are Admin only
+    to change; everyone may view."""
+    holidays = hosp.list_holidays()
+    if not holidays:
+        print("  No holidays recorded.")
+    for h in holidays:
+        print(f"  #{h['id']} | {h['date']} — {h['name']}")
+    choice = input("  [A]dd holiday  [D]elete holiday  [Enter] back: ").strip().upper()
+    if choice == "A":
+        if role != "Admin":
+            return print("  Only Admin can add holidays.")
+        date = input("  Holiday date (YYYY-MM-DD): ").strip()
+        name = input("  Holiday name (e.g. Eid-ul-Fitr): ").strip()
+        try:
+            row = hosp.add_holiday(date, name, role=role)
+        except (ValueError, PermissionError) as exc:
+            return print(f"  {exc}")
+        print(f"  Holiday #{row['id']} added: {row['date']} — {row['name']}.")
+    elif choice == "D":
+        if role != "Admin":
+            return print("  Only Admin can delete holidays.")
+        try:
+            holiday_id = int(input("  Holiday ID to delete: ").strip())
+        except ValueError:
+            return print("  Holiday ID must be a number.")
+        try:
+            hosp.delete_holiday(holiday_id, role=role)
+        except (ValueError, PermissionError) as exc:
+            return print(f"  {exc}")
+        print("  Holiday deleted.")
+    elif choice == "":
+        return
+    else:
+        print("  Pick A, D or Enter.")
+
+
+def leave_holidays_menu(hosp, role, user):
+    """Doctor leave + hospital holidays (Step 11, menu 24)."""
+    print("\n  --- Leave & Holidays ---")
+    print("  1. Doctor Leave")
+    print("  2. Hospital Holidays")
+    choice = input("  Pick (1-2, empty = back): ").strip()
+    if choice == "1":
+        _leave_menu(hosp, role, user)
+    elif choice == "2":
+        _holidays_menu(hosp, role)
+    elif choice == "":
+        return
+    else:
+        print("  Pick 1 or 2.")
+
+
 def _appointment_detail_menu(hosp, role, user, apt_ref):
     """Full details for one appointment (Step 9) — everything the
     details page shows, plus edit/reschedule and cancel for
@@ -2225,6 +2715,26 @@ def book_appointment_menu(hosp):
             print(f"    {b['time']} | {b['token']} ({b['patient_name']}) | {b['status']} — {tag}")
     else:
         print(f"  Nothing booked on {appt_date} yet — all times free.")
+    # Step 11: the doctor's available slots for the day (working
+    # hours minus breaks, in consultation-duration steps) — or the
+    # plain reason when there are none (holiday, leave, not a
+    # working day), or the note that no availability is set yet and
+    # any time is allowed.
+    try:
+        slots = hosp.availability_slots(doc["id"], appt_date)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    if slots["availability"] is None:
+        print("  No availability set for this doctor yet — any time is allowed.")
+    elif slots["unavailable_reason"]:
+        print(f"  {slots['unavailable_reason']}")
+    else:
+        free = [s["time"] for s in slots["slots"] if s["available"]]
+        taken = [s["time"] for s in slots["slots"] if not s["available"]]
+        print(f"  Available slots on {appt_date}: "
+              f"{', '.join(free) if free else 'none'}")
+        if taken:
+            print(f"  Already booked: {', '.join(taken)}")
     appt_time = input("  Time (HH:MM, empty = no fixed time): ").strip() or None
     # ---- 4. Type, reason, notes, status
     print("  4. Appointment details")
@@ -2422,6 +2932,8 @@ MENU = [
     ("20", "Appointment Status", "update_appointment_status"),  # Step 6
     ("21", "All Appointments", "view"),  # Step 9: table + details
     ("22", "Calendar", "view"),  # Step 10: day/week/month calendar
+    ("23", "Availability", "view_availability"),  # Step 11: doctor availability
+    ("24", "Leave & Holidays", "view_availability"),  # Step 11: leave + holidays
 ]
 
 
@@ -2504,6 +3016,10 @@ def main():
             appointments_table_menu(hosp, role, user)
         elif choice == "22":
             calendar_menu(hosp, role, user)
+        elif choice == "23":
+            availability_menu(hosp, role, user)
+        elif choice == "24":
+            leave_holidays_menu(hosp, role, user)
 
 
 if __name__ == "__main__":

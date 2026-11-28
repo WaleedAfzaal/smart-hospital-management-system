@@ -519,6 +519,84 @@ doctor also joins the shift rotation.
   HTTP endpoints incl. 404/400/403 rules, and the CLI table menu
   incl. Doctor seeing only their own queue).
 
+## Doctor Availability & Scheduling — Step 11 (`availability.py` + `hospital.py` + `server.py` + `web/`)
+
+- New module `availability.py` (same pattern as `status_history.py` /
+  `billing.py` — its own tables in the same `hospital.db`, in-memory
+  fallback when there is no db path; `Database.save()` never touches
+  it). Tables: `doctor_availability` (one row per doctor: working
+  days as a comma string, start/end time, duration in minutes, breaks
+  as JSON), `doctor_leave` (doctor, start/end date, optional reason),
+  `holidays` (date UNIQUE + name). Class `Availability` with
+  `set/get/clear`, leave add/list/delete, holiday add/list/delete, and
+  the small validators (`validate_time`, `time_to_minutes`,
+  `minutes_to_time`, `validate_date`, `weekday_name`); bad patterns
+  raise `ValueError` with a plain message (bad day, hours not
+  start<end, duration outside 5–120, break outside hours,
+  overlapping breaks).
+- `Hospital` owns one `self.availability` (created before
+  `self.db.load`). `check_availability(doc_id, date, time,
+  exclude_token=None)` returns the refusal reason string or `None`,
+  checked in order: hospital holiday, doctor on leave, non-working
+  day, outside working hours, inside a break, then the overlap guard.
+  A doctor with no availability set is only checked for holiday /
+  leave; an untimed booking (`time=None`) is only checked for
+  holiday / leave / working day. `availability_slots(doctor_id,
+  date=None)` returns `{"doctor_id", "date", "availability",
+  "slots", "booked", "unavailable_reason"}` — slots are working
+  hours minus breaks in duration steps, each `{"time", "available",
+  "token"}`.
+- The Step 6 guard is now duration-aware:
+  `find_conflicting_appointment(doc_id, date, time, duration=None,
+  exclude_token=None)` — without a duration it is the old
+  exact-minute check (existing tests rely on it); with a duration it
+  is an interval-overlap check, so a 30-minute appointment at 09:00
+  blocks a 09:15 booking; `exclude_token` keeps a reschedule from
+  blocking its own slot; Cancelled / No Show never block.
+- Enforcement is server-side, never client-only:
+  `book_appointment` runs `check_availability` (a refusal prints the
+  reason and returns `None`); the booking API runs the same check
+  AFTER the doctor lookup and BEFORE a new patient is registered, so
+  a refused booking never leaves a stray patient; `edit_appointment`
+  re-runs it only when the date or time actually changes (reason /
+  notes / type-only edits skip the checks). The CLI booking menu
+  enforces it too and prints the free slots before asking for a time.
+- Roles (`auth.py` PERMISSIONS): `manage_availability` {Admin},
+  `manage_leave` {Admin, Doctor}, `manage_holidays` {Admin},
+  `view_availability` {Admin, Doctor, Receptionist}. A Doctor may set
+  or remove only their OWN leave — enforced in `Hospital` and in the
+  API (403); a Doctor reading availability is forced to their own
+  doctor. CLI menus 23 (Availability) and 24 (Leave & Holidays) gate
+  the same way.
+- API: `GET /api/availability?doctor_id=` (availability + leaves),
+  `POST /api/availability`, `POST /api/availability/clear`,
+  `POST /api/leaves`, `POST /api/leaves/<id>/delete`,
+  `GET /api/holidays`, `POST /api/holidays`,
+  `POST /api/holidays/<id>/delete`; `GET
+  /api/appointments/slots` extended with `availability`, `slots` and
+  `unavailable_reason`. PermissionError → 403, ValueError → 400.
+- Web: `renderAvailability` (doctor picker — Doctor forced to own;
+  working-hours card with Admin-only save form: weekday checkboxes,
+  start/end time, duration select 15/20/30/45/60, breaks textarea one
+  per line; Clear button; slots preview for a chosen date; Leave card
+  with list + delete + add-leave form) and `renderHolidays` (list
+  with Admin-only delete + Admin-only add form), under Doctor
+  Management → Availability and Appointments → Holidays. The Step 8
+  booking form's `refreshSlots` shows the working pattern line, free
+  slot chips as clickable buttons that fill the time input, TAKEN
+  slots greyed, the `unavailable_reason` as an error box, and the
+  "Availability not set for this doctor yet — pick any time below."
+  note when availability is `null`.
+- Tests: `tests/test_doctor_availability.py` (45 tests: store
+  set/get/clear + validation + leave/holiday CRUD + restart
+  persistence; slot generation incl. break boundaries, 20-minute
+  steps, weekend/leave/holiday no-slots; booking enforcement incl.
+  working-day/outside-hours/break/leave/holiday/overlap refusals,
+  adjacent slot OK, Cancelled freeing the overlap, D2-with-no-availability
+  booking freely; reschedule re-checks; roles; HTTP endpoints incl.
+  no-stray-patient and 403s; CLI menus incl. Doctor read-only).
+  350 tests total passing.
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.

@@ -42,6 +42,13 @@ const OP_PERMS = {
   /* Step 10 (Calendar): every role may open it — a Doctor linked
      to one doctor only sees that doctor's appointments. */
   "calendar": ["Admin", "Doctor", "Receptionist"],
+  /* Step 11 (Doctor Availability & Scheduling): every role may open
+     the availability and holidays views — a Doctor linked to one
+     doctor only sees their own. Editing is Admin only (leave: Admin
+     or the doctor themself); the server enforces it, the forms below
+     just hide those buttons for other roles. */
+  "availability": ["Admin", "Doctor", "Receptionist"],
+  "holidays": ["Admin", "Doctor", "Receptionist"],
 };
 
 function canUse(op) {
@@ -238,6 +245,8 @@ const OPS = {
   "reports": ["Reports", "Daily summary — patients, money, beds"],
   "schedule": ["Schedule", "Appointments by date — today or any day"],
   "all-appointments": ["All Appointments", "Search, filter, sort and export every appointment"],
+  "availability": ["Doctor Availability", "Working days, hours, breaks, slots and leave per doctor"],
+  "holidays": ["Holidays", "Hospital holidays — no appointments on these days"],
 };
 
 /* ---------------- Step 7: views + sidebar navigation ---------------- */
@@ -262,6 +271,7 @@ const OP_NAV = {
   "doctors": "doctors", "shifts": "doctors",
   "book-appointment": "appointments", "schedule": "appointments",
   "all-appointments": "appointments", "calendar": "appointments",
+  "availability": "doctors", "holidays": "appointments",
   "beds": "beds", "pharmacy": "pharmacy", "billing": "billing",
   "reports": "reports", "departments": "departments",
   "settings": "settings", "change-password": "settings",
@@ -307,6 +317,8 @@ function openOp(op) {
     "schedule": renderSchedule,
     "all-appointments": renderAllAppointments,
     "calendar": renderCalendar,
+    "availability": renderAvailability,
+    "holidays": renderHolidays,
   })[op]();
 }
 
@@ -329,6 +341,7 @@ const NAV = [
   ] },
   { key: "doctors", label: "Doctor Management", icon: "steth", children: [
     { op: "doctors", label: "All Doctors" },
+    { op: "availability", label: "Availability" },
     { op: "shifts", label: "Shifts" },
   ] },
   { key: "appointments", label: "Appointments", icon: "cal", children: [
@@ -336,6 +349,7 @@ const NAV = [
     { op: "book-appointment", label: "Book Appointment" },
     { op: "schedule", label: "Schedule" },
     { op: "calendar", label: "Calendar" },
+    { op: "holidays", label: "Holidays" },
   ] },
   { key: "departments", label: "Departments", icon: "building", view: "departments" },
   { key: "beds", label: "Bed & Ward Management", icon: "bed", op: "beds" },
@@ -755,6 +769,243 @@ function renderDoctors(msg = "", ok = true) {
   });
 }
 
+/* Step 11 (Doctor Availability & Scheduling): working days, hours,
+   breaks, consultation duration, leave and slots per doctor (Admin
+   edits; a Doctor sees only their own; Receptionist views only),
+   plus the hospital holidays. The server enforces the role rules —
+   a failed save just shows the server's message. */
+const AVAIL_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const AVAIL_DAY_FULL = { Mon: "Monday", Tue: "Tuesday", Wed: "Wednesday",
+  Thu: "Thursday", Fri: "Friday", Sat: "Saturday", Sun: "Sunday" };
+
+async function renderAvailability(msg = "", ok = true) {
+  const docs = state ? state.doctors : [];
+  const isAdmin = currentUser && currentUser.role === "Admin";
+  const ownDoctor = currentUser && currentUser.role === "Doctor"
+    ? currentUser.doctor_id : null;
+  body.innerHTML = `
+    ${msgHtml(msg, ok)}
+    ${state ? "" : offlineBanner()}
+    ${docs.length ? `
+    <div class="field-row">
+      <div class="field"><label>Doctor</label>
+        <select id="av-doctor">
+          ${ownDoctor
+            ? docs.filter((d) => d.id === ownDoctor).map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — ${esc(d.spec || "—")}</option>`).join("")
+            : `<option value="">— Select doctor —</option>` + docs.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — ${esc(d.spec || "—")}</option>`).join("")}
+        </select></div>
+      <div class="field"><label>Show slots for date</label>
+        <input type="date" id="av-date"></div>
+    </div>
+    <div id="av-body" style="margin-top:12px"></div>` : `<p class="muted">No doctors yet.</p>`}`;
+  if (!docs.length) return;
+  const docSel = document.getElementById("av-doctor");
+  const dateInput = document.getElementById("av-date");
+  const now = new Date();
+  dateInput.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+  async function loadSlots(docId, date, box) {
+    const res = await api(`/api/appointments/slots?doctor_id=${encodeURIComponent(docId)}&date=${encodeURIComponent(date)}`);
+    if (!res.ok) {
+      box.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+      return;
+    }
+    if (res.unavailable_reason) {
+      box.innerHTML = `<div class="msg msg-err">${esc(res.unavailable_reason)}</div>`;
+      return;
+    }
+    const slots = res.slots || [];
+    box.innerHTML = slots.length
+      ? `<p>${slots.map((s) => s.available
+          ? `<span class="tag tag-done" style="margin:2px">${esc(s.time)} — free</span>`
+          : `<span class="tag tag-cancel" style="margin:2px">${esc(s.time)} · ${esc(s.token || "")} — TAKEN</span>`).join(" ")}</p>`
+      : `<p class="muted">${res.availability ? "No free slots on this date." : "Availability not set yet — any time is allowed."}</p>`;
+  }
+
+  async function loadDoctor() {
+    const docId = docSel.value;
+    const box = document.getElementById("av-body");
+    if (!docId) { box.innerHTML = `<p class="muted">Pehle doctor choose karo.</p>`; return; }
+    const res = await api(`/api/availability?doctor_id=${encodeURIComponent(docId)}`);
+    if (!res.ok) { box.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`; return; }
+    const a = res.availability;
+    const leaves = res.leaves || [];
+    const canLeave = isAdmin || !!ownDoctor;
+    box.innerHTML = `
+    <div class="card"><h3>Working Hours</h3>
+      ${a ? `<p><b>${esc(a.working_days.join(", "))}</b> • ${esc(a.start_time)}–${esc(a.end_time)} • ${a.duration_minutes} min per appointment${a.breaks.length ? ` • Breaks: ${a.breaks.map((b) => esc(b[0]) + "–" + esc(b[1])).join(", ")}` : " • No breaks"}</p>`
+        : `<p class="muted">Availability not set yet — any time is allowed for this doctor.</p>`}
+      ${isAdmin ? `
+      <form id="f-avail" class="form-grid">
+        <div class="field"><label>Working days</label>
+          <div>${AVAIL_DAYS.map((d) => `<label style="margin-right:10px"><input type="checkbox" name="day" value="${d}" ${a && a.working_days.includes(d) ? "checked" : ""}> ${AVAIL_DAY_FULL[d]}</label>`).join("")}</div></div>
+        <div class="field-row">
+          <div class="field"><label>Start time</label><input type="time" name="start" value="${a ? esc(a.start_time) : "09:00"}" required></div>
+          <div class="field"><label>End time</label><input type="time" name="end" value="${a ? esc(a.end_time) : "17:00"}" required></div>
+          <div class="field"><label>Consultation duration (minutes)</label>
+            <select name="duration">${[15, 20, 30, 45, 60].map((m) => `<option ${a && a.duration_minutes === m ? "selected" : ""}>${m}</option>`).join("")}</select></div>
+        </div>
+        <div class="field"><label>Breaks (one per line, e.g. 13:00-14:00)</label>
+          <textarea name="breaks" rows="2" placeholder="13:00-14:00">${a ? esc(a.breaks.map((b) => b[0] + "-" + b[1]).join("\n")) : ""}</textarea></div>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-primary">Save Availability</button>
+          ${a ? `<button type="button" class="btn btn-ghost" id="av-clear">Clear Availability</button>` : ""}
+        </div>
+      </form>` : `<p class="muted">Only Admin can change availability.</p>`}
+    </div>
+    <div class="card" style="margin-top:12px"><h3>Slots — <span id="av-slots-date">${esc(dateInput.value)}</span></h3>
+      <div id="av-slots"></div></div>
+    <div class="card" style="margin-top:12px"><h3>Leave</h3>
+      ${leaves.length ? leaves.map((lv) => `<p>#${lv.id} • ${esc(lv.start_date)} to ${esc(lv.end_date)}${lv.reason ? " • " + esc(lv.reason) : ""} ${canLeave ? `<button type="button" class="btn btn-ghost" data-del-leave="${lv.id}">Delete</button>` : ""}</p>`).join("") : `<p class="muted">No leave recorded.</p>`}
+      ${canLeave ? `
+      <form id="f-leave" class="form-grid">
+        <div class="field-row">
+          <div class="field"><label>Leave from</label><input type="date" name="from" required></div>
+          <div class="field"><label>Leave to</label><input type="date" name="to" required></div>
+          <div class="field"><label>Reason (optional)</label><input type="text" name="reason" placeholder="e.g. Annual leave"></div>
+        </div>
+        <div class="btn-row"><button type="submit" class="btn btn-primary">Add Leave</button></div>
+      </form>` : `<p class="muted">Only Admin (or the doctor themself) can add leave.</p>`}
+    </div>`;
+    const slotsBox = document.getElementById("av-slots");
+    loadSlots(docId, dateInput.value, slotsBox);
+    const availForm = document.getElementById("f-avail");
+    if (availForm) {
+      availForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const f = new FormData(e.target);
+        const days = f.getAll("day");
+        const breaks = f.get("breaks").split("\n").map((s) => s.trim()).filter(Boolean);
+        const res2 = await api("/api/availability", "POST", {
+          doctor_id: docId, working_days: days,
+          start_time: f.get("start"), end_time: f.get("end"),
+          duration_minutes: Number(f.get("duration")), breaks,
+        });
+        await loadState();
+        if (res2.ok) {
+          toast(res2.message);
+          renderAvailability(res2.message, true);
+        } else {
+          const m = errOf(res2);
+          toast(m, true);
+          renderAvailability(m, false);
+        }
+      });
+      const clearBtn = document.getElementById("av-clear");
+      if (clearBtn) {
+        clearBtn.onclick = async () => {
+          const res2 = await api("/api/availability/clear", "POST", { doctor_id: docId });
+          await loadState();
+          if (res2.ok) {
+            toast(res2.message);
+            renderAvailability(res2.message, true);
+          } else {
+            const m = errOf(res2);
+            toast(m, true);
+            renderAvailability(m, false);
+          }
+        };
+      }
+    }
+    const leaveForm = document.getElementById("f-leave");
+    if (leaveForm) {
+      leaveForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const f = new FormData(e.target);
+        const res2 = await api("/api/leaves", "POST", {
+          doctor_id: docId, start_date: f.get("from"),
+          end_date: f.get("to"), reason: f.get("reason"),
+        });
+        await loadState();
+        if (res2.ok) {
+          toast(res2.message);
+          renderAvailability(res2.message, true);
+        } else {
+          const m = errOf(res2);
+          toast(m, true);
+          renderAvailability(m, false);
+        }
+      });
+    }
+    box.querySelectorAll("[data-del-leave]").forEach((btn) => {
+      btn.onclick = async () => {
+        const res2 = await api(`/api/leaves/${btn.dataset.delLeave}/delete`, "POST", {});
+        await loadState();
+        if (res2.ok) {
+          toast(res2.message);
+          renderAvailability(res2.message, true);
+        } else {
+          const m = errOf(res2);
+          toast(m, true);
+          renderAvailability(m, false);
+        }
+      };
+    });
+  }
+
+  docSel.onchange = loadDoctor;
+  dateInput.onchange = () => {
+    const box = document.getElementById("av-slots");
+    const label = document.getElementById("av-slots-date");
+    if (label) label.textContent = dateInput.value;
+    if (box && docSel.value) loadSlots(docSel.value, dateInput.value, box);
+  };
+  if (docSel.value) loadDoctor();
+}
+
+async function renderHolidays(msg = "", ok = true) {
+  const isAdmin = currentUser && currentUser.role === "Admin";
+  const res = await api("/api/holidays");
+  body.innerHTML = `
+    ${msgHtml(msg, ok)}
+    ${!res.ok ? `<div class="msg msg-err">${esc(errOf(res))}</div>`
+      : (res.holidays.length
+        ? res.holidays.map((h) => `<div class="card"><p><b>${esc(h.date)}</b> — ${esc(h.name)} ${isAdmin ? `<button type="button" class="btn btn-ghost" data-del-holiday="${h.id}">Delete</button>` : ""}</p></div>`).join("")
+        : `<p class="muted">No holidays recorded — the hospital is open every day.</p>`)}
+    ${isAdmin ? `
+    <h3 style="margin:16px 0 8px">Add Holiday</h3>
+    <form id="f-holiday" class="form-grid">
+      <div class="field-row">
+        <div class="field"><label>Date</label><input type="date" name="date" required></div>
+        <div class="field"><label>Holiday name</label><input type="text" name="name" placeholder="e.g. Eid-ul-Fitr" required></div>
+      </div>
+      <div class="btn-row"><button type="submit" class="btn btn-primary">Add Holiday</button></div>
+    </form>` : `<p class="muted">Only Admin can add or delete holidays.</p>`}`;
+  document.querySelectorAll("[data-del-holiday]").forEach((btn) => {
+    btn.onclick = async () => {
+      const res2 = await api(`/api/holidays/${btn.dataset.delHoliday}/delete`, "POST", {});
+      await loadState();
+      if (res2.ok) {
+        toast(res2.message);
+        renderHolidays(res2.message, true);
+      } else {
+        const m = errOf(res2);
+        toast(m, true);
+        renderHolidays(m, false);
+      }
+    };
+  });
+  const form = document.getElementById("f-holiday");
+  if (form) {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const res2 = await api("/api/holidays", "POST", {
+        date: f.get("date"), name: f.get("name"),
+      });
+      await loadState();
+      if (res2.ok) {
+        toast(res2.message);
+        renderHolidays(res2.message, true);
+      } else {
+        const m = errOf(res2);
+        toast(m, true);
+        renderHolidays(m, false);
+      }
+    });
+  }
+}
+
 /* Step 8 (Book Appointment form) state — the patient picked (or the
    new patient being registered), the department/doctor picked, and
    the booked times for the chosen doctor/day. */
@@ -904,13 +1155,43 @@ function renderBook(msg = "", ok = true) {
       return;
     }
     bookSlots = res.booked || [];
-    slotsBox.innerHTML = bookSlots.length
+    /* Step 11: the live availability for this doctor + day — the
+       working pattern, the free slot chips (click one to fill the
+       time), and the plain reason when there is no slot at all
+       (holiday, leave, not a working day). When no availability is
+       set yet, any time is allowed and the free time field below is
+       the way to book. */
+    let html = "";
+    if (res.unavailable_reason) {
+      html += `<div class="msg msg-err">${esc(res.unavailable_reason)}</div>`;
+    }
+    if (res.availability) {
+      const a = res.availability;
+      html += `<p><b>${esc(a.start_time)}–${esc(a.end_time)}</b> • ${esc(a.working_days.join(", "))} • ${a.duration_minutes} min per appointment${a.breaks.length ? ` • Breaks: ${a.breaks.map((b) => esc(b[0]) + "–" + esc(b[1])).join(", ")}` : ""}</p>`;
+      if (!res.unavailable_reason) {
+        const slots = res.slots || [];
+        html += slots.length
+          ? `<p><b>Available slots on ${esc(res.date)}:</b></p><p>${slots.map((s) => s.available
+              ? `<button type="button" class="btn btn-ghost" data-slot="${esc(s.time)}" style="margin:2px">${esc(s.time)}</button>`
+              : `<span class="tag tag-cancel" style="margin:2px">${esc(s.time)} · ${esc(s.token || "")} — TAKEN</span>`).join(" ")}</p><p class="muted">Slot par click karo to time bhar jayega.</p>`
+          : `<p class="muted">No free slots on ${esc(res.date)}.</p>`;
+      }
+    } else {
+      html += `<p class="muted">Availability not set for this doctor yet — pick any time below.</p>`;
+    }
+    html += bookSlots.length
       ? `<p><b>Booked on ${esc(res.date)}:</b></p>
         <p>${bookSlots.map((b) => {
           const taken = !["Cancelled", "No Show"].includes(b.status);
           return `<span class="tag ${taken ? "tag-cancel" : "tag-done"}">${esc(b.time)} · ${esc(b.token)} · ${esc(b.patient_name)}</span> <span class="tag ${statusTagClass(b.status)}">${esc(b.status)}</span>${taken ? " — TAKEN" : " — free again"}`;
         }).join("<br>")}</p>`
-      : `<p class="muted">Nothing booked on ${esc(res.date)} yet — all times free.</p>`;
+      : `<p class="muted">Nothing booked on ${esc(res.date)} yet.</p>`;
+    slotsBox.innerHTML = html;
+    slotsBox.querySelectorAll("[data-slot]").forEach((btn) => {
+      btn.onclick = () => {
+        document.getElementById("bk-time").value = btn.dataset.slot;
+      };
+    });
   }
 
   function refreshDoctors() {
