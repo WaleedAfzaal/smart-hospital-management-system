@@ -49,6 +49,10 @@ const OP_PERMS = {
      just hide those buttons for other roles. */
   "availability": ["Admin", "Doctor", "Receptionist"],
   "holidays": ["Admin", "Doctor", "Receptionist"],
+  /* Step 12 (Notifications + Reports & Analytics): every role may
+     open them — a Doctor linked to one doctor only sees their own
+     queue's notifications and figures. The server enforces it. */
+  "notifications": ["Admin", "Doctor", "Receptionist"],
 };
 
 function canUse(op) {
@@ -242,11 +246,12 @@ const OPS = {
   "users": ["Users", "Manage user accounts (Admin)"],
   "change-password": ["Change Password", "Change your own password"],
   "billing": ["Billing", "Bills from appointments + extra charges"],
-  "reports": ["Reports", "Daily summary — patients, money, beds"],
+  "reports": ["Reports & Analytics", "Daily, weekly, monthly — appointments, doctors, departments, revenue"],
   "schedule": ["Schedule", "Appointments by date — today or any day"],
   "all-appointments": ["All Appointments", "Search, filter, sort and export every appointment"],
   "availability": ["Doctor Availability", "Working days, hours, breaks, slots and leave per doctor"],
   "holidays": ["Holidays", "Hospital holidays — no appointments on these days"],
+  "notifications": ["Notifications", "Booking, cancellation, reschedule, reminder and schedule-change alerts"],
 };
 
 /* ---------------- Step 7: views + sidebar navigation ---------------- */
@@ -276,6 +281,7 @@ const OP_NAV = {
   "reports": "reports", "departments": "departments",
   "settings": "settings", "change-password": "settings",
   "users": "settings", "dashboard": "dashboard",
+  "notifications": "notifications",
 };
 function setActiveNav(key) {
   document.querySelectorAll("#side-nav .nav-item, #side-nav .nav-sub").forEach((el) => {
@@ -319,6 +325,7 @@ function openOp(op) {
     "calendar": renderCalendar,
     "availability": renderAvailability,
     "holidays": renderHolidays,
+    "notifications": renderNotifications,
   })[op]();
 }
 
@@ -333,6 +340,7 @@ function showView(view) {
    never a dead link that pretends to work. */
 const NAV = [
   { key: "dashboard", label: "Dashboard", icon: "home", view: "dashboard" },
+  { key: "notifications", label: "Notifications", icon: "bell", op: "notifications" },
   { key: "patients", label: "Patient Management", icon: "users", children: [
     { op: "view-sorted", label: "All Patients" },
     { op: "add-patient", label: "Add Patient" },
@@ -382,6 +390,7 @@ const ICONS = {
   record: '<path d="M6 2h9l5 5v15H6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 11v5M9.5 13.5h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-8M22 20H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
   gear: '<circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  bell: '<path d="M18 9a6 6 0 1 0-12 0c0 6-2.5 7-2.5 7h17S18 15 18 9M10 20a2.2 2.2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
 };
 function navIcon(name) {
   return `<svg viewBox="0 0 24 24" class="nav-ic" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -1863,35 +1872,136 @@ function runSearch(q) {
   });
 }
 
-function renderBell() {
+/* Step 12: the bell shows the REAL notifications — the badge is the
+   unread count for the logged-in user, and the panel lists the
+   newest first. Clicking one marks it read and opens its
+   appointment's details page (when it has one). */
+async function refreshBell() {
   const badge = document.getElementById("bell-badge");
   if (!badge) return;
-  const n = dashData ? dashData.notification_count : 0;
+  const res = await api("/api/notifications?limit=1");
+  const n = res && res.ok ? res.unread_count
+    : (dashData ? dashData.notification_count : 0);
   badge.textContent = n;
   badge.classList.toggle("hidden", !n);
 }
 
-function toggleBellPanel() {
+function renderBell() {
+  refreshBell();
+}
+
+const NOTIF_TYPE_LABELS = {
+  booking: "Booking", cancellation: "Cancellation",
+  reschedule: "Reschedule", status: "Status",
+  reminder: "Reminder", schedule: "Schedule change",
+};
+
+function notifRowHtml(n) {
+  const label = NOTIF_TYPE_LABELS[n.type] || n.type;
+  return `<button type="button" class="notif-row${n.is_read ? "" : " notif-unread"}" data-notif-id="${n.id}" data-notif-apt="${esc(n.apt_id || "")}">
+    <b>${esc(n.title)}</b> <span class="tag tag-nor">${esc(label)}</span>
+    <span class="muted">${esc(n.message)}</span>
+    <span class="muted">${esc(n.created_at || "")}</span></button>`;
+}
+
+async function openNotifRow(row) {
+  const id = row.dataset.notifId;
+  const apt = row.dataset.notifApt;
+  await api(`/api/notifications/${id}/read`, "POST", {});
+  document.getElementById("bell-panel").classList.add("hidden");
+  refreshBell();
+  if (apt) renderAppointmentDetail(apt);
+}
+
+async function fillBellPanel() {
+  const panel = document.getElementById("bell-panel");
+  const res = await api("/api/notifications?limit=15");
+  if (!res || !res.ok) {
+    panel.innerHTML = `<div class="pop-head">Notifications</div><p class="muted" style="padding:4px 14px 14px">${esc(errOf(res))}</p>`;
+    return;
+  }
+  const rows = res.notifications || [];
+  panel.innerHTML = `
+    <div class="pop-head">Notifications (${res.unread_count} unread)</div>
+    ${rows.length ? rows.map(notifRowHtml).join("") : `<p class="muted" style="padding:4px 14px 14px">All caught up — no notifications yet.</p>`}
+    <div class="pop-foot">
+      <button type="button" class="btn btn-ghost" id="bell-view-all">View all</button>
+      <button type="button" class="btn btn-ghost" id="bell-read-all">Mark all read</button>
+    </div>`;
+  panel.querySelectorAll("[data-notif-id]").forEach((row) => row.addEventListener("click", () => openNotifRow(row)));
+  document.getElementById("bell-view-all").addEventListener("click", () => {
+    panel.classList.add("hidden");
+    openOp("notifications");
+  });
+  document.getElementById("bell-read-all").addEventListener("click", async () => {
+    await api("/api/notifications/read-all", "POST", {});
+    refreshBell();
+    fillBellPanel();
+  });
+}
+
+async function toggleBellPanel() {
   const panel = document.getElementById("bell-panel");
   const wasHidden = panel.classList.contains("hidden");
   document.getElementById("profile-menu").classList.add("hidden");
   if (!wasHidden) { panel.classList.add("hidden"); return; }
-  const items = dashData ? dashData.pending_items : { appointments: [], bills: [] };
-  const n = dashData ? dashData.notification_count : 0;
-  panel.innerHTML = n === 0
-    ? `<div class="pop-head">Notifications</div><p class="muted" style="padding:4px 14px 14px">All caught up — no pending appointments or unpaid bills.</p>`
-    : `<div class="pop-head">Notifications (${n})</div>
-      ${items.appointments.map((a) => `<button type="button" class="pop-row" data-bell-appt="${esc(a.appt_date || "")}" data-bell-doc="${esc(a.doctor_id)}"><b>${esc(a.token)}</b> ${esc(a.patient_name)}<span class="muted">${esc(a.doctor_name)}${a.appt_date ? " • " + esc(a.appt_date) + (a.appt_time ? " " + esc(a.appt_time) : "") : ""}</span></button>`).join("")}
-      ${items.bills.map((b) => `<button type="button" class="pop-row" data-bell-bill="${b.id}"><b>Bill #${b.id}</b> ${esc(b.patient_name)}<span class="muted">Rs ${b.total} unpaid</span></button>`).join("")}`;
+  panel.innerHTML = `<div class="pop-head">Notifications</div><p class="muted" style="padding:4px 14px 14px">Loading…</p>`;
   panel.classList.remove("hidden");
-  panel.querySelectorAll("[data-bell-appt]").forEach((row) => row.addEventListener("click", () => {
-    panel.classList.add("hidden");
-    openOp("schedule");
-    if (row.dataset.bellAppt) renderSchedule(row.dataset.bellAppt, row.dataset.bellDoc || null);
-  }));
-  panel.querySelectorAll("[data-bell-bill]").forEach((row) => row.addEventListener("click", () => {
-    panel.classList.add("hidden");
-    openOp("billing");
+  fillBellPanel();
+}
+
+/* Step 12: the Notifications view — filter by type, All / Unread,
+   click one to mark it read (and open its appointment, when it has
+   one), mark all read. */
+async function renderNotifications(ntype, unreadOnly) {
+  const type = ntype || "all";
+  const unread = !!unreadOnly;
+  const params = new URLSearchParams({ limit: 100 });
+  if (type !== "all") params.set("type", type);
+  if (unread) params.set("unread_only", "1");
+  const res = await api(`/api/notifications?${params.toString()}`);
+  if (!res || !res.ok) {
+    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+    return;
+  }
+  const rows = res.notifications || [];
+  body.innerHTML = `
+    <div class="field" style="margin-bottom:12px"><label>Filter</label>
+      <div class="field-row">
+        <select id="notif-type" style="flex:1">
+          <option value="all" ${type === "all" ? "selected" : ""}>All types</option>
+          ${["booking", "cancellation", "reschedule", "status", "reminder", "schedule"].map((t) => `<option value="${t}" ${type === t ? "selected" : ""}>${NOTIF_TYPE_LABELS[t]}</option>`).join("")}
+        </select>
+        <select id="notif-unread" style="flex:1">
+          <option value="0" ${!unread ? "selected" : ""}>All</option>
+          <option value="1" ${unread ? "selected" : ""}>Unread only</option>
+        </select>
+        <button type="button" id="notif-read-all" class="btn btn-ghost">Mark all read</button>
+      </div>
+    </div>
+    <h3 style="margin:6px 0 8px">Notifications (${res.unread_count} unread)</h3>
+    ${rows.length ? `<ul class="activity-list">
+      ${rows.map((n) => `<li>${notifRowHtml(n)}</li>`).join("")}
+    </ul>` : `<p class="muted">No notifications match this filter.</p>`}
+    <p class="muted">Click a notification to mark it read — one with an appointment opens its details page.</p>`;
+  document.getElementById("notif-type").addEventListener("change", (e) => {
+    renderNotifications(e.target.value, document.getElementById("notif-unread").value === "1");
+  });
+  document.getElementById("notif-unread").addEventListener("change", (e) => {
+    renderNotifications(document.getElementById("notif-type").value, e.target.value === "1");
+  });
+  document.getElementById("notif-read-all").addEventListener("click", async () => {
+    await api("/api/notifications/read-all", "POST", {});
+    refreshBell();
+    renderNotifications(type, unread);
+  });
+  body.querySelectorAll("[data-notif-id]").forEach((row) => row.addEventListener("click", async () => {
+    const id = row.dataset.notifId;
+    const apt = row.dataset.notifApt;
+    await api(`/api/notifications/${id}/read`, "POST", {});
+    refreshBell();
+    if (apt) renderAppointmentDetail(apt);
+    else renderNotifications(type, unread);
   }));
 }
 
@@ -2113,43 +2223,112 @@ async function renderBilling(msg = "", ok = true) {
 
 /* ------------------------------------------------------------------ reports */
 
-async function renderReports(date) {
-  const day = date || new Date().toISOString().slice(0, 10);
-  const res = await api(`/api/reports?date=${encodeURIComponent(day)}`);
-  if (!res.ok) {
-    body.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
-    return;
-  }
-  const r = res.report;
+/* Step 12: Reports & Analytics — daily / weekly / monthly figures
+   from the server, with doctor + department filters, charts and
+   CSV/PDF export of the current report. (The old Step 3 daily
+   summary still lives on GET /api/reports and in the CLI.) */
+function barChartSVG(perDay) {
+  const rowH = 24, PT = 8, labelW = 90, maxW = 420;
+  const H = PT + perDay.length * rowH + 8;
+  const maxV = Math.max(1, ...perDay.map((d) => d.count));
+  const rows = perDay.map((d, i) => {
+    const y = PT + i * rowH;
+    const w = (d.count / maxV) * maxW;
+    return `<text x="0" y="${y + 15}" font-size="11" fill="#64748b">${esc(d.date.slice(5))}</text>
+      <rect x="${labelW}" y="${y + 4}" width="${w}" height="14" rx="3" fill="#1769AA"/>
+      <text x="${labelW + w + 8}" y="${y + 15}" font-size="11" fill="#172033">${d.count}</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${labelW + maxW + 40} ${H}" class="chart-svg" role="img" aria-label="Appointments per day bar chart">${rows}</svg>`;
+}
+
+async function renderReports() {
+  const docs = state ? state.doctors : [];
+  const depts = [...new Set(docs.map((d) => d.spec).filter(Boolean))];
+  const now = new Date();
+  const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   body.innerHTML = `
-    <div class="field" style="margin-bottom:12px"><label>Date</label>
+    <div class="field" style="margin-bottom:12px"><label>Report</label>
       <div class="field-row">
-        <input type="date" id="rep-date" value="${esc(r.date)}" style="flex:1">
+        <select id="rep-period" style="flex:1">
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+        </select>
+        <input type="date" id="rep-date" value="${todayLocal}" style="flex:1">
+        <select id="rep-doctor" style="flex:1">
+          <option value="">All doctors</option>
+          ${docs.map((d) => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join("")}
+        </select>
+        <select id="rep-dept" style="flex:1">
+          <option value="">All departments</option>
+          ${depts.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join("")}
+        </select>
         <button type="button" id="rep-load" class="btn btn-primary">Load Report</button>
       </div>
     </div>
-    <h3 style="margin:6px 0 8px">Daily Report — ${esc(r.date)}</h3>
+    <div id="rep-body"><p class="muted">Loading report…</p></div>`;
+  const load = async () => {
+    const period = document.getElementById("rep-period").value;
+    const date = document.getElementById("rep-date").value;
+    const doctorId = document.getElementById("rep-doctor").value;
+    const dept = document.getElementById("rep-dept").value;
+    const params = new URLSearchParams({ period });
+    if (date) params.set("date", date);
+    if (doctorId) params.set("doctor_id", doctorId);
+    if (dept) params.set("department", dept);
+    const res = await api(`/api/reports/analytics?${params.toString()}`);
+    const box = document.getElementById("rep-body");
+    if (!box) return;
+    if (!res || !res.ok) {
+      box.innerHTML = `<div class="msg msg-err">${esc(errOf(res))}</div>`;
+      return;
+    }
+    const r = res.report;
+    const qs = params.toString();
+    box.innerHTML = `
+    <h3 style="margin:6px 0 8px">Appointments Report — ${esc(r.period[0].toUpperCase() + r.period.slice(1))} ${esc(r.from)} to ${esc(r.to)}</h3>
     <div class="stats" style="grid-template-columns: repeat(2, 1fr); margin-bottom: 14px">
-      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Patients Today</span><span class="stat-num">${r.patients_today}</span></div></div>
-      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Appointments Today</span><span class="stat-num">${r.appointments_today}</span></div></div>
-      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Billed Today</span><span class="stat-num">Rs ${r.billed_today}</span></div></div>
-      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Collected Today</span><span class="stat-num">Rs ${r.collected_today}</span></div></div>
-      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Unpaid (All Time)</span><span class="stat-num">Rs ${r.unpaid_total}</span></div></div>
-      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Beds Occupied</span><span class="stat-num">${r.beds_occupied}/${r.beds_total}</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Total Appointments</span><span class="stat-num">${r.total}</span></div></div>
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Completed</span><span class="stat-num">${r.completed} (${r.completion_rate}%)</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Cancelled</span><span class="stat-num">${r.cancelled} (${r.cancellation_rate}%)</span></div></div>
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">No Show</span><span class="stat-num">${r.no_show} (${r.no_show_rate}%)</span></div></div>
+      <div class="stat-card stat-blue"><div class="stat-text"><span class="stat-label">Revenue (Paid Bills)</span><span class="stat-num">Rs ${r.revenue}</span></div></div>
+      <div class="stat-card stat-teal"><div class="stat-text"><span class="stat-label">Unpaid in Period</span><span class="stat-num">Rs ${r.unpaid_total}</span></div></div>
     </div>
-    <p class="muted">${r.bills_today} bill(s) on this date — ${r.paid_today} paid, ${r.unpaid_today} unpaid. ${r.unpaid_count} unpaid bill(s) overall.</p>
-    <h3 style="margin:14px 0 8px">Appointments per Doctor</h3>
-    <table class="tbl"><thead><tr>
-        <th>Doctor</th><th>That Day</th><th>Waiting Now</th>
-      </tr></thead><tbody>
-      ${r.per_doctor.map((d) => `<tr><td>${esc(d.name)} (${esc(d.doctor_id)})</td>
-        <td>${d.appointments_today}</td><td>${d.waiting}</td></tr>`).join("")}
-    </tbody></table>`;
-  document.getElementById("rep-load").addEventListener("click", () => {
-    const picked = document.getElementById("rep-date").value;
-    if (!picked) { toast("Pick a date first.", true); return; }
-    renderReports(picked);
-  });
+    <div class="btn-row" style="margin-bottom:14px">
+      <a class="btn btn-ghost" href="/api/reports/analytics.csv?${qs}" style="text-decoration:none">Export CSV ↓</a>
+      <a class="btn btn-ghost" href="/api/reports/analytics.pdf?${qs}" style="text-decoration:none">Export PDF ↓</a>
+    </div>
+    <h3 style="margin:14px 0 8px">By Status</h3>
+    <table class="tbl"><thead><tr><th>Status</th><th>Count</th></tr></thead><tbody>
+      ${["Pending", "Confirmed", "Checked In", "In Progress", "Completed", "Cancelled", "No Show"].map((s) => `<tr><td><span class="tag ${statusTagClass(s)}">${esc(s)}</span></td><td>${r.by_status[s]}</td></tr>`).join("")}
+    </tbody></table>
+    <h3 style="margin:14px 0 8px">Appointments per Day</h3>
+    ${r.per_day.length ? barChartSVG(r.per_day) : `<p class="muted">No days in this period.</p>`}
+    <h3 style="margin:14px 0 8px">Department Statistics</h3>
+    ${r.per_department.length ? `<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+      ${donutSVG(r.per_department.map((d) => ({ name: d.name, count: d.appointments, percent: r.total ? Math.round(100 * d.appointments / r.total) : 0 })))}
+      <ul class="dept-list">${r.per_department.map((d, i) => `<li><span class="dot" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>${esc(d.name)}<b>${d.appointments}</b></li>`).join("")}</ul>
+    </div>` : `<p class="muted">No appointments in this period.</p>`}
+    <h3 style="margin:14px 0 8px">Per Doctor</h3>
+    <table class="tbl"><thead><tr><th>Doctor</th><th>Department</th><th>Appointments</th><th>Completed</th><th>Cancelled</th><th>No Show</th></tr></thead><tbody>
+      ${r.per_doctor.map((d) => `<tr><td>${esc(d.name)} (${esc(d.doctor_id)})</td><td>${esc(d.department)}</td><td>${d.appointments}</td><td>${d.completed}</td><td>${d.cancelled}</td><td>${d.no_show}</td></tr>`).join("")}
+    </tbody></table>
+    <h3 style="margin:14px 0 8px">Per Department</h3>
+    <table class="tbl"><thead><tr><th>Department</th><th>Appointments</th><th>Completed</th><th>Cancelled</th><th>No Show</th></tr></thead><tbody>
+      ${r.per_department.map((d) => `<tr><td>${esc(d.name)}</td><td>${d.appointments}</td><td>${d.completed}</td><td>${d.cancelled}</td><td>${d.no_show}</td></tr>`).join("")}
+    </tbody></table>
+    <h3 style="margin:14px 0 8px">Cancelled Appointments (${r.cancelled_list.length})</h3>
+    ${r.cancelled_list.length ? `<table class="tbl"><thead><tr><th>Appt ID</th><th>Patient</th><th>Doctor</th><th>Date</th><th>Time</th></tr></thead><tbody>
+      ${r.cancelled_list.map((a) => `<tr><td>${esc(a.apt_id || "—")}</td><td>${esc(a.patient_name)}</td><td>${esc(a.doctor_name)}</td><td>${esc(a.appt_date || "—")}</td><td>${esc(a.appt_time || "—")}</td></tr>`).join("")}
+    </tbody></table>` : `<p class="muted">None in this period.</p>`}
+    <h3 style="margin:14px 0 8px">No-Show Appointments (${r.no_show_list.length})</h3>
+    ${r.no_show_list.length ? `<table class="tbl"><thead><tr><th>Appt ID</th><th>Patient</th><th>Doctor</th><th>Date</th><th>Time</th></tr></thead><tbody>
+      ${r.no_show_list.map((a) => `<tr><td>${esc(a.apt_id || "—")}</td><td>${esc(a.patient_name)}</td><td>${esc(a.doctor_name)}</td><td>${esc(a.appt_date || "—")}</td><td>${esc(a.appt_time || "—")}</td></tr>`).join("")}
+    </tbody></table>` : `<p class="muted">None in this period.</p>`}`;
+  };
+  document.getElementById("rep-load").addEventListener("click", load);
+  load();
 }
 
 /* Step 4 (Schedule): appointments for one date, one doctor or all.

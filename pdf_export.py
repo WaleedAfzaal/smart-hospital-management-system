@@ -12,6 +12,11 @@ three characters that are special inside a PDF literal string —
 backslash, "(" and ")" — are escaped, so a patient's name or a reason
 can never break the file. Columns are truncated to fit their width;
 the full text lives in the CSV export instead.
+
+Step 12 (Reports & Analytics): ``report_pdf`` builds the analytics
+report the same way — portrait A4, summary + by-status / per-doctor /
+per-department tables, a per-day bar chart, and the cancelled /
+no-show lists — sharing the same PDF assembly (``_assemble_pdf``).
 """
 
 # Landscape A4 in points (842 x 595).
@@ -120,8 +125,16 @@ def appointments_pdf(rows, title, subtitle):
         current.append(_line("F1", _ROW_SIZE, _MARGIN, _TOP,
                              "No appointments match these filters."))
 
-    # ---- Assemble the PDF: catalog, pages, fonts, one page +
-    # content object per page, then the cross-reference table.
+    return _assemble_pdf(pages, _PAGE_W, _PAGE_H)
+
+
+def _assemble_pdf(pages, page_w, page_h):
+    """Pages (lists of content-stream fragments) -> a complete PDF.
+
+    Catalog, Pages, the two built-in Helvetica fonts, one page +
+    content object per page, then the cross-reference table. Shared
+    by appointments_pdf and report_pdf.
+    """
     objects = []
     # 1: Catalog, 2: Pages, 3: Helvetica, 4: Helvetica-Bold.
     objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
@@ -134,7 +147,7 @@ def appointments_pdf(rows, title, subtitle):
     for i, lines in enumerate(pages):
         content = "".join(lines).encode("latin-1")
         objects.append(
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {_PAGE_W} {_PAGE_H}]"
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w} {page_h}]"
             f" /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >>"
             f" /Contents {page_ids[i] + 1} 0 R >>".encode("latin-1"))
         objects.append(
@@ -154,3 +167,149 @@ def appointments_pdf(rows, title, subtitle):
     out += (f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
             f"startxref\n{xref_at}\n%%EOF\n").encode("latin-1")
     return bytes(out)
+
+
+# Report PDF (Step 12): portrait A4 in points (595 x 842).
+_R_PAGE_W, _R_PAGE_H = 595, 842
+_R_MARGIN = 40
+_R_TOP = 750          # y of the first content line
+_R_BOTTOM = 50        # footer sits below this
+
+
+def report_pdf(report):
+    """The Step 12 analytics report as PDF bytes (portrait A4).
+
+    Summary lines, by-status table, per-doctor and per-department
+    tables, a per-day bar chart, and the cancelled / no-show lists.
+    Same hand-built approach as appointments_pdf (stdlib only).
+    """
+    title = f"Appointments Report — {report['period'].title()}"
+    subtitle = (f"{report['from']} to {report['to']}"
+                + (f"  •  Doctor {report['doctor_id']}"
+                   if report.get("doctor_id") else "")
+                + (f"  •  {report['department']}"
+                   if report.get("department") else ""))
+    pages = []
+    page_no = 0
+
+    def _new_page():
+        nonlocal page_no
+        page_no += 1
+        lines = []
+        lines.append(_line("F1", _TITLE_SIZE, _R_MARGIN, _R_PAGE_H - 48, title))
+        lines.append(_line("F1", _HEAD_SIZE, _R_MARGIN, _R_PAGE_H - 66, subtitle))
+        lines.append(f"0.5 w {_R_MARGIN} {_R_PAGE_H - 74} m "
+                     f"{_R_PAGE_W - _R_MARGIN} {_R_PAGE_H - 74} l S\n")
+        lines.append(_line("F1", 8, _R_MARGIN, 30,
+                           f"City Care Hospital — Page {page_no}"))
+        lines.append(_line("F1", 8, _R_PAGE_W - _R_MARGIN - 110, 30,
+                           f"{report['total']} appointment(s)"))
+        pages.append(lines)
+        return lines
+
+    current = [_new_page()]
+    y = [_R_TOP]  # mutable box so the helpers below can move it
+
+    def _space(needed):
+        if y[0] - needed < _R_BOTTOM:
+            current[0] = _new_page()
+            y[0] = _R_TOP
+
+    def _heading(text):
+        _space(30)
+        current[0].append(_line("F2", 12, _R_MARGIN, y[0], text))
+        y[0] -= 20
+
+    def _text(text, size=10):
+        _space(16)
+        current[0].append(_line("F1", size, _R_MARGIN, y[0], text))
+        y[0] -= 15
+
+    def _table(columns, rows):
+        """columns: [(heading, x, max_chars)]; rows: [[values...]]."""
+        _space(30)
+        for heading, x, _m in columns:
+            current[0].append(_line("F2", 9, x, y[0], heading))
+        y[0] -= 6
+        current[0].append(f"0.5 w {_R_MARGIN} {y[0]} m "
+                           f"{_R_PAGE_W - _R_MARGIN} {y[0]} l S\n")
+        y[0] -= 12
+        for row in rows:
+            _space(16)
+            for (_h, x, max_chars), value in zip(columns, row):
+                current[0].append(
+                    _line("F1", 9, x, y[0], _fit(value, max_chars)))
+            y[0] -= 14
+
+    def _bars(per_day):
+        """Appointments per day as horizontal bars (label + count)."""
+        _space(30)
+        max_count = max([d["count"] for d in per_day] + [1])
+        bar_x = _R_MARGIN + 90
+        bar_max = 300
+        for d in per_day:
+            _space(18)
+            current[0].append(_line("F1", 9, _R_MARGIN, y[0], d["date"]))
+            width = bar_max * d["count"] / max_count
+            if width > 0:
+                current[0].append(
+                    f"0.09 0.41 0.67 rg {bar_x} {y[0] - 3} {width:.1f} 9 re f\n"
+                    "0 0 0 rg\n")
+            current[0].append(
+                _line("F1", 9, bar_x + bar_max + 8, y[0],
+                      str(d["count"])))
+            y[0] -= 16
+
+    _heading("Summary")
+    _text(f"Total appointments: {report['total']}")
+    _text(f"Completed: {report['completed']} "
+          f"({report['completion_rate']}%)")
+    _text(f"Cancelled: {report['cancelled']} "
+          f"({report['cancellation_rate']}%)")
+    _text(f"No Show: {report['no_show']} ({report['no_show_rate']}%)")
+    _text(f"Revenue (Paid bills): Rs {report['revenue']}")
+    _text(f"Unpaid in period: Rs {report['unpaid_total']}")
+    _heading("By status")
+    _table([("Status", _R_MARGIN, 20), ("Count", 300, 8)],
+           [[s, str(report["by_status"][s])] for s in
+            ("Pending", "Confirmed", "Checked In", "In Progress",
+             "Completed", "Cancelled", "No Show")])
+    _heading("Per doctor")
+    _table([("Doctor", _R_MARGIN, 28), ("Department", 210, 18),
+            ("Appts", 330, 6), ("Done", 385, 6), ("Canc.", 435, 6),
+            ("No Show", 485, 7)],
+           [[f"{d['name']} ({d['doctor_id']})", d["department"],
+             str(d["appointments"]), str(d["completed"]),
+             str(d["cancelled"]), str(d["no_show"])]
+            for d in report["per_doctor"]])
+    _heading("Per department")
+    _table([("Department", _R_MARGIN, 28), ("Appts", 300, 6),
+            ("Done", 360, 6), ("Canc.", 420, 6), ("No Show", 480, 7)],
+           [[d["name"], str(d["appointments"]), str(d["completed"]),
+             str(d["cancelled"]), str(d["no_show"])]
+            for d in report["per_department"]])
+    _heading("Appointments per day")
+    _bars(report["per_day"])
+    _heading("Cancelled appointments")
+    if report["cancelled_list"]:
+        _table([("Appt ID", _R_MARGIN, 11), ("Patient", 120, 22),
+                ("Doctor", 280, 20), ("Date", 420, 10),
+                ("Time", 490, 5)],
+               [[a.get("apt_id") or "", a["patient_name"],
+                 a["doctor_name"], a["appt_date"] or "",
+                 a["appt_time"] or ""]
+                for a in report["cancelled_list"]])
+    else:
+        _text("None in this period.")
+    _heading("No-show appointments")
+    if report["no_show_list"]:
+        _table([("Appt ID", _R_MARGIN, 11), ("Patient", 120, 22),
+                ("Doctor", 280, 20), ("Date", 420, 10),
+                ("Time", 490, 5)],
+               [[a.get("apt_id") or "", a["patient_name"],
+                 a["doctor_name"], a["appt_date"] or "",
+                 a["appt_time"] or ""]
+                for a in report["no_show_list"]])
+    else:
+        _text("None in this period.")
+    return _assemble_pdf(pages, _R_PAGE_W, _R_PAGE_H)

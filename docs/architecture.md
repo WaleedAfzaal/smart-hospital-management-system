@@ -597,6 +597,106 @@ doctor also joins the shift rotation.
   no-stray-patient and 403s; CLI menus incl. Doctor read-only).
   350 tests total passing.
 
+## Notifications & Reports — Step 12 (`notifications.py` + `hospital.py` + `pdf_export.py` + `server.py` + `web/`)
+
+- New module `notifications.py` (same pattern as `status_history.py` /
+  `billing.py` / `availability.py` — its own table in the same
+  `hospital.db`, in-memory fallback when there is no db path;
+  `Database.save()` never touches it). Table `notifications` (id,
+  type, title, message, apt_id nullable, doctor_id nullable,
+  created_at, is_read, dedupe_key UNIQUE-ish). Types:
+  `booking`, `cancellation`, `reschedule`, `status`, `reminder`,
+  `schedule`. Class `Notifications` with `add` (validates the type;
+  a `dedupe_key` returns the existing row instead of storing a
+  duplicate), `list` (newest first; `doctor_id=None` = all,
+  otherwise that doctor's rows plus hospital-wide `doctor_id IS
+  NULL` ones; `ntype`, `unread_only`, `limit`), `unread_count`,
+  `mark_read`, `mark_all_read`, `has_dedupe`, and
+  `generate_tomorrow_reminders(hospital, today=None)` — one reminder
+  per appointment scheduled for tomorrow still Pending/Confirmed
+  (dedupe key `reminder:{apt_id or doctor:token}`), so calling it on
+  every dashboard load still creates each reminder exactly once.
+- `Hospital` owns one `self.notifications` (created before
+  `self.db.load`). Hooks, all after the change is persisted:
+  `book_appointment` → "booking" (APT ID, token, patient, doctor,
+  date/time, type, status); `update_status` → "cancellation" when
+  the new status is Cancelled, else "status" (old → new + who
+  changed it; a same-status no-op notifies nobody);
+  `edit_appointment` → "reschedule" only when the date or time
+  actually changed (old → new slot); `set_doctor_availability` /
+  `clear_doctor_availability` (only when something was actually
+  cleared) / `add_doctor_leave` / `delete_doctor_leave` /
+  `add_holiday` / `delete_holiday` → "schedule" (doctor_id set for
+  doctor changes, `None` = hospital-wide for holidays).
+  `refresh_reminders(today=None)` calls the generator.
+  `list_notifications` / `unread_notifications_count` /
+  `mark_notification_read` / `mark_all_notifications_read` take
+  `(role, user_doctor_id)` and scope a Doctor to their own queue.
+- `appointment_report(period, date=None, doctor_id=None,
+  department=None)` — period daily (one date), weekly
+  (Monday–Sunday holding the date) or monthly (whole month); rows
+  come from `calendar_appointments(from, to, doctor_id,
+  department)`. Returns total, `by_status` (all 7), completed /
+  cancelled / no_show counts + rates (1 decimal, 0 when total is
+  0), `per_doctor` and `per_department` (name, appointments,
+  completed, cancelled, no_show), `revenue` (Paid bills dated in
+  range, scoped by doctor/department — a bill whose doctor was
+  deleted counts only in the unfiltered report), `unpaid_total`
+  (Unpaid bills in range), `per_day` (one {date, count} per day),
+  `cancelled_list` and `no_show_list`. `report_to_csv(report)`
+  writes the same figures as CSV (header + period, Summary, By
+  status, Per doctor, Per department, Appointments per day,
+  Cancelled, No-show).
+- `pdf_export.py`: the PDF assembly was extracted into a shared
+  `_assemble_pdf(pages, page_w, page_h)`; new `report_pdf(report)`
+  (portrait A4: title + subtitle with period/range/filters, Summary
+  / By status / Per doctor / Per department sections, Appointments
+  per day as horizontal bars, Cancelled + No-show lists).
+- API: `GET /api/notifications` (refreshes reminders first; `type`
+  validated against the six types → 400; `unread_only`,
+  `limit` clamped 1–1000; returns rows + `unread_count`),
+  `POST /api/notifications/<id>/read` (404 when missing or not
+  visible to that user), `POST /api/notifications/read-all`
+  (returns the count marked), `GET /api/reports/analytics`
+  (+ `.csv` / `.pdf` downloads — same parameters and Doctor
+  scoping). A Doctor user linked to one doctor is forced to their
+  own doctor in every analytics call, whatever they ask for. The
+  old `/api/dashboard` `notification_count` (pending appointments +
+  unpaid bills) is unchanged — the bell badge comes from
+  `/api/notifications` (`refreshBell()`), with that count only as a
+  fallback when the fetch fails.
+- Web: `refreshBell()` fetches the live unread count for the badge;
+  `toggleBellPanel()` / `fillBellPanel()` list the newest 15 real
+  notifications — click one marks it read and opens its
+  appointment's details page (when it has one), with "View all" and
+  "Mark all read" in the panel footer; `renderNotifications`
+  (sidebar) filters by type + All/Unread and marks on click.
+  `renderReports` is now the analytics view (period select
+  Daily/Weekly/Monthly, date input, doctor + department selects,
+  Load button; stat cards for Total / Completed / Cancelled /
+  No Show / Revenue / Unpaid; by-status table; per-day bar chart
+  `barChartSVG` and department donut reusing `donutSVG`; per-doctor
+  and per-department tables; cancelled + no-show lists; Export CSV
+  / PDF links). The old Step 3 daily summary still lives on
+  `GET /api/reports` and in the CLI. CLI menus: 25 Notifications
+  (latest 20, `*` = unread; mark one / mark all / back) and 16
+  Reports is now a chooser (1 = daily summary, 2 = analytics with
+  CSV/PDF export to a file).
+- Roles (`auth.py` PERMISSIONS): `view_notifications` {Admin,
+  Doctor, Receptionist} — the fine scoping lives in
+  `Hospital.list_notifications`. Reports: Admin full, Receptionist
+  all, Doctor only their own queue's figures (enforced in
+  `Hospital` + the API).
+- Tests: `tests/test_notifications_reports.py` (28 tests: booking /
+  cancel / reschedule / status notifications exactly once each,
+  reason-only edit creates none, tomorrow reminder once only,
+  schedule-change notifications, read / mark-all-read, Doctor
+  scoping, restart persistence with no duplicates, daily / weekly /
+  monthly figures for a known seeded dataset, doctor + department
+  filters, Doctor report scoping, CSV rows matching the figures,
+  PDF valid `%PDF-`…`%%EOF`, API auth + endpoints + exports +
+  Doctor scoping). 378 tests total passing.
+
 ## Server (`server.py`)
 
 - Python stdlib only: `ThreadingHTTPServer` + `SimpleHTTPRequestHandler`.

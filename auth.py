@@ -88,6 +88,10 @@ PERMISSIONS = {
     "manage_leave": {"Admin", "Doctor"},
     "manage_holidays": {"Admin"},
     "view_availability": {"Admin", "Doctor", "Receptionist"},
+    # Step 12 (Notifications): every role may read notifications —
+    # a Doctor only ever sees their own queue's plus hospital-wide
+    # ones (the fine rule lives in Hospital.list_notifications).
+    "view_notifications": {"Admin", "Doctor", "Receptionist"},
 }
 
 _USERS_SCHEMA = """

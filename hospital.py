@@ -85,6 +85,17 @@ enforce — any time is allowed, and the booking form says so plainly.
 a date (working hours minus breaks, in duration steps, booked ones
 marked). Admin manages patterns and holidays; a Doctor may add or
 delete only their OWN leave.
+
+Step 12 (Notifications + Reports & Analytics): every booking,
+cancellation, reschedule and status change writes an in-app
+notification (see notifications.py) — the dashboard bell shows the
+real unread ones, with tomorrow's appointments reminded about once
+each, and doctor schedule changes (availability, leave, holidays)
+notify too. ``appointment_report`` computes daily / weekly / monthly
+figures (totals, by status, rates, per-doctor and per-department
+breakdowns, revenue from Paid bills, per-day series, cancelled and
+no-show lists) and exports as CSV (``report_to_csv``) or PDF (see
+pdf_export.py).
 """
 
 import csv
@@ -100,6 +111,8 @@ from availability import (Availability, WEEKDAY_NAMES, minutes_to_time,
                           time_to_minutes, weekday_name)
 from billing import Billing
 from database import Database
+from notifications import Notifications
+from pdf_export import report_pdf
 from status_history import StatusHistory
 
 # Step 6: appointment statuses. "Pending" is the default for a new
@@ -510,6 +523,10 @@ class Hospital:
         # in-memory otherwise — see availability.py). Database.save()
         # never touches them.
         self.availability = Availability(db_path)
+        # Step 12: in-app notifications live in their own store
+        # (same file when a db is given, pure in-memory otherwise —
+        # see notifications.py). Database.save() never touches them.
+        self.notifications = Notifications(db_path)
         if self.db is not None:
             self.db.load(self)
 
@@ -886,6 +903,13 @@ class Hospital:
         self._persist()
         row = next((r for r in doc["queue"].heap if r[2] == token), None)
         when = _appt_when(row) if row is not None else ""
+        # Step 12: the booking writes a notification — the bell
+        # shows it, and it links back to this appointment.
+        self.notifications.add(
+            "booking", "Appointment booked",
+            f"{apt_id} ({token}): {pat['name']} with {doc['name']} on "
+            f"{when or appt_date} — {appt_type}, {status}.",
+            apt_id=apt_id, doctor_id=doc["id"])
         print(f"  Booked {apt_id} ({token}) for {pat['name']} with {doc['name']} | Fee: {doc['fee']}"
               f"{' | ' + when if when else ''} | {appt_type} | {status}")
         return token
@@ -999,7 +1023,22 @@ class Hospital:
         self.status_history.record(
             doc["id"], token, old_status, new_status, changed_by)
         self._persist()
-        return _public_appointment(doc, doc["queue"].heap[idx])
+        # Step 12: a status change writes a notification — a
+        # cancellation gets its own type so it stands out in the
+        # bell. (A no-op — same status — notifies nobody.)
+        appt = _public_appointment(doc, doc["queue"].heap[idx])
+        ntype = "cancellation" if new_status == "Cancelled" else "status"
+        when = _appt_when(doc["queue"].heap[idx])
+        self.notifications.add(
+            ntype,
+            "Appointment cancelled" if new_status == "Cancelled"
+            else "Status changed",
+            f"{appt['apt_id'] or token} ({token}): "
+            f"{appt['patient_name']} with {doc['name']}"
+            f"{' on ' + when if when else ''} — {old_status} → "
+            f"{new_status} (by {changed_by}).",
+            apt_id=appt["apt_id"], doctor_id=doc["id"])
+        return appt
 
     def appointments_for_date(self, date=None, doctor_id=None):
         """All appointments scheduled for ``date`` (today by default).
@@ -1174,9 +1213,19 @@ class Hospital:
         doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
         if not doc:
             raise ValueError("Doctor not found.")
-        return self.availability.set(
+        record = self.availability.set(
             doc["id"], working_days, start_time, end_time,
             duration_minutes, breaks)
+        # Step 12: a schedule change notifies Admin/Receptionist
+        # (and the doctor themself) — the bell shows it.
+        days = ", ".join(record["working_days"])
+        self.notifications.add(
+            "schedule", "Doctor schedule changed",
+            f"{doc['name']}'s working hours set: {days}, "
+            f"{record['start_time']}–{record['end_time']}, "
+            f"{record['duration_minutes']} min per patient.",
+            doctor_id=doc["id"])
+        return record
 
     def get_doctor_availability(self, doctor_id):
         """One doctor's working pattern, or None when not set yet."""
@@ -1195,7 +1244,15 @@ class Hospital:
         doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
         if not doc:
             raise ValueError("Doctor not found.")
-        return self.availability.clear(doc["id"])
+        cleared = self.availability.clear(doc["id"])
+        if cleared:
+            # Step 12: clearing is a schedule change too.
+            self.notifications.add(
+                "schedule", "Doctor schedule changed",
+                f"{doc['name']}'s working hours cleared — any time "
+                "is allowed again.",
+                doctor_id=doc["id"])
+        return cleared
 
     def add_doctor_leave(self, doctor_id, start_date, end_date, reason="",
                          role="Admin", user_doctor_id=None):
@@ -1214,8 +1271,16 @@ class Hospital:
         doc = self.doctors_map.get(str(doctor_id or "").strip().upper())
         if not doc:
             raise ValueError("Doctor not found.")
-        return self.availability.add_leave(
+        row = self.availability.add_leave(
             doc["id"], start_date, end_date, reason)
+        # Step 12: leave is a schedule change — notify.
+        self.notifications.add(
+            "schedule", "Doctor on leave",
+            f"{doc['name']} is on leave {row['start_date']} to "
+            f"{row['end_date']}"
+            + (f" ({row['reason']})" if row["reason"] else "") + ".",
+            doctor_id=doc["id"])
+        return row
 
     def list_doctor_leaves(self, doctor_id=None, role="Admin",
                            user_doctor_id=None):
@@ -1253,7 +1318,17 @@ class Hospital:
         elif role != "Admin":
             raise PermissionError(
                 "Only Admin can delete leave.")
-        return self.availability.delete_leave(leave_id)
+        deleted = self.availability.delete_leave(leave_id)
+        if deleted:
+            # Step 12: removing leave is a schedule change too.
+            doc = self.doctors_map.get(row["doctor_id"])
+            name = doc["name"] if doc else row["doctor_id"]
+            self.notifications.add(
+                "schedule", "Doctor leave removed",
+                f"Leave removed for {name} ({row['start_date']} to "
+                f"{row['end_date']}).",
+                doctor_id=row["doctor_id"])
+        return deleted
 
     def add_holiday(self, date, name, role="Admin"):
         """Add a hospital holiday (Admin only). Returns the saved row
@@ -1261,7 +1336,15 @@ class Hospital:
         empty name, or a date that is already a holiday)."""
         if role != "Admin":
             raise PermissionError("Only Admin can add holidays.")
-        return self.availability.add_holiday(date, name)
+        row = self.availability.add_holiday(date, name)
+        # Step 12: a holiday closes the whole hospital — notify
+        # everyone (hospital-wide: no doctor_id).
+        self.notifications.add(
+            "schedule", "Hospital holiday added",
+            f"Hospital holiday: {row['name']} ({row['date']}) — no "
+            "appointments that day.",
+            doctor_id=None)
+        return row
 
     def list_holidays(self):
         """Every hospital holiday, earliest first."""
@@ -1276,9 +1359,276 @@ class Hospital:
             holiday_id = int(holiday_id)
         except (TypeError, ValueError):
             raise ValueError("Holiday ID must be a number.")
-        if not self.availability.delete_holiday(holiday_id):
+        row = next((h for h in self.availability.holidays()
+                    if h["id"] == holiday_id), None)
+        if row is None:
             raise ValueError("Holiday not found.")
+        self.availability.delete_holiday(holiday_id)
+        # Step 12: removing a holiday is a schedule change too.
+        self.notifications.add(
+            "schedule", "Hospital holiday removed",
+            f"Hospital holiday removed: {row['name']} ({row['date']}).",
+            doctor_id=None)
         return True
+
+    # ------------------------------------------------ Step 12: notifications
+    def refresh_reminders(self, today=None):
+        """Create tomorrow's appointment reminders (once each).
+
+        Called by the server before the bell / notifications list is
+        read, and by the CLI notifications menu — so a reminder is
+        never missed and never duplicated.
+        """
+        return self.notifications.generate_tomorrow_reminders(self, today)
+
+    def list_notifications(self, role="Admin", user_doctor_id=None,
+                           ntype=None, unread_only=False, limit=100):
+        """Notifications this user may see, newest first.
+
+        A Doctor linked to one doctor sees only their own queue's
+        notifications plus hospital-wide ones; Admin and
+        Receptionist see everything.
+        """
+        doctor_id = user_doctor_id if role == "Doctor" else None
+        return self.notifications.list(
+            doctor_id=doctor_id, ntype=ntype,
+            unread_only=unread_only, limit=limit)
+
+    def unread_notifications_count(self, role="Admin",
+                                   user_doctor_id=None):
+        """How many unread notifications this user has — the bell badge."""
+        doctor_id = user_doctor_id if role == "Doctor" else None
+        return self.notifications.unread_count(doctor_id=doctor_id)
+
+    def mark_notification_read(self, notification_id, role="Admin",
+                               user_doctor_id=None):
+        """Mark one notification read. False when it does not exist
+        or is not visible to this user."""
+        doctor_id = user_doctor_id if role == "Doctor" else None
+        return self.notifications.mark_read(notification_id,
+                                            doctor_id=doctor_id)
+
+    def mark_all_notifications_read(self, role="Admin",
+                                    user_doctor_id=None):
+        """Mark every visible notification read. Returns how many
+        were marked."""
+        doctor_id = user_doctor_id if role == "Doctor" else None
+        return self.notifications.mark_all_read(doctor_id=doctor_id)
+
+    # ------------------------------------------------ Step 12: reports & analytics
+    def appointment_report(self, period="daily", date=None,
+                           doctor_id=None, department=None):
+        """Appointments + money for a day, a week or a month.
+
+        ``period`` is daily (one date), weekly (the Monday–Sunday
+        week holding ``date``) or monthly (the whole month of
+        ``date``); ``date`` defaults to today. ``doctor_id`` /
+        ``department`` narrow the report to one doctor or
+        department. A Doctor user passes their own doctor_id (the
+        server enforces it) — they only ever see their own queue's
+        figures.
+
+        Counts come from the appointments SCHEDULED in the period
+        (undated rows booked before Step 4 never sit in a dated
+        view). Money comes from bills DATED in the period: revenue
+        is Paid bills only, unpaid_total is what is still owed.
+        Rates are 0 when there are no appointments.
+        """
+        if period not in ("daily", "weekly", "monthly"):
+            raise ValueError(
+                "Period must be daily, weekly or monthly.")
+        if date in (None, ""):
+            ref = datetime.date.today()
+        else:
+            try:
+                ref = datetime.date.fromisoformat(str(date).strip())
+            except ValueError:
+                raise ValueError(
+                    "Date must look like YYYY-MM-DD (e.g. 2026-11-28).")
+        if period == "daily":
+            start, end = ref, ref
+        elif period == "weekly":
+            start = ref - datetime.timedelta(days=ref.weekday())
+            end = start + datetime.timedelta(days=6)
+        else:
+            start = ref.replace(day=1)
+            if ref.month == 12:
+                end = datetime.date(ref.year + 1, 1, 1) \
+                    - datetime.timedelta(days=1)
+            else:
+                end = datetime.date(ref.year, ref.month + 1, 1) \
+                    - datetime.timedelta(days=1)
+        if doctor_id:
+            doctor_id = str(doctor_id).strip().upper()
+            if doctor_id not in self.doctors_map:
+                raise ValueError("Doctor not found.")
+        if department:
+            department = str(department).strip()
+        rows = self.calendar_appointments(
+            start.isoformat(), end.isoformat(),
+            doctor_id=doctor_id, department=department)
+        by_status = {s: 0 for s in APPOINTMENT_STATUSES}
+        for a in rows:
+            by_status[a["status"]] = by_status.get(a["status"], 0) + 1
+        total = len(rows)
+        completed = by_status["Completed"]
+        cancelled = by_status["Cancelled"]
+        no_show = by_status["No Show"]
+
+        def _rate(n):
+            return round(100 * n / total, 1) if total else 0
+
+        # Per-doctor and per-department breakdowns (only doctors /
+        # departments inside the filters).
+        per_doctor = []
+        for doc in sorted(self.doctors_map.values(),
+                          key=lambda d: d["name"]):
+            if doctor_id and doc["id"] != doctor_id:
+                continue
+            if department and doc["spec"] != department:
+                continue
+            mine = [a for a in rows if a["doctor_id"] == doc["id"]]
+            per_doctor.append({
+                "doctor_id": doc["id"], "name": doc["name"],
+                "department": doc["spec"],
+                "appointments": len(mine),
+                "completed": sum(1 for a in mine
+                                 if a["status"] == "Completed"),
+                "cancelled": sum(1 for a in mine
+                                 if a["status"] == "Cancelled"),
+                "no_show": sum(1 for a in mine
+                               if a["status"] == "No Show"),
+            })
+        dept_names = sorted({d["department"] for d in per_doctor})
+        per_department = []
+        for name in dept_names:
+            mine = [a for a in rows if a["department"] == name]
+            per_department.append({
+                "name": name, "appointments": len(mine),
+                "completed": sum(1 for a in mine
+                                 if a["status"] == "Completed"),
+                "cancelled": sum(1 for a in mine
+                                 if a["status"] == "Cancelled"),
+                "no_show": sum(1 for a in mine
+                               if a["status"] == "No Show"),
+            })
+        # Money: bills dated inside the period, narrowed to the same
+        # doctor / department. A bill's doctor may have been deleted
+        # since — those bills count only in the unfiltered report.
+        revenue = 0
+        unpaid_total = 0
+        for bill in self.billing.list_bills():
+            if not (start.isoformat() <= bill["date"] <= end.isoformat()):
+                continue
+            bdoc = self.doctors_map.get(bill["doctor_id"])
+            if doctor_id and bill["doctor_id"] != doctor_id:
+                continue
+            if department and (bdoc is None
+                               or bdoc["spec"] != department):
+                continue
+            if bill["status"] == "Paid":
+                revenue += bill["total"]
+            else:
+                unpaid_total += bill["total"]
+        # Appointments per day in the range (the bar chart).
+        per_day = []
+        day = start
+        while day <= end:
+            per_day.append({
+                "date": day.isoformat(),
+                "count": sum(1 for a in rows
+                             if a["appt_date"] == day.isoformat()),
+            })
+            day += datetime.timedelta(days=1)
+        return {
+            "period": period, "date": ref.isoformat(),
+            "from": start.isoformat(), "to": end.isoformat(),
+            "doctor_id": doctor_id, "department": department,
+            "total": total, "by_status": by_status,
+            "completed": completed, "cancelled": cancelled,
+            "no_show": no_show,
+            "completion_rate": _rate(completed),
+            "cancellation_rate": _rate(cancelled),
+            "no_show_rate": _rate(no_show),
+            "per_doctor": per_doctor,
+            "per_department": per_department,
+            "revenue": revenue, "unpaid_total": unpaid_total,
+            "per_day": per_day,
+            "cancelled_list": [a for a in rows
+                               if a["status"] == "Cancelled"],
+            "no_show_list": [a for a in rows
+                             if a["status"] == "No Show"],
+        }
+
+    def report_to_csv(self, report):
+        """The report as a CSV string — sections with plain rows.
+
+        Opens in Excel: summary, by-status, per-doctor,
+        per-department, per-day, then the cancelled and no-show
+        appointments.
+        """
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["City Care Hospital — Appointments Report"])
+        writer.writerow(["Period", report["period"].title(),
+                         "From", report["from"], "To", report["to"]])
+        if report.get("doctor_id"):
+            writer.writerow(["Doctor", report["doctor_id"]])
+        if report.get("department"):
+            writer.writerow(["Department", report["department"]])
+        writer.writerow([])
+        writer.writerow(["Summary"])
+        writer.writerow(["Total appointments", report["total"]])
+        writer.writerow(["Completed", report["completed"],
+                         f"{report['completion_rate']}%"])
+        writer.writerow(["Cancelled", report["cancelled"],
+                         f"{report['cancellation_rate']}%"])
+        writer.writerow(["No Show", report["no_show"],
+                         f"{report['no_show_rate']}%"])
+        writer.writerow(["Revenue (Paid bills, Rs)", report["revenue"]])
+        writer.writerow(["Unpaid in period (Rs)", report["unpaid_total"]])
+        writer.writerow([])
+        writer.writerow(["By status"])
+        writer.writerow(["Status", "Count"])
+        for status in APPOINTMENT_STATUSES:
+            writer.writerow([status, report["by_status"][status]])
+        writer.writerow([])
+        writer.writerow(["Per doctor"])
+        writer.writerow(["Doctor", "Department", "Appointments",
+                         "Completed", "Cancelled", "No Show"])
+        for d in report["per_doctor"]:
+            writer.writerow([f"{d['name']} ({d['doctor_id']})",
+                             d["department"], d["appointments"],
+                             d["completed"], d["cancelled"], d["no_show"]])
+        writer.writerow([])
+        writer.writerow(["Per department"])
+        writer.writerow(["Department", "Appointments", "Completed",
+                         "Cancelled", "No Show"])
+        for d in report["per_department"]:
+            writer.writerow([d["name"], d["appointments"],
+                             d["completed"], d["cancelled"], d["no_show"]])
+        writer.writerow([])
+        writer.writerow(["Appointments per day"])
+        writer.writerow(["Date", "Count"])
+        for d in report["per_day"]:
+            writer.writerow([d["date"], d["count"]])
+        writer.writerow([])
+        writer.writerow(["Cancelled appointments"])
+        writer.writerow(["Appointment ID", "Patient", "Doctor", "Date",
+                         "Time", "Type"])
+        for a in report["cancelled_list"]:
+            writer.writerow([a.get("apt_id") or "", a["patient_name"],
+                             a["doctor_name"], a["appt_date"] or "",
+                             a["appt_time"] or "", a["appt_type"]])
+        writer.writerow([])
+        writer.writerow(["No-show appointments"])
+        writer.writerow(["Appointment ID", "Patient", "Doctor", "Date",
+                         "Time", "Type"])
+        for a in report["no_show_list"]:
+            writer.writerow([a.get("apt_id") or "", a["patient_name"],
+                             a["doctor_name"], a["appt_date"] or "",
+                             a["appt_time"] or "", a["appt_type"]])
+        return out.getvalue()
 
     # ------------------------------------------------ Step 9: appointments table + details
     def all_appointments(self, doctor_id=None):
@@ -1601,6 +1951,22 @@ class Hospital:
         if new_is_emg != (row[0] == 1):
             heapq.heapify(doc["queue"].heap)
         self._persist()
+        # Step 12: a reschedule (date or time actually changed)
+        # writes a notification naming the old and new slot. An edit
+        # of only reason/notes/type is not a reschedule and notifies
+        # nobody.
+        if (new_date != appt["appt_date"]
+                or new_time != appt["appt_time"]):
+            old_when = (appt["appt_date"] or "") + (
+                f" {appt['appt_time']}" if appt["appt_time"] else "")
+            new_when = (new_date or "") + (
+                f" {new_time}" if new_time else "")
+            self.notifications.add(
+                "reschedule", "Appointment rescheduled",
+                f"{appt['apt_id'] or appt['token']} ({appt['token']}): "
+                f"{appt['patient_name']} with {doc['name']} moved from "
+                f"{old_when or 'no date'} to {new_when or 'no date'}.",
+                apt_id=appt["apt_id"], doctor_id=doc["id"])
         return _public_appointment(doc, new_row)
 
     def appointments_to_csv(self, rows):
@@ -2102,7 +2468,129 @@ def _print_bill(bill):
     print(f"  Total: Rs {bill['total']}")
 
 
-def reports_menu(hosp):
+def notifications_menu(hosp, role, user):
+    """Notifications (Step 12, menu 25): unread first, mark read.
+
+    The bell on the dashboard shows the same list. A Doctor only
+    ever sees their own queue's notifications plus hospital-wide
+    ones; Admin and Receptionist see everything.
+    """
+    hosp.refresh_reminders()
+    while True:
+        unread = hosp.list_notifications(
+            role=role, user_doctor_id=user.get("doctor_id"),
+            unread_only=True)
+        print(f"\n  --- Notifications ({len(unread)} unread) ---")
+        rows = hosp.list_notifications(
+            role=role, user_doctor_id=user.get("doctor_id"), limit=20)
+        if not rows:
+            print("  No notifications yet.")
+            return
+        for n in rows:
+            mark = " " if n["is_read"] else "*"
+            print(f"  [{mark}] #{n['id']} | {n['type']} | {n['title']} — "
+                  f"{n['message']} ({n['created_at']})")
+        print("  1. Mark one read  2. Mark all read  3. Back")
+        opt = input("  Choice: ").strip()
+        if opt == "1":
+            try:
+                nid = int(input("  Notification ID: ").strip())
+            except ValueError:
+                print("  ID must be a number.")
+                continue
+            if hosp.mark_notification_read(
+                    nid, role=role,
+                    user_doctor_id=user.get("doctor_id")):
+                print("  Marked read.")
+            else:
+                print("  Notification not found.")
+        elif opt == "2":
+            count = hosp.mark_all_notifications_read(
+                role=role, user_doctor_id=user.get("doctor_id"))
+            print(f"  {count} notification(s) marked read.")
+        elif opt == "3":
+            return
+        else:
+            print("  Pick 1, 2 or 3.")
+
+
+def reports_menu(hosp, role="Admin", user=None):
+    """Reports: 1 = the Step 3 daily summary, 2 = Step 12 appointment
+    analytics (daily / weekly / monthly + CSV/PDF export)."""
+    print("  1. Daily summary  2. Appointment analytics")
+    opt = input("  Choice: ").strip()
+    if opt == "2":
+        return _analytics_report_menu(hosp, role, user)
+    return _daily_report_menu(hosp)
+
+
+def _analytics_report_menu(hosp, role, user):
+    """Appointment analytics (Step 12): pick a period and filters,
+    see the figures, and optionally save them as CSV or PDF.
+
+    A Doctor only ever sees their own queue's figures.
+    """
+    period = input("  Period (daily/weekly/monthly, empty = daily): ").strip().lower() or "daily"
+    date = input("  Date (YYYY-MM-DD, empty = today): ").strip() or None
+    doctor_filter = None
+    if role == "Doctor" and user and user.get("doctor_id"):
+        doctor_filter = user["doctor_id"]
+        print(f"  Doctor: {doctor_filter} (your queue)")
+    else:
+        doctor_filter = input("  Doctor ID (empty = all doctors): ").strip().upper() or None
+    dept = input("  Department (empty = all): ").strip() or None
+    try:
+        rep = hosp.appointment_report(
+            period, date, doctor_id=doctor_filter, department=dept)
+    except ValueError as exc:
+        return print(f"  {exc}")
+    print(f"\n  --- Appointments Report — {rep['period'].title()} "
+          f"{rep['from']} to {rep['to']} ---")
+    print(f"  Total appointments: {rep['total']}")
+    print(f"  Completed: {rep['completed']} ({rep['completion_rate']}%)")
+    print(f"  Cancelled: {rep['cancelled']} ({rep['cancellation_rate']}%)")
+    print(f"  No Show: {rep['no_show']} ({rep['no_show_rate']}%)")
+    print(f"  Revenue (Paid bills): Rs {rep['revenue']}")
+    print(f"  Unpaid in period: Rs {rep['unpaid_total']}")
+    print("  Per doctor:")
+    for d in rep["per_doctor"]:
+        print(f"    {d['name']} ({d['doctor_id']}): {d['appointments']} "
+              f"appointments, {d['completed']} completed, "
+              f"{d['cancelled']} cancelled, {d['no_show']} no-show")
+    print("  Per department:")
+    for d in rep["per_department"]:
+        print(f"    {d['name']}: {d['appointments']} appointments, "
+              f"{d['completed']} completed, {d['cancelled']} cancelled, "
+              f"{d['no_show']} no-show")
+    if rep["cancelled_list"]:
+        print("  Cancelled:")
+        for a in rep["cancelled_list"]:
+            print(f"    {a.get('apt_id') or a['token']} | {a['patient_name']} | "
+                  f"{a['doctor_name']} | {a['appt_date']} {a['appt_time'] or ''}")
+    if rep["no_show_list"]:
+        print("  No-show:")
+        for a in rep["no_show_list"]:
+            print(f"    {a.get('apt_id') or a['token']} | {a['patient_name']} | "
+                  f"{a['doctor_name']} | {a['appt_date']} {a['appt_time'] or ''}")
+    exp = input("  Export? (csv / pdf / empty = no): ").strip().lower()
+    if exp not in ("csv", "pdf"):
+        return
+    name = input(f"  File name (empty = report-{rep['period']}-{rep['from']}.{exp}): ").strip()
+    if not name:
+        name = f"report-{rep['period']}-{rep['from']}.{exp}"
+    try:
+        if exp == "csv":
+            with open(name, "w", encoding="utf-8") as f:
+                f.write(hosp.report_to_csv(rep))
+        else:
+            with open(name, "wb") as f:
+                f.write(report_pdf(rep))
+        print(f"  Saved: {name}")
+    except OSError as exc:
+        print(f"  Could not save the file: {exc}")
+
+
+def _daily_report_menu(hosp):
     """Daily report (Step 3): today by default, or any date you type."""
     date = input("  Date (YYYY-MM-DD, empty = today): ").strip()
     if not date:
@@ -2934,6 +3422,7 @@ MENU = [
     ("22", "Calendar", "view"),  # Step 10: day/week/month calendar
     ("23", "Availability", "view_availability"),  # Step 11: doctor availability
     ("24", "Leave & Holidays", "view_availability"),  # Step 11: leave + holidays
+    ("25", "Notifications", "view"),  # Step 12: in-app notifications
 ]
 
 
@@ -3003,7 +3492,7 @@ def main():
         elif choice == "15":
             billing_menu(hosp, role)
         elif choice == "16":
-            reports_menu(hosp)
+            reports_menu(hosp, role, user)
         elif choice == "17":
             schedule_menu(hosp)
         elif choice == "18":
@@ -3020,6 +3509,8 @@ def main():
             availability_menu(hosp, role, user)
         elif choice == "24":
             leave_holidays_menu(hosp, role, user)
+        elif choice == "25":
+            notifications_menu(hosp, role, user)
 
 
 if __name__ == "__main__":

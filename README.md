@@ -18,6 +18,8 @@ It is built around classic data structures — a **singly linked list** for pati
 - **Pharmacy Queue**: FIFO token queue — add a token, serve the next one, or view the line.
 - **Shift Rotation**: Doctors rotate on duty through a circular queue.
 - **Dashboard**: City Care Hospital dashboard — 6 live stat cards (patients, doctors, today's appointments, free beds, total revenue, pending bills), monthly appointments chart, today's appointments with statuses, department donut, recent activities, working search, notification bell, quick actions. Every number is real data from `hospital.db`.
+- **Notifications**: In-app notifications, stored in `hospital.db` — a booking, a cancellation, a reschedule, a status change, a doctor's schedule change, and a reminder for tomorrow's appointments (each reminder created once, never duplicated). The dashboard bell shows the real unread count; clicking a notification opens its appointment's details page. The **Notifications** view filters by type (Booking / Cancellation / Reschedule / Status / Reminder / Schedule change) and All / Unread. A Doctor linked to one doctor only sees their own queue's notifications plus hospital-wide ones.
+- **Reports & Analytics**: **Reports & Analytics** — Daily / Weekly / Monthly with a date picker and doctor + department filters: total appointments, by status (all 7), completion / cancellation / no-show rates, per-doctor and per-department breakdowns, revenue from Paid bills in the period + unpaid total, appointments-per-day bar chart and a department donut, plus cancelled and no-show lists. Export the current report as **CSV** (Excel) or **PDF**. A Doctor linked to one doctor only sees their own queue's figures.
 - **SQLite Persistence**: All data is saved to `hospital.db` (created automatically) on every change — patients, notes, doctors, appointments, beds, pharmacy queue and shifts all survive a restart. The CLI and the web dashboard share the same database file. Delete `hospital.db` to start fresh.
 - **Login & Roles**: Every user logs in with a username, password and role — Admin, Doctor or Receptionist — and can only do what their role allows (see [Login & Roles](#login--roles) below). Passwords are stored as salted hashes, never as plain text.
 - **Billing**: Create a bill from a booked appointment — the consultation fee is the first line item — then add extra charges (medicine, bed charges, lab...). Mark bills Paid / Unpaid. A token is billed only once, and totals are always the sum of the line items.
@@ -53,6 +55,8 @@ Both the CLI (`python hospital.py`) and the web dashboard ask you to log in firs
 | Create bills & add charges | ✅ | ❌ | ✅ |
 | Mark bills Paid / Unpaid | ✅ | ❌ | ✅ |
 | View bills, reports & CSV export | ✅ | ✅ | ✅ |
+| View notifications (own queue for a linked Doctor) | ✅ | ✅ | ✅ |
+| Analytics reports (own queue for a linked Doctor) | ✅ | ✅ | ✅ |
 | Change own password | ✅ | ✅ | ✅ |
 
 A Doctor account can be **linked to one doctor** (e.g. `D1`) — then the dashboard and the CLI show only that doctor's appointment queue. A Doctor with no linked doctor sees all queues.
@@ -76,11 +80,20 @@ the line items — no tax, no discount, nothing hidden.
 
 - **CLI:** log in → menu option **15. Billing** (create bill, add
   charge, view/list bills, mark paid/unpaid, export `bills.csv`) and
-  **16. Reports** (daily report for today or any date you type).
+  **16. Reports** (1 = daily report for today or any date you type;
+  2 = appointment analytics — Daily / Weekly / Monthly with doctor
+  and department filters, plus CSV/PDF export to a file), and menu
+  option **25. Notifications** (list unread, mark one read, mark all
+  read).
 - **Dashboard:** **Billing & Payments** in the sidebar (create-bill form, bills table, bill
   detail with items + add-charge + pay/unpay, Download CSV button)
-  and **Reports & Analytics** in the sidebar (date picker, patients / appointments / billed
-  / collected / unpaid / beds cards, appointments per doctor). The
+  and **Reports & Analytics** in the sidebar (Daily / Weekly / Monthly
+  selector, date picker, doctor + department filters, totals by
+  status, completion / cancellation / no-show rates, per-doctor and
+  per-department tables, appointments-per-day bar chart, department
+  donut, cancelled and no-show lists, Export CSV / PDF buttons), and
+  **Notifications** in the sidebar (filter by type and All / Unread,
+  click one to open its appointment). The
   dashboard itself also shows **Billed Today** and **Collected Today**.
 
 The daily report counts patients registered that day, appointments

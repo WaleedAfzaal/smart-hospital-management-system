@@ -94,6 +94,12 @@ Each queue item in `GET /api/doctors` and `/api/state` now also carries `booked_
 | GET | `/api/holidays` | — | Step 11: all hospital holidays (`id`, `date`, `name`), sorted by date. Every role may view |
 | POST | `/api/holidays` | `{date, name}` | Step 11: add a hospital holiday. Admin only. A date already listed gets a 400 |
 | POST | `/api/holidays/<id>/delete` | — | Step 11: delete a holiday. Admin only. Unknown id gets a 404 |
+| GET | `/api/notifications?type=&unread_only=&limit=` | — | Step 12: the logged-in user's notifications, newest first, with `unread_count` for the bell badge. `type` is one of booking, cancellation, reschedule, status, reminder, schedule (bad type gets a 400); `unread_only=1` lists unread only; `limit` defaults to 100. Calling it first generates tomorrow's reminders, so the list never misses one. A Doctor user linked to one doctor only ever sees their own queue's notifications plus hospital-wide ones. 401 without login |
+| POST | `/api/notifications/<id>/read` | — | Step 12: mark one notification read. Returns the new `unread_count`. A notification the user cannot see gets a 404. 401 without login |
+| POST | `/api/notifications/read-all` | — | Step 12: mark every visible notification read. Returns how many were marked and `unread_count: 0`. 401 without login |
+| GET | `/api/reports/analytics?period=&date=&doctor_id=&department=` | — | Step 12: the analytics report — `period` daily / weekly / monthly (bad period gets a 400), `date` any day inside the period (defaults to today). Returns total, by-status counts for all 7 statuses, completed / cancelled / no-show counts + rates, per-doctor and per-department breakdowns, revenue (Paid bills in the period) + unpaid total, per-day counts, and the cancelled + no-show appointment lists. A Doctor user linked to one doctor is forced to their own doctor, whatever they ask for. 401 without login |
+| GET | `/api/reports/analytics.csv?...` | — | Step 12: the same report as a CSV download (same parameters and Doctor scoping as the JSON report). Opens in Excel |
+| GET | `/api/reports/analytics.pdf?...` | — | Step 12: the same report as a PDF download (same parameters and Doctor scoping; pure-Python generator, no new dependency) |
 
 Step 11 booking rules (server-side, in `Hospital.book_appointment` and the
 booking API — never client-only): a booking is refused with a 400 naming

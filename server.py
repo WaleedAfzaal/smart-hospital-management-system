@@ -104,6 +104,24 @@ slots (holiday, leave, not a working day). Booking refuses a slot
 outside the doctor's availability with a 400 that says why — checked
 before a new patient is registered, so a refused booking never
 leaves a stray patient behind.
+
+Step 12 (Notifications + Reports & Analytics): ``GET
+/api/notifications`` lists the stored in-app notifications (booking,
+cancellation, reschedule, status, reminder, schedule — with ``type``
+and ``unread_only`` filters and an ``unread_count``); ``POST
+/api/notifications/<id>/read`` marks one read and ``POST
+/api/notifications/read-all`` marks them all read. A Doctor user
+linked to one doctor only ever sees their own queue's notifications
+plus hospital-wide ones. The dashboard bell badge (``GET
+/api/dashboard`` ``notification_count``) is the real unread count for
+the logged-in user — tomorrow's reminders are generated first, so
+the badge never misses one. ``GET /api/reports/analytics`` returns
+the daily / weekly / monthly report (totals, by-status, rates,
+per-doctor and per-department, revenue from Paid bills, per-day
+series, cancelled and no-show lists); ``GET
+/api/reports/analytics.csv`` and ``.pdf`` export the same report
+(the PDF is the pure-Python generator in ``pdf_export.py``). A Doctor
+only ever sees their own queue's figures in reports.
 """
 
 import argparse
@@ -123,7 +141,8 @@ from hospital import (APPOINTMENT_TYPES, BOOKING_STATUSES, DEFAULT_DB_PATH,
                       Hospital, PriorityQueue, binary_search, bubble_sort,
                       validate_appt_datetime, validate_gender,
                       validate_patient_details, validate_phone)
-from pdf_export import appointments_pdf
+from notifications import NOTIFICATION_TYPES
+from pdf_export import appointments_pdf, report_pdf
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOST = "127.0.0.1"
@@ -375,6 +394,20 @@ def _filters_note(params: Dict[str, Any], total: int) -> str:
     note = "All appointments" if not bits else "Filters: " + ", ".join(bits)
     return (f"{note}  •  {total} appointment(s)  •  "
             f"{datetime.date.today().isoformat()}")
+
+
+def _analytics_params(query: Dict[str, List[str]]) -> Dict[str, Any]:
+    """period/date/doctor_id/department for the Step 12 analytics
+    report — only the keys the caller actually sent."""
+    params: Dict[str, Any] = {}
+    period = query.get("period", [None])[0]
+    if period not in (None, ""):
+        params["period"] = period
+    for key in ("date", "doctor_id", "department"):
+        value = query.get(key, [None])[0]
+        if value not in (None, ""):
+            params[key] = value
+    return params
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -868,6 +901,90 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                          "error": "Date must look like 2026-11-27."}, 400)
                 return self._send_json(
                     {"ok": True, "report": hospital.daily_report(date)})
+
+            # ---- Step 12: in-app notifications — newest first, with
+            # the unread count for the bell badge. Tomorrow's
+            # reminders are generated first, so the list never misses
+            # one. A Doctor user linked to one doctor only ever sees
+            # their own queue's notifications plus hospital-wide ones.
+            if path == "/api/notifications":
+                if not can(self._user["role"], "view_notifications"):
+                    return self._forbidden(self._user["role"])
+                hospital.refresh_reminders()
+                ntype = query.get("type", [None])[0]
+                if ntype not in (None, "") \
+                        and ntype not in NOTIFICATION_TYPES:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "Type must be one of: "
+                         + ", ".join(NOTIFICATION_TYPES) + "."}, 400)
+                unread_only = query.get(
+                    "unread_only", ["0"])[0] in ("1", "true", "yes")
+                limit = _parse_int(query.get("limit", [None])[0]) or 100
+                try:
+                    rows = hospital.list_notifications(
+                        role=self._user["role"],
+                        user_doctor_id=self._user.get("doctor_id"),
+                        ntype=ntype or None, unread_only=unread_only,
+                        limit=limit)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({
+                    "ok": True, "notifications": rows,
+                    "unread_count":
+                        hospital.unread_notifications_count(
+                            role=self._user["role"],
+                            user_doctor_id=self._user.get("doctor_id")),
+                })
+
+            # ---- Step 12: the analytics report — daily / weekly /
+            # monthly, with doctor and department filters. A Doctor
+            # user linked to one doctor only ever sees their own
+            # queue's figures, whatever they ask for.
+            if path == "/api/reports/analytics":
+                params = _analytics_params(query)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    params["doctor_id"] = doctor_filter
+                try:
+                    report = hospital.appointment_report(**params)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_json({"ok": True, "report": report})
+
+            # ---- Step 12: the same report as a download — CSV
+            # (opens in Excel) or PDF (pure-Python generator). Same
+            # filters and the same Doctor scoping as the JSON report.
+            if path == "/api/reports/analytics.csv":
+                params = _analytics_params(query)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    params["doctor_id"] = doctor_filter
+                try:
+                    report = hospital.appointment_report(**params)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_text(
+                    hospital.report_to_csv(report),
+                    "text/csv; charset=utf-8",
+                    f"report-{report['period']}-{report['from']}.csv")
+
+            if path == "/api/reports/analytics.pdf":
+                params = _analytics_params(query)
+                doctor_filter = self._doctor_filter()
+                if doctor_filter is not None:
+                    params["doctor_id"] = doctor_filter
+                try:
+                    report = hospital.appointment_report(**params)
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                return self._send_bytes(
+                    report_pdf(report), "application/pdf",
+                    f"report-{report['period']}-{report['from']}.pdf")
 
             # Unknown API route: answer JSON, never an HTML 404 page —
             # the frontend's res.json() would throw on HTML and the
@@ -1689,6 +1806,44 @@ class HospitalRequestHandler(SimpleHTTPRequestHandler):
                     "ok": True,
                     "message": f"Bill #{bill_id} is now {bill['status']}.",
                     "bill": bill,
+                })
+
+            # ---- Step 12: mark one notification read. A Doctor may
+            # only mark their own queue's notifications (an invisible
+            # one is a 404, not a 403 — it does not exist for them).
+            if path.startswith("/api/notifications/") and path.endswith("/read"):
+                raw = path.removeprefix("/api/notifications/").removesuffix("/read").strip("/")
+                if not raw or "/" in raw:
+                    return self._send_json(
+                        {"ok": False, "error": "Unknown endpoint."}, 404)
+                try:
+                    marked = hospital.mark_notification_read(
+                        raw, role=role,
+                        user_doctor_id=self._user.get("doctor_id"))
+                except ValueError as exc:
+                    return self._send_json(
+                        {"ok": False, "error": str(exc)}, 400)
+                if not marked:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "Notification not found."}, 404)
+                return self._send_json({
+                    "ok": True, "message": "Notification marked read.",
+                    "unread_count":
+                        hospital.unread_notifications_count(
+                            role=role,
+                            user_doctor_id=self._user.get("doctor_id")),
+                })
+
+            # ---- Step 12: mark every visible notification read.
+            if path == "/api/notifications/read-all":
+                count = hospital.mark_all_notifications_read(
+                    role=role,
+                    user_doctor_id=self._user.get("doctor_id"))
+                return self._send_json({
+                    "ok": True,
+                    "message": f"{count} notification(s) marked read.",
+                    "marked": count, "unread_count": 0,
                 })
 
         return self._send_json(

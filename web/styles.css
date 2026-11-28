@@ -465,6 +465,22 @@ body.sidebar-collapsed .sidebar { margin-left: -252px; }
 }
 .pop-row:hover { background: #eff6ff; }
 .pop-row .muted { display: block; font-size: 12.5px; margin-top: 2px; }
+/* Step 12: notification rows (bell panel + Notifications view) —
+   same shape as .pop-row; unread ones are highlighted. */
+.notif-row {
+  display: block; width: 100%; text-align: left;
+  padding: 10px 14px; background: transparent; border: 0;
+  border-top: 1px solid #f1f5f9; font-size: 13.5px; color: #172033;
+  cursor: pointer; font-family: inherit;
+}
+.notif-row:hover { background: #eff6ff; }
+.notif-row .muted { display: block; font-size: 12.5px; margin-top: 2px; }
+.notif-unread { background: #eff6ff; }
+.pop-foot {
+  display: flex; gap: 8px; padding: 10px 12px 12px;
+  border-top: 1px solid #e2e8f0;
+}
+.pop-foot .btn { flex: 1; }
 .profile-btn {
   display: flex; align-items: center; gap: 10px;
   background: transparent; border: 0; border-radius: 999px; padding: 4px 8px 4px 4px;
